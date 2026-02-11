@@ -1,42 +1,9 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-dist/
-build/
-*.egg
-
-# Virtual environments
-venv/
-.venv/
-env/
-
-# Environment variables & secrets
+node_modules/
+.next/
 .env
+.env.local
 *.pem
 *.key
-kalshi-private-key*
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Logs
-logs/
-*.log
-
-# OS
+.vercel
+out/
 .DS_Store
-Thumbs.db
-
-# Testing
-.pytest_cache/
-htmlcov/
-.coverage
-
-# Distribution
-*.tar.gz
-*.whl
