@@ -7,8 +7,8 @@
  * Body: { categories: ["weather", "economic"] }
  */
 
-import { createClientFromEnv } from "../../lib/kalshi";
-import { runStrategyScan } from "../../lib/strategies";
+import { createClientFromEnv } from "../../../lib/kalshi";
+import { runStrategyScan } from "../../../lib/strategies";
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {

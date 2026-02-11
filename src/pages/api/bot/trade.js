@@ -13,7 +13,7 @@
  * }
  */
 
-import { createClientFromEnv } from "../../lib/kalshi";
+import { createClientFromEnv } from "../../../lib/kalshi";
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
