@@ -1,9 +1,5 @@
 node_modules/
 .next/
-.env
 .env.local
-*.pem
-*.key
-.vercel
+.env
 out/
-.DS_Store
