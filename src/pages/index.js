@@ -274,13 +274,51 @@ export default function Apex() {
     setSt(prev => ({ ...prev, trades: prev.trades + 1 }));
   };
 
-  const closePos = id => {
+  const closePos = (id, pnl = 0) => {
     setPositions(prev => {
       const p = prev.find(x => x.id === id);
-      if (p) pushLog("CLOSE", p);
+      if (p) {
+        pushLog("CLOSE", p);
+        setSt(s => ({ ...s, pnl: s.pnl + pnl, wins: s.wins + (pnl > 0 ? 1 : 0) }));
+      }
       return prev.filter(x => x.id !== id);
     });
   };
+
+  // ── Live P&L: fetch current prices for open positions ──
+  const refreshPositions = useCallback(async () => {
+    if (positions.length === 0) return;
+    const updated = [];
+    for (const pos of positions) {
+      const d = await kGet(`/markets/${pos.ticker}`);
+      if (d?.market) {
+        const curYes = (d.market.yes_price || 50) / 100;
+        const curVal = pos.side === "yes" ? curYes : 1 - curYes;
+        const unrealPnl = (curVal - pos.entryPrice) * pos.contracts;
+        updated.push({ ...pos, curPrice: curVal, unrealPnl });
+        // Check TP/SL
+        const curCents = Math.round(curVal * 100);
+        if (pos.side === "yes" && curCents >= pos.tp) {
+          closePos(pos.id, unrealPnl); continue;
+        }
+        if (pos.side === "yes" && curCents <= pos.sl) {
+          closePos(pos.id, unrealPnl); continue;
+        }
+        // Check settlement
+        if (d.market.status === "settled" || d.market.status === "closed") {
+          const won = d.market.result === pos.side;
+          const finalPnl = won ? (1 - pos.entryPrice) * pos.contracts : -pos.entryPrice * pos.contracts;
+          closePos(pos.id, finalPnl); continue;
+        }
+      }
+      updated.push(pos);
+    }
+    // Only keep positions that weren't closed
+    setPositions(prev => prev.map(p => {
+      const u = updated.find(x => x.id === p.id);
+      return u || p;
+    }).filter(p => prev.some(pp => pp.id === p.id)));
+  }, [positions]);
 
   const pushLog = (type, d) => {
     setLog(l => [{
@@ -295,9 +333,9 @@ export default function Apex() {
   useEffect(() => {
     if (!on) return;
     scanAll();
-    const iv = setInterval(scanAll, cfg.interval * 1000);
+    const iv = setInterval(() => { scanAll(); refreshPositions(); }, cfg.interval * 1000);
     return () => clearInterval(iv);
-  }, [on, scanAll, cfg.interval]);
+  }, [on, scanAll, refreshPositions, cfg.interval]);
 
   // ── Derived ──
   const tradeable = allMkts.filter(m =>
@@ -308,6 +346,8 @@ export default function Apex() {
   const tradeableYes = tradeable.filter(m => m.edge > 0);
   const tradeableNo = tradeable.filter(m => m.edge < 0);
   const wr = st.trades > 0 ? (st.wins / st.trades * 100) : 0;
+  const totalUnreal = positions.reduce((s, p) => s + (p.unrealPnl || 0), 0);
+  const bestEdge = allMkts.length > 0 ? allMkts[0] : null;
 
   // ═══ RENDER ═══
 
@@ -338,7 +378,16 @@ export default function Apex() {
               <span style={{ fontSize: 16, fontWeight: 800, letterSpacing: 2 }}>APEX</span>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-              <span style={{ fontSize: 16, fontWeight: 800, color: st.pnl >= 0 ? C.g : C.r }}>{st.pnl >= 0 ? "+" : ""}{usd(st.pnl)}</span>
+              <div style={{ textAlign: "right" }}>
+                <span style={{ fontSize: 16, fontWeight: 800, color: (st.pnl + totalUnreal) >= 0 ? C.g : C.r }}>
+                  {(st.pnl + totalUnreal) >= 0 ? "+" : ""}{usd(st.pnl + totalUnreal)}
+                </span>
+                {totalUnreal !== 0 && (
+                  <div style={{ fontSize: 8, color: totalUnreal >= 0 ? C.g : C.r, opacity: 0.7 }}>
+                    {totalUnreal >= 0 ? "+" : ""}{usd(totalUnreal)} open
+                  </div>
+                )}
+              </div>
               <button onClick={() => setOn(!on)} style={{
                 padding: "8px 22px", borderRadius: 8, border: "none", fontSize: 11,
                 fontWeight: 800, letterSpacing: 2, cursor: "pointer",
@@ -444,6 +493,22 @@ export default function Apex() {
               </div>
             )}
 
+            {/* Best opportunity banner */}
+            {bestEdge && Math.abs(bestEdge.edge) >= cfg.minEdge && (
+              <div style={{
+                padding: "10px 14px", marginBottom: 12, borderRadius: 8,
+                background: `linear-gradient(135deg, ${C.g}12, ${C.b}12)`,
+                border: `1px solid ${C.g}30`,
+              }}>
+                <div style={{ fontSize: 9, color: C.g, fontWeight: 700, letterSpacing: 1.5, marginBottom: 4 }}>⚡ BEST OPPORTUNITY RIGHT NOW</div>
+                <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 2 }}>{bestEdge.city} — {bestEdge.title}</div>
+                <div style={{ fontSize: 10, color: C.dm }}>
+                  {Math.abs(bestEdge.edge) >= 8 ? "Strong" : Math.abs(bestEdge.edge) >= 5 ? "Moderate" : "Small"} edge: {bestEdge.edge > 0 ? "+" : ""}{f1(bestEdge.edge)}¢ •
+                  Model {bestEdge.modelPct}% vs Market {bestEdge.mktPct}¢
+                </div>
+              </div>
+            )}
+
             {/* TRADEABLE SIGNALS - these meet your criteria */}
             {tradeable.length > 0 && (
               <div style={{ marginBottom: 16 }}>
@@ -469,6 +534,19 @@ export default function Apex() {
                             Forecast {wx[CITIES.find(c => c.label === s.city)?.station]?.ens}°F → threshold {s.thresh}°F
                             <br/>Model says <span style={{ color: C.b }}>{s.modelPct}%</span> • Market priced <span style={{ color: C.y }}>{s.mktPct}¢</span>
                             {s.vol > 0 && <> • Vol: {s.vol}</>}
+                          </div>
+                          {/* Confidence bar */}
+                          <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                            <div style={{ flex: 1, height: 4, background: C.bd, borderRadius: 2, overflow: "hidden" }}>
+                              <div style={{
+                                height: "100%", borderRadius: 2, transition: "width 0.3s",
+                                width: `${Math.min(100, Math.abs(s.edge) * 5)}%`,
+                                background: Math.abs(s.edge) >= 10 ? C.g : Math.abs(s.edge) >= 6 ? C.y : C.b,
+                              }} />
+                            </div>
+                            <span style={{ fontSize: 8, color: C.dm, flexShrink: 0 }}>
+                              {Math.abs(s.edge) >= 10 ? "HIGH" : Math.abs(s.edge) >= 6 ? "MED" : "LOW"}
+                            </span>
                           </div>
                         </div>
                         <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
@@ -545,12 +623,14 @@ export default function Apex() {
                 <div style={{ fontSize: 9, color: C.p, letterSpacing: 2, marginBottom: 8, fontWeight: 700 }}>OPEN POSITIONS</div>
                 {positions.map(p => {
                   const mins = Math.floor((Date.now() - p.entryTime) / 60000);
+                  const hasPnl = p.unrealPnl != null;
                   return (
                     <div key={p.id} style={{
                       display: "flex", justifyContent: "space-between", alignItems: "center",
                       padding: "10px 12px", marginBottom: 4, background: C.cd, borderRadius: 8,
+                      borderLeft: hasPnl ? `3px solid ${p.unrealPnl >= 0 ? C.g : C.r}` : `3px solid ${C.bd}`,
                     }}>
-                      <div>
+                      <div style={{ flex: 1 }}>
                         <div style={{ fontSize: 11, fontWeight: 700 }}>
                           <span style={{ color: p.side === "yes" ? C.g : C.r }}>{p.side.toUpperCase()}</span>
                           <span style={{ color: C.dm }}> • </span>{p.city} • {p.contracts}× @ {f0(p.entryPrice * 100)}¢
@@ -558,12 +638,22 @@ export default function Apex() {
                         </div>
                         <div style={{ fontSize: 9, color: C.dm, marginTop: 2 }}>
                           TP {p.tp}¢ SL {p.sl}¢ • {mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h${mins % 60}m`}
+                          {hasPnl && p.curPrice != null && (
+                            <> • now {f0(p.curPrice * 100)}¢</>
+                          )}
                         </div>
                       </div>
-                      <button onClick={() => closePos(p.id)} style={{
-                        padding: "6px 10px", borderRadius: 5, border: `1px solid ${C.bd}`,
-                        background: "transparent", color: C.dm, fontSize: 10, cursor: "pointer", fontWeight: 700,
-                      }}>✕</button>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                        {hasPnl && (
+                          <span style={{ fontSize: 13, fontWeight: 800, color: p.unrealPnl >= 0 ? C.g : C.r }}>
+                            {p.unrealPnl >= 0 ? "+" : ""}{usd(p.unrealPnl)}
+                          </span>
+                        )}
+                        <button onClick={() => closePos(p.id, p.unrealPnl || 0)} style={{
+                          padding: "6px 10px", borderRadius: 5, border: `1px solid ${C.bd}`,
+                          background: "transparent", color: C.dm, fontSize: 10, cursor: "pointer", fontWeight: 700,
+                        }}>✕</button>
+                      </div>
                     </div>
                   );
                 })}
@@ -734,6 +824,50 @@ export default function Apex() {
 
           {/* ═══ LOG TAB ═══ */}
           {tab === "log" && (<>
+            {/* Session Performance Summary */}
+            {st.trades > 0 && (
+              <div style={{
+                padding: 14, background: C.cd, borderRadius: 10, marginBottom: 14,
+                border: `1px solid ${C.bd}`,
+              }}>
+                <div style={{ fontSize: 9, color: C.dm, letterSpacing: 2, fontWeight: 700, marginBottom: 10 }}>SESSION PERFORMANCE</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+                  <div>
+                    <div style={{ fontSize: 8, color: C.dm, marginBottom: 2 }}>REALIZED</div>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: st.pnl >= 0 ? C.g : C.r }}>
+                      {st.pnl >= 0 ? "+" : ""}{usd(st.pnl)}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 8, color: C.dm, marginBottom: 2 }}>OPEN P&L</div>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: totalUnreal >= 0 ? C.g : C.r }}>
+                      {totalUnreal >= 0 ? "+" : ""}{usd(totalUnreal)}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 8, color: C.dm, marginBottom: 2 }}>WIN RATE</div>
+                    <div style={{ fontSize: 14, fontWeight: 800, color: wr >= 50 ? C.g : C.r }}>
+                      {f0(wr)}%
+                    </div>
+                  </div>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginTop: 10 }}>
+                  <div>
+                    <div style={{ fontSize: 8, color: C.dm, marginBottom: 2 }}>TRADES</div>
+                    <div style={{ fontSize: 12, fontWeight: 700 }}>{st.trades}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 8, color: C.dm, marginBottom: 2 }}>WINS</div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.g }}>{st.wins}</div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 8, color: C.dm, marginBottom: 2 }}>SCANS</div>
+                    <div style={{ fontSize: 12, fontWeight: 700 }}>{st.scans}</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
               <span style={{ fontSize: 9, color: C.dm, letterSpacing: 2, fontWeight: 700 }}>{log.length} ENTRIES</span>
               {log.length > 0 && (
