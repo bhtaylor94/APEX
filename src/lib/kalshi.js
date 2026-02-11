@@ -228,11 +228,15 @@ class KalshiClient {
  * Reads KALSHI_API_KEY, KALSHI_PRIVATE_KEY, KALSHI_ENV.
  */
 function createClientFromEnv() {
-  const apiKey = process.env.KALSHI_API_KEY;
-  const privateKey = process.env.KALSHI_PRIVATE_KEY; // Full PEM content
-  const env = process.env.KALSHI_ENV || "demo";
+  const apiKey = process.env.KALSHI_API_KEY
+    || process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID
+    || process.env.NEXT_PUBLIC_KALSHI_API_KEY;
+  const privateKey = process.env.KALSHI_PRIVATE_KEY;
+  const env = process.env.KALSHI_ENV
+    || process.env.NEXT_PUBLIC_KALSHI_ENV
+    || "demo";
 
-  if (!apiKey) throw new Error("KALSHI_API_KEY is not set");
+  if (!apiKey) throw new Error("KALSHI_API_KEY is not set — add KALSHI_API_KEY or NEXT_PUBLIC_KALSHI_API_KEY_ID in Vercel env vars");
   if (!privateKey) throw new Error("KALSHI_PRIVATE_KEY is not set");
 
   return new KalshiClient(apiKey, privateKey, env);

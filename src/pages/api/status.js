@@ -19,7 +19,7 @@ export default async function handler(req, res) {
     account: { balance: null, balanceFormatted: null },
     positions: { count: 0, totalExposure: null, items: [] },
     config: {
-      env: process.env.KALSHI_ENV || "demo",
+      env: process.env.KALSHI_ENV || process.env.NEXT_PUBLIC_KALSHI_ENV || "demo",
       dryRun: process.env.DRY_RUN !== "false",
       maxDailyLoss: parseFloat(process.env.MAX_DAILY_LOSS || "50"),
       kellyFraction: parseFloat(process.env.KELLY_FRACTION || "0.5"),
