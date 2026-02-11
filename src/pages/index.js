@@ -134,6 +134,7 @@ export default function Apex() {
   const [bal, setBal] = useState(null); // account balance in cents
   const [connected, setConnected] = useState(false);
   const [authChecked, setAuthChecked] = useState(false);
+  const [authErr, setAuthErr] = useState(null); // debug info if connection fails
 
   const [cfg, setCfg] = useState({
     bet: 10, minEdge: 3, pMin: 10, pMax: 90, tp: 8, sl: 12,
@@ -150,8 +151,10 @@ export default function Apex() {
     if (d.cfg) setCfg(c => ({ ...c, ...d.cfg }));
     // Check auth
     authReq("/portfolio/balance").then(d => {
-      if (d && !d.noKeys && d.balance != null) {
+      if (d && !d.noKeys && !d.error && d.balance != null) {
         setConnected(true); setBal(d.balance);
+      } else if (d && d.error && d.error !== "no_keys") {
+        setAuthErr(d);
       }
       setAuthChecked(true);
     });
@@ -409,6 +412,11 @@ export default function Apex() {
               <>
                 <span style={{ fontSize: 10, color: C.g }}>● Connected {process.env.NEXT_PUBLIC_KALSHI_ENV === "prod" ? "(LIVE)" : "(DEMO)"}</span>
                 <span style={{ fontSize: 12, fontWeight: 800, color: C.g }}>{usd((bal || 0) / 100)}</span>
+              </>
+            ) : authErr ? (
+              <>
+                <span style={{ fontSize: 10, color: C.r }}>✕ Connection error</span>
+                <span style={{ fontSize: 9, color: C.r, cursor: "pointer" }} onClick={() => setTab("settings")}>See details →</span>
               </>
             ) : (
               <>
@@ -737,24 +745,63 @@ export default function Apex() {
                 </div>
               ) : (
                 <div style={{ fontSize: 10, color: C.dm, lineHeight: 1.9 }}>
-                  Without API keys, you can scan and see signals but cannot execute trades.
-                  <br/><br/>
-                  <span style={{ color: C.tx, fontWeight: 700 }}>To connect:</span>
-                  <br/>1. Go to <span style={{ color: C.b }}>kalshi.com/account/profile</span>
-                  <br/>2. Scroll to "API Keys" → Create New
-                  <br/>3. Save the private key file + note the Key ID
-                  <br/>4. Add to <span style={{ color: C.b }}>.env.local</span>:
-                  <div style={{
-                    margin: "8px 0", padding: 8, background: C.bg, borderRadius: 4,
-                    fontSize: 9, lineHeight: 1.7, wordBreak: "break-all",
-                  }}>
-                    NEXT_PUBLIC_KALSHI_API_KEY_ID=your-id<br/>
-                    KALSHI_PRIVATE_KEY=&quot;-----BEGIN RSA...&quot;<br/>
-                    NEXT_PUBLIC_KALSHI_ENV=demo
-                  </div>
-                  5. Restart the app → you&apos;ll see your balance here
-                  <br/><br/>
-                  <span style={{ color: C.y }}>⚠ Start with demo mode first!</span>
+                  {authErr ? (
+                    <div>
+                      <div style={{ color: C.r, fontWeight: 700, marginBottom: 6 }}>Connection failed:</div>
+                      <div style={{
+                        padding: 8, background: C.bg, borderRadius: 4,
+                        fontSize: 9, lineHeight: 1.5, wordBreak: "break-all", marginBottom: 8,
+                        border: `1px solid ${C.r}30`, color: C.r,
+                      }}>
+                        {authErr.message || authErr.error || "Unknown error"}
+                        {authErr.detail && <><br/>{JSON.stringify(authErr.detail)}</>}
+                        {authErr.env && <><br/>ENV: {authErr.env}</>}
+                        {authErr.base && <><br/>URL: {authErr.base}</>}
+                        {authErr.status && <><br/>Status: {authErr.status}</>}
+                      </div>
+                      <div style={{ color: C.dm, marginBottom: 6 }}>
+                        Common fixes:
+                        <br/>• Your API key was created on <span style={{ color: C.b }}>kalshi.com</span> (production), so set <span style={{ color: C.y }}>NEXT_PUBLIC_KALSHI_ENV=prod</span> (not demo)
+                        <br/>• Make sure the full private key is pasted including <span style={{ color: C.y }}>-----BEGIN RSA PRIVATE KEY-----</span> and <span style={{ color: C.y }}>-----END RSA PRIVATE KEY-----</span>
+                        <br/>• Redeploy after changing env vars
+                      </div>
+                      <button onClick={() => {
+                        setAuthErr(null); setAuthChecked(false);
+                        authReq("/portfolio/balance").then(d => {
+                          if (d && !d.noKeys && !d.error && d.balance != null) {
+                            setConnected(true); setBal(d.balance); setAuthErr(null);
+                          } else if (d && d.error && d.error !== "no_keys") {
+                            setAuthErr(d);
+                          }
+                          setAuthChecked(true);
+                        });
+                      }} style={{
+                        padding: "8px 16px", borderRadius: 6, border: `1px solid ${C.b}`,
+                        background: "transparent", color: C.b, fontSize: 10, cursor: "pointer", fontWeight: 700,
+                      }}>RETRY CONNECTION</button>
+                    </div>
+                  ) : (
+                    <>
+                      Without API keys, you can scan and see signals but cannot execute trades.
+                      <br/><br/>
+                      <span style={{ color: C.tx, fontWeight: 700 }}>To connect:</span>
+                      <br/>1. Go to <span style={{ color: C.b }}>kalshi.com/account/profile</span>
+                      <br/>2. Scroll to "API Keys" → Create New
+                      <br/>3. Save the private key file + note the Key ID
+                      <br/>4. Add to Vercel Environment Variables:
+                      <div style={{
+                        margin: "8px 0", padding: 8, background: C.bg, borderRadius: 4,
+                        fontSize: 9, lineHeight: 1.7, wordBreak: "break-all",
+                      }}>
+                        NEXT_PUBLIC_KALSHI_API_KEY_ID=your-id<br/>
+                        KALSHI_PRIVATE_KEY=&quot;-----BEGIN RSA PRIVATE KEY-----...-----END RSA PRIVATE KEY-----&quot;<br/>
+                        NEXT_PUBLIC_KALSHI_ENV=prod
+                      </div>
+                      5. Redeploy → you&apos;ll see your balance here
+                      <br/><br/>
+                      <span style={{ color: C.y }}>⚠ Use &quot;demo&quot; only if you created keys at demo.kalshi.com — regular Kalshi keys need &quot;prod&quot;</span>
+                    </>
+                  )}
                 </div>
               )}
             </div>
