@@ -13,40 +13,50 @@ function getBase() {
 }
 
 function formatPemKey(raw) {
-  // Vercel env vars mangle newlines in PEM keys
-  // Handle all common cases:
+  // Vercel env vars mangle newlines in PEM keys.
+  // This handles PKCS#1 (BEGIN RSA PRIVATE KEY) AND PKCS#8 (BEGIN PRIVATE KEY)
 
-  // 1. Escaped \n as literal characters (Vercel does this)
-  let key = raw;
-  if (key.includes("\\n")) {
-    key = key.replace(/\\n/g, "\n");
+  let key = raw.trim();
+
+  // Strip wrapping quotes if Vercel added them
+  if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) {
+    key = key.slice(1, -1);
   }
 
-  // 2. Already properly formatted with real newlines
-  if (key.includes("-----BEGIN") && key.includes("\n")) {
-    return key.trim();
+  // Replace literal \n sequences with real newlines
+  key = key.replace(/\\n/g, "\n");
+
+  // If it already has proper PEM headers and newlines, return as-is
+  if (key.includes("-----BEGIN") && key.includes("\n") && key.split("\n").length > 3) {
+    return key;
   }
 
-  // 3. Raw base64 without PEM wrapper — wrap it
-  if (!key.includes("-----BEGIN")) {
-    const clean = key.replace(/[\s"']+/g, "");
-    const lines = clean.match(/.{1,64}/g) || [];
-    return `-----BEGIN RSA PRIVATE KEY-----\n${lines.join("\n")}\n-----END RSA PRIVATE KEY-----`;
+  // Detect which PEM type we have
+  let header, footer;
+  if (key.includes("BEGIN RSA PRIVATE KEY")) {
+    header = "-----BEGIN RSA PRIVATE KEY-----";
+    footer = "-----END RSA PRIVATE KEY-----";
+  } else if (key.includes("BEGIN PRIVATE KEY")) {
+    header = "-----BEGIN PRIVATE KEY-----";
+    footer = "-----END PRIVATE KEY-----";
+  } else if (key.includes("BEGIN EC PRIVATE KEY")) {
+    header = "-----BEGIN EC PRIVATE KEY-----";
+    footer = "-----END EC PRIVATE KEY-----";
+  } else {
+    // Raw base64 with no header — assume PKCS#8 since that's what Kalshi generates
+    header = "-----BEGIN PRIVATE KEY-----";
+    footer = "-----END PRIVATE KEY-----";
   }
 
-  // 4. All on one line with spaces instead of newlines
-  key = key.replace(/-----BEGIN RSA PRIVATE KEY-----\s*/, "-----BEGIN RSA PRIVATE KEY-----\n")
-    .replace(/\s*-----END RSA PRIVATE KEY-----/, "\n-----END RSA PRIVATE KEY-----");
-  
-  // Split the middle base64 content into proper lines
-  const match = key.match(/-----BEGIN RSA PRIVATE KEY-----\n([\s\S]+)\n-----END RSA PRIVATE KEY-----/);
-  if (match) {
-    const b64 = match[1].replace(/\s+/g, "");
-    const lines = b64.match(/.{1,64}/g) || [];
-    return `-----BEGIN RSA PRIVATE KEY-----\n${lines.join("\n")}\n-----END RSA PRIVATE KEY-----`;
-  }
+  // Extract just the base64 content
+  let b64 = key
+    .replace(/-----BEGIN[^-]+-----/g, "")
+    .replace(/-----END[^-]+-----/g, "")
+    .replace(/[\s\r\n]+/g, "");
 
-  return key.trim();
+  // Reformat into proper 64-char PEM lines
+  const lines = b64.match(/.{1,64}/g) || [];
+  return `${header}\n${lines.join("\n")}\n${footer}`;
 }
 
 function sign(privateKeyPem, timestamp, method, path) {
