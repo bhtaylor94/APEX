@@ -360,7 +360,73 @@ export default function Apex() {
 
   useEffect(() => { save({ log, st, positions, cfg }); }, [log, st, positions, cfg]);
 
-  // ═══ UNIVERSAL SCANNER ═══
+  
+  // ── Portfolio sync (keeps UI in sync if you close trades outside the app, or if a sell fills partially)
+  const syncPortfolioPositions = useCallback(async () => {
+    try {
+      if (!connected) return;
+      const d = await authReq("/portfolio/positions?limit=1000&count_filter=position");
+      const mp = Array.isArray(d?.market_positions) ? d.market_positions : [];
+      const live = new Map();
+      mp.forEach(x => {
+        const pos = Number(x.position || 0);
+        if (!pos) return;
+        live.set(String(x.ticker || ""), {
+          ticker: String(x.ticker || ""),
+          qty: Math.abs(pos),
+          side: pos > 0 ? "yes" : "no",
+          lastUpdated: x.last_updated_ts || null,
+        });
+      });
+
+      setPositions(prev => {
+        const out = [];
+        const seen = new Set();
+
+        // keep/update existing
+        prev.forEach(p => {
+          const t = String(p.ticker || "");
+          const lp = live.get(t);
+          if (!p.live) { out.push(p); return; } // simulated / manual positions
+          if (!lp) return; // closed on Kalshi -> drop from UI
+          seen.add(t);
+          out.push({ ...p, contracts: lp.qty, side: lp.side, live: true, lastUpdated: lp.lastUpdated || p.lastUpdated });
+        });
+
+        // add any live positions not in UI yet
+        live.forEach((lp, t) => {
+          if (seen.has(t)) return;
+          out.push({
+            id: t,
+            ticker: t,
+            title: t,
+            contracts: lp.qty,
+            side: lp.side,
+            entryPrice: null,
+            entryTime: Date.now(),
+            tp: cfg.tp,
+            sl: cfg.sl,
+            strategy: "UNKNOWN",
+            live: true,
+            lastUpdated: lp.lastUpdated,
+          });
+        });
+
+        return out;
+      });
+    } catch (e) {
+      // silent: avoid breaking UI if Kalshi is down or keys missing
+    }
+  }, [connected, cfg.tp, cfg.sl]);
+
+  // auto-sync every 15s when connected
+  useEffect(() => {
+    if (!connected) return;
+    syncPortfolioPositions();
+    const t = setInterval(() => { syncPortfolioPositions(); }, 15000);
+    return () => clearInterval(t);
+  }, [connected, syncPortfolioPositions]);
+// ═══ UNIVERSAL SCANNER ═══
   const scanAll = useCallback(async () => {
     setScanning(true);
     const allSignals = [];
@@ -482,7 +548,7 @@ export default function Apex() {
       ).slice(0, cfg.maxPos - positions.length);
       for (const sig of topSignals) {
         if (!positions.find(p => p.ticker === sig.ticker)) {
-          if (!inProbBand(tradeProbForSide(sig.prob, sig.side || (sig.edge > 0 ? 'yes' : 'no')), 0.40, 0.50)) { addLog('SKIP prob band (40–50%)'); } else { await execTrade(sig); }
+          await execTrade(sig);
         }
       }
     }
@@ -502,10 +568,11 @@ const execTrade = async (s) => {
     const entryPrice = tradePriceForSide(s.price, side);
     const tradeProb = tradeProbForSide(s.prob, side);
     const marketYesProb = Number(s.price); // market-implied YES probability
+    const marketSideProb = tradeProbForSide(marketYesProb, side); // implied probability of the side we will trade
 
-    // Only trade if implied probability is in the 40–50% band
-    if (!inProbBand(marketYesProb, 0.40, 0.50)) {
-      addLog(`SKIP prob band (market YES): ${Math.round(marketYesProb * 100)}% (requires 40–50%)`);
+    // Only trade if implied probability (for the SIDE we're buying) is in the 40–50% band
+    if (!inProbBand(marketSideProb, 0.40, 0.50)) {
+      addLog(`SKIP prob band (market ${side.toUpperCase()}): ${Math.round(marketSideProb * 100)}% (requires 40–50%)`);
       return;
     }
 
@@ -591,7 +658,11 @@ const execTrade = async (s) => {
             ? { yes_price: Math.round(yesMid * 100) }
             : { no_price: Math.round((1 - yesMid) * 100) }),
           client_order_id: `apex-close-${Date.now()}`,
-        };
+      
+
+    // refresh from Kalshi so UI clears even if the sell fills slowly
+    setTimeout(() => { syncPortfolioPositions(); }, 1500);
+  };
 
         await authReq("/orders", "POST", body);
       } catch {}
