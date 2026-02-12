@@ -5,7 +5,7 @@
 import crypto from "crypto";
 
 const DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2";
-const PROD_BASE = "https://trading-api.kalshi.com/trade-api/v2";
+const PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 
 function getBase() {
   return process.env.NEXT_PUBLIC_KALSHI_ENV === "demo" ? DEMO_BASE : PROD_BASE;
