@@ -46,6 +46,19 @@ const ECON_SERIES = [
 ];
 
 // Strategy tags
+
+function tradePriceForSide(yesPrice, side) {
+  return side === "yes" ? yesPrice : 1 - yesPrice;
+}
+
+function tradeProbForSide(probYes, side) {
+  return side === "yes" ? probYes : 1 - probYes;
+}
+
+function inProbBand(p, lo = 0.40, hi = 0.50) {
+  return typeof p === "number" && p >= lo && p <= hi;
+}
+
 const STRAT = {
   WEATHER: "WX_EDGE",         // NWS ensemble vs market
   FLB: "FAV_LONGSHOT",        // Favorite-longshot bias exploitation
@@ -469,7 +482,7 @@ export default function Apex() {
       ).slice(0, cfg.maxPos - positions.length);
       for (const sig of topSignals) {
         if (!positions.find(p => p.ticker === sig.ticker)) {
-          await execTrade(sig);
+          if (!inProbBand(tradeProbForSide(sig.prob, sig.side || (sig.edge > 0 ? 'yes' : 'no')), 0.40, 0.50)) { addLog('SKIP prob band (40–50%)'); } else { await execTrade(sig); }
         }
       }
     }
@@ -482,31 +495,73 @@ export default function Apex() {
   }, [cfg, positions, connected]);
 
   // Trading
-  const execTrade = async (s) => {
+  
+const execTrade = async (s) => {
+    // Never trade tail probabilities / lotto contracts (server also enforces 10c–90c)
     const side = s.side || (s.edge > 0 ? "yes" : "no");
-    const entryPrice = side === "yes" ? s.price : 1 - s.price;
+    const entryPrice = tradePriceForSide(s.price, side);
+    const tradeProb = tradeProbForSide(s.prob, side);
+
+    // Only trade if implied probability is in the 40–50% band
+    if (!inProbBand(tradeProb, 0.40, 0.50)) {
+      addLog(`SKIP prob band: ${Math.round(tradeProb * 100)}% (requires 40–50%)`);
+      return;
+    }
+
+    // Enforce UI price floor/ceiling against the ACTUAL side price we will trade
+    if (!shouldTradePrice(entryPrice) || entryPrice < cfg.pMin || entryPrice > cfg.pMax) {
+      addLog(`SKIP price gate: ${(entryPrice * 100).toFixed(0)}c (allowed ${(cfg.pMin*100).toFixed(0)}c–${(cfg.pMax*100).toFixed(0)}c)`);
+      return;
+    }
+
     const contracts = s.contracts || Math.max(1, Math.floor(cfg.bet / entryPrice));
     if (contracts < 1) return;
 
+    // Take-profit is treated as % gain (e.g. 20 => 20% gain)
+    const tpPct = Math.max(0, (cfg.tp || 0) / 100);
+    const slPct = Math.max(0, (cfg.sl || 0) / 100);
+
     const pos = {
-      ...s, side, entryPrice, contracts,
-      tp: Math.min(99, Math.round(s.price * 100 + cfg.tp)),
-      sl: Math.max(1, Math.round(s.price * 100 - cfg.sl)),
-      entryTime: Date.now(), id: Date.now(), live: false,
+      ...s,
+      side,
+      entryPrice,
+      tradeProb,
+      contracts,
+      tpPct,
+      slPct,
+      entryTime: Date.now(),
+      id: Date.now(),
+      live: false,
     };
 
     if (connected) {
       const body = {
-        ticker: s.ticker, action: "buy", side, type: "limit",
+        ticker: s.ticker,
+        action: "buy",
+        side,
+        type: "limit",
         count: contracts,
         ...(side === "yes"
           ? { yes_price: s.limitPrice || Math.round(s.price * 100) }
           : { no_price: s.limitPrice || Math.round((1 - s.price) * 100) }),
         client_order_id: `apex-${Date.now()}`,
       };
-      const r = await authReq("/portfolio/orders", "POST", body);
-      if (r?.order) { pos.orderId = r.order.order_id; pos.live = true; }
+
+      // NOTE: Kalshi create order endpoint is /orders
+      const r = await authReq("/orders", "POST", body);
+      if (r?.order) {
+        pos.orderId = r.order.order_id;
+        pos.live = true;
+      } else if (r?.order_id) {
+        pos.orderId = r.order_id;
+        pos.live = true;
+      }
     }
+
+    setPositions((p) => [...p, pos]);
+    pushLog("OPEN", { ...pos });
+    setSt((prev) => ({ ...prev, trades: prev.trades + 1 }));
+  }
 
     setPositions(p => [...p, pos]);
     pushLog("OPEN", { ...pos });
