@@ -81,11 +81,6 @@ const load = () => { try { return JSON.parse(localStorage.getItem(SK)) || {}; } 
 const save = d => { try { localStorage.setItem(SK, JSON.stringify(d)); } catch {} };
 
 // API
-async function kGet(path, params = {}) {
-  const u = new URL(`${PUB}${path}`);
-  Object.entries(params).forEach(([k, v]) => v != null && u.searchParams.set(k, v));
-  try { const r = await fetch(u); return r.ok ? r.json() : null; } catch { return null; }
-}
 async function authReq(path, method = "GET", body = null) {
   try {
     const r = await fetch("/api/kalshi", {
