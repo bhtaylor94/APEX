@@ -157,11 +157,6 @@ function yesMidC(m) {
   return 50;
 }
 
-function tradePriceForSide(yesProb, side) {
-  const p = Number(yesProb);
-  return side === "yes" ? p : (1 - p);
-}
-
 function clamp01(x){ return Math.max(0, Math.min(1, x)); }
 
 function inProbBand(p, lo, hi) {
