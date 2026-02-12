@@ -1,119 +1,79 @@
-// pages/api/kalshi.js
-// Uses Kalshi's official JavaScript signing method from their docs:
-// https://docs.kalshi.com/getting_started/api_keys#javascript
-
 import crypto from "crypto";
 
-const DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2";
-const PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2";
+const PROD_ROOT = "https://api.elections.kalshi.com/trade-api/v2";
+const DEMO_ROOT = "https://demo-api.kalshi.co/trade-api/v2";
 
-function getBase() {
-  return process.env.NEXT_PUBLIC_KALSHI_ENV === "demo" ? DEMO_BASE : PROD_BASE;
+const ALLOWED = new Map([
+  ["GET", new Set([
+    "/portfolio/balance",
+    "/portfolio/positions",
+    "/portfolio/orders",
+    "/portfolio/fills",
+  ])],
+  ["POST", new Set([
+    "/orders",
+    "/orders/cancel",
+  ])],
+]);
+
+function getRoot() {
+  return (process.env.KALSHI_ENV || "demo") === "prod"
+    ? PROD_ROOT
+    : DEMO_ROOT;
 }
 
-// Reconstruct a valid PEM key from whatever Vercel gives us
-function fixPem(raw) {
-  let k = raw.trim();
-
-  // Remove wrapping quotes
-  if ((k[0] === '"' && k[k.length - 1] === '"') || (k[0] === "'" && k[k.length - 1] === "'")) {
-    k = k.slice(1, -1);
+function requireAuth(req, res) {
+  const token = process.env.ADMIN_TOKEN;
+  const auth = req.headers.authorization || "";
+  if (!token || auth !== `Bearer ${token}`) {
+    res.status(401).json({ error: "Unauthorized" });
+    return false;
   }
-
-  // Replace escaped newlines
-  k = k.replace(/\\n/g, "\n");
-
-  // Detect key type from whatever header fragment exists
-  const isRsa = /RSA/i.test(k);
-  const header = isRsa ? "-----BEGIN RSA PRIVATE KEY-----" : "-----BEGIN PRIVATE KEY-----";
-  const footer = isRsa ? "-----END RSA PRIVATE KEY-----" : "-----END PRIVATE KEY-----";
-
-  // Strip ALL header/footer variants (even malformed ones with wrong dash count)
-  let b64 = k
-    .replace(/-+BEGIN[^-]*-+/g, "")
-    .replace(/-+END[^-]*-+/g, "")
-    .replace(/[\s\r\n]+/g, "");
-
-  // Reformat into proper 64-char PEM lines
-  const lines = b64.match(/.{1,64}/g) || [];
-  return `${header}\n${lines.join("\n")}\n${footer}`;
+  return true;
 }
 
-// Kalshi's official JS signing method (from their docs)
-function signPssText(privateKeyPem, text) {
-  const sign = crypto.createSign("RSA-SHA256");
-  sign.update(text);
-  sign.end();
+function isAllowed(method, path) {
+  return ALLOWED.has(method) && ALLOWED.get(method).has(path);
+}
 
-  const signature = sign.sign({
-    key: privateKeyPem,
+function signRequest(timestamp, method, path, privateKey) {
+  const msg = `${timestamp}${method}${path}`;
+  const signer = crypto.createSign("RSA-SHA256");
+  signer.update(msg);
+  signer.end();
+  return signer.sign({
+    key: privateKey,
     padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
     saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST,
-  });
-
-  return signature.toString("base64");
+  }).toString("base64");
 }
 
 export default async function handler(req, res) {
-  const keyId = process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID;
-  const rawKey = process.env.KALSHI_PRIVATE_KEY;
+  if (!requireAuth(req, res)) return;
+  if (req.method !== "POST") return res.status(405).end();
 
-  if (!keyId || !rawKey || keyId === "your-api-key-id-here") {
-    return res.status(200).json({ error: "no_keys", message: "API keys not configured." });
+  const { path, method, body } = req.body || {};
+  const m = (method || "").toUpperCase();
+  const p = String(path || "");
+
+  if (!isAllowed(m, p)) {
+    return res.status(403).json({ error: "Path not allowed", method: m, path: p });
   }
 
-  const { path, method = "GET", body } = req.body || {};
-  if (!path) return res.status(400).json({ error: "Missing path" });
+  const ts = Date.now();
+  const sig = signRequest(ts, m, p, process.env.KALSHI_PRIVATE_KEY);
 
-  const base = getBase();
-  const fullPath = `/trade-api/v2${path}`;
-  const timestamp = String(Date.now());
+  const r = await fetch(getRoot() + p, {
+    method: m,
+    headers: {
+      "Content-Type": "application/json",
+      "KALSHI-ACCESS-KEY": process.env.KALSHI_KEY_ID,
+      "KALSHI-ACCESS-TIMESTAMP": String(ts),
+      "KALSHI-ACCESS-SIGNATURE": sig,
+    },
+    body: m === "GET" ? undefined : JSON.stringify(body || {}),
+  });
 
-  try {
-    const privateKeyPem = fixPem(rawKey);
-
-    // Build the message to sign: timestamp + method + path (no query params)
-    const pathWithoutQuery = fullPath.split("?")[0];
-    const msgString = timestamp + method + pathWithoutQuery;
-    const sig = signPssText(privateKeyPem, msgString);
-
-    const url = `${base}${path}`;
-
-    const opts = {
-      method,
-      headers: {
-        "Content-Type": "application/json",
-        "KALSHI-ACCESS-KEY": keyId,
-        "KALSHI-ACCESS-TIMESTAMP": timestamp,
-        "KALSHI-ACCESS-SIGNATURE": sig,
-      },
-    };
-
-    if (body && method !== "GET") {
-      opts.body = JSON.stringify(body);
-    }
-
-    const resp = await fetch(url, opts);
-    const text = await resp.text();
-
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
-
-    if (!resp.ok) {
-      return res.status(resp.status).json({
-        error: "kalshi_error",
-        status: resp.status,
-        detail: data,
-        base,
-        env: process.env.NEXT_PUBLIC_KALSHI_ENV || "prod",
-      });
-    }
-
-    return res.status(200).json(data);
-  } catch (err) {
-    return res.status(500).json({
-      error: "server_error",
-      message: err.message,
-    });
-  }
+  const text = await r.text();
+  res.status(r.status).send(text);
 }
