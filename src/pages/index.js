@@ -1,3 +1,5 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+import Head from "next/head";
 
 
 async function kGet(path, params = {}) {
@@ -13,8 +15,6 @@ async function kGet(path, params = {}) {
   }
 }
 
-import { useState, useEffect, useCallback, useRef } from "react";
-import Head from "next/head";
 
 // ═══════════════════════════════════════════════════════════════
 // APEX BOT v3 — Universal Kalshi Strategy Engine

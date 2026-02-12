@@ -1,23 +1,24 @@
-async function nws(path, params) {
-  const r = await fetch("http://localhost:3000/api/nws", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, params }),
+const NWS_ROOT = "https://api.weather.gov";
+
+function userAgent() {
+  // Recommended by NWS: include a UA with contact info
+  return process.env.NWS_USER_AGENT || "APEXBot/1.0 (contact: unknown)";
+}
+
+async function nwsAbs(url) {
+  const r = await fetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": userAgent(),
+      "Accept": "application/geo+json",
+    },
   });
   if (!r.ok) return null;
   return r.json();
 }
 
-// Vercel doesn't provide localhost:3000 in production.
-// We'll call the route handler internally by reusing fetch relative URL.
-async function nwsRel(path, params) {
-  const r = await fetch("/api/nws", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path, params }),
-  });
-  if (!r.ok) return null;
-  return r.json();
+async function nws(path) {
+  return nwsAbs(NWS_ROOT + path);
 }
 
 export default async function handler(req, res) {
@@ -27,35 +28,50 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "lat, lon, station required" });
   }
 
-  const NWS = "https://api.weather.gov";
+  // Points + latest observation
   const [pt, obs] = await Promise.all([
-    nwsRel(`/points/${lat},${lon}`),
-    nwsRel(`/stations/${station}/observations/latest`),
+    nws(`/points/${lat},${lon}`),
+    nws(`/stations/${station}/observations/latest`),
   ]);
 
   let hi = null, hrMax = null, desc = null;
+
+  // Daytime forecast high
   if (pt?.properties?.forecast) {
-    const fc = await nwsRel(pt.properties.forecast.replace(NWS, ""));
-    const day = fc?.properties?.periods?.find(p => p.isDaytime);
-    hi = day?.temperature ?? null;
+    const fc = await nwsAbs(pt.properties.forecast);
+    const day = fc?.properties?.periods?.find((p) => p?.isDaytime);
+    hi = (day && typeof day.temperature === "number") ? day.temperature : null;
     desc = day?.shortForecast ?? null;
   }
-  if (pt?.properties?.forecastHourly) {
-    const hc = await nwsRel(pt.properties.forecastHourly.replace(NWS, ""));
-    const dh = hc?.properties?.periods?.filter(p => p.isDaytime)?.slice(0, 12);
-    if (dh?.length) hrMax = Math.max(...dh.map(h => h.temperature));
-  }
-  const cur = obs?.properties?.temperature?.value != null
-    ? Math.round(obs.properties.temperature.value * 9 / 5 + 32) : null;
 
+  // Hourly forecast max (daytime)
+  if (pt?.properties?.forecastHourly) {
+    const hc = await nwsAbs(pt.properties.forecastHourly);
+    const dh = hc?.properties?.periods
+      ?.filter((p) => p?.isDaytime)
+      ?.slice(0, 18);
+    if (dh?.length) {
+      const temps = dh.map((h) => h.temperature).filter((t) => typeof t === "number");
+      if (temps.length) hrMax = Math.max(...temps);
+    }
+  }
+
+  // Current observation (C -> F)
+  const cur = (obs?.properties?.temperature?.value != null)
+    ? Math.round(obs.properties.temperature.value * 9 / 5 + 32)
+    : null;
+
+  // Simple ensemble: blend available signals
   const srcs = [];
-  if (hi != null) srcs.push({ t: hi, w: 0.45 });
+  if (hi != null) srcs.push({ t: hi, w: 0.5 });
   if (hrMax != null) srcs.push({ t: hrMax, w: 0.35 });
-  if (cur != null && hi != null) srcs.push({ t: Math.round(cur + (hi - cur) * 0.55), w: 0.2 });
+  if (cur != null && hi != null) srcs.push({ t: Math.round(cur + (hi - cur) * 0.55), w: 0.15 });
 
   const tw = srcs.reduce((s, x) => s + x.w, 0);
   const ens = tw > 0 ? Math.round(srcs.reduce((s, x) => s + x.t * x.w, 0) / tw) : hi;
-  const sig = srcs.length >= 2
+
+  // Uncertainty proxy: if we have multiple signals, use spread; otherwise default
+  const sig = (srcs.length >= 2 && ens != null)
     ? Math.max(1.5, Math.sqrt(srcs.reduce((s, x) => s + (x.t - ens) ** 2, 0) / srcs.length))
     : 3;
 
