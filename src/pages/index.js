@@ -1,3 +1,18 @@
+
+
+async function kGet(path, params = {}) {
+  try {
+    const r = await fetch("/api/kalshi_public", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, params }),
+    });
+    return r.ok ? r.json() : null;
+  } catch {
+    return null;
+  }
+}
+
 import { useState, useEffect, useCallback, useRef } from "react";
 import Head from "next/head";
 
