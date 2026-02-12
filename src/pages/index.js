@@ -658,14 +658,15 @@ const execTrade = async (s) => {
             ? { yes_price: Math.round(yesMid * 100) }
             : { no_price: Math.round((1 - yesMid) * 100) }),
           client_order_id: `apex-close-${Date.now()}`,
-      
-
-    // refresh from Kalshi so UI clears even if the sell fills slowly
-    setTimeout(() => { syncPortfolioPositions(); }, 1500);
-  };
+        };
 
         await authReq("/orders", "POST", body);
-      } catch {}
+
+        // refresh from Kalshi so UI clears even if the sell fills slowly
+        setTimeout(() => { syncPortfolioPositions(); }, 1500);
+      } catch (e) {
+        // ignore; UI still removes locally, portfolio sync will reconcile
+      }
     }
 
     setPositions(prev => {
@@ -678,17 +679,7 @@ const execTrade = async (s) => {
     });
   };
 
-
-  const pushLog = (type, d) => {
-    setLog(l => [{
-      type, strat: d.strategy, ticker: d.ticker, side: d.side,
-      qty: d.contracts, price: d.entryPrice || d.price, edge: d.edge,
-      reason: d.reason || "", live: d.live, time: new Date().toISOString(),
-    }, ...l].slice(0, 500));
-  };
-
-  // Bot loop
-  useEffect(() => {
+useEffect(() => {
     if (!on) return;
     scanAll();
     const iv = setInterval(scanAll, cfg.interval * 1000);
