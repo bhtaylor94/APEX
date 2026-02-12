@@ -633,7 +633,7 @@ const execTrade = async (s) => {
 
   
   const closePos = async (id, pnl = 0) => {
-    const p = positions.find(x => x.id === id);
+    const p = positions.find((x) => x.id === id);
     if (!p) return;
 
     // If connected, send a sell order (limit at current mid). Then optimistically remove from UI.
@@ -660,22 +660,23 @@ const execTrade = async (s) => {
           client_order_id: `apex-close-${Date.now()}`,
         };
 
+        // NOTE: Kalshi create order endpoint is /orders
         await authReq("/orders", "POST", body);
 
-        // refresh from Kalshi so UI clears even if the sell fills slowly
-        setTimeout(() => { syncPortfolioPositions(); }, 1500);
+        // Refresh from Kalshi so UI clears even if the sell fills slowly
+        setTimeout(syncPortfolioPositions, 1500);
       } catch (e) {
         // ignore; UI still removes locally, portfolio sync will reconcile
       }
     }
 
-    setPositions(prev => {
-      const hit = prev.find(x => x.id === id);
+    setPositions((prev) => {
+      const hit = prev.find((x) => x.id === id);
       if (hit) {
         pushLog("CLOSE", hit);
-        setSt(s => ({ ...s, pnl: s.pnl + pnl, wins: s.wins + (pnl > 0 ? 1 : 0) }));
+        setSt((s) => ({ ...s, pnl: s.pnl + pnl, wins: s.wins + (pnl > 0 ? 1 : 0) }));
       }
-      return prev.filter(x => x.id !== id);
+      return prev.filter((x) => x.id !== id);
     });
   };
 
