@@ -501,10 +501,11 @@ const execTrade = async (s) => {
     const side = s.side || (s.edge > 0 ? "yes" : "no");
     const entryPrice = tradePriceForSide(s.price, side);
     const tradeProb = tradeProbForSide(s.prob, side);
+    const marketYesProb = Number(s.price); // market-implied YES probability
 
     // Only trade if implied probability is in the 40–50% band
-    if (!inProbBand(tradeProb, 0.40, 0.50)) {
-      addLog(`SKIP prob band: ${Math.round(tradeProb * 100)}% (requires 40–50%)`);
+    if (!inProbBand(marketYesProb, 0.40, 0.50)) {
+      addLog(`SKIP prob band (market YES): ${Math.round(marketYesProb * 100)}% (requires 40–50%)`);
       return;
     }
 
@@ -561,11 +562,6 @@ const execTrade = async (s) => {
     setPositions((p) => [...p, pos]);
     pushLog("OPEN", { ...pos });
     setSt((prev) => ({ ...prev, trades: prev.trades + 1 }));
-  }
-
-    setPositions(p => [...p, pos]);
-    pushLog("OPEN", { ...pos });
-    setSt(prev => ({ ...prev, trades: prev.trades + 1 }));
   };
 
   const closePos = (id, pnl = 0) => {
