@@ -577,8 +577,8 @@ const execTrade = async (s) => {
     }
 
     // Enforce UI price floor/ceiling against the ACTUAL side price we will trade
-    if (!shouldTradePrice(entryPrice) || entryPrice < cfg.pMin || entryPrice > cfg.pMax) {
-      addLog(`SKIP price gate: ${(entryPrice * 100).toFixed(0)}c (allowed ${(cfg.pMin*100).toFixed(0)}c–${(cfg.pMax*100).toFixed(0)}c)`);
+    if (!shouldTradePrice(entryPrice) || entryPrice < (cfg.pMin / 100) || entryPrice > (cfg.pMax / 100)) {
+      addLog(`SKIP price gate: ${(entryPrice * 100).toFixed(0)}c (allowed ${f0(cfg.pMin)}c–${f0(cfg.pMax)}c)`);
       return;
     }
 
