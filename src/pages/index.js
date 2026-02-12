@@ -69,6 +69,10 @@ const normCDF = (x, mean, std) => {
 };
 
 // Kelly criterion: f* = (bp - q) / b where b=odds, p=win prob, q=lose prob
+function shouldTradePrice(price) {
+  return typeof price === "number" && price >= 0.10 && price <= 0.90;
+}
+
 function kellyFraction(prob, price, fraction = 0.25) {
   const b = (1 - price) / price; // payout odds
   const f = (b * prob - (1 - prob)) / b;
@@ -91,39 +95,49 @@ async function authReq(path, method = "GET", body = null) {
     return d.error === "no_keys" ? { noKeys: true } : d;
   } catch { return null; }
 }
-async function nwsGet(path) {
-  try { const r = await fetch(`${NWS}${path}`, { headers: { "User-Agent": "Apex/3" } }); return r.ok ? r.json() : null; } catch { return null; }
+async function nwsGet(path, params = {}) {
+  try {
+    const r = await fetch("/api/nws", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, params }),
+    });
+    return r.ok ? r.json() : null;
+  } catch {
+    return null;
+  }
 }
 
 // ═══ STRATEGY ENGINES ═══
 
 // 1. WEATHER EDGE — NWS ensemble vs Kalshi price
 async function wxForecast(city) {
-  const [pt, obs] = await Promise.all([
-    nwsGet(`/points/${city.lat},${city.lon}`),
-    nwsGet(`/stations/${city.station}/observations/latest`),
-  ]);
-  let hi = null, hrMax = null, desc = null;
-  if (pt?.properties?.forecast) {
-    const fc = await nwsGet(pt.properties.forecast.replace(NWS, ""));
-    const day = fc?.properties?.periods?.find(p => p.isDaytime);
-    hi = day?.temperature ?? null; desc = day?.shortForecast ?? null;
-  }
-  if (pt?.properties?.forecastHourly) {
-    const hc = await nwsGet(pt.properties.forecastHourly.replace(NWS, ""));
-    const dh = hc?.properties?.periods?.filter(p => p.isDaytime)?.slice(0, 12);
-    if (dh?.length) hrMax = Math.max(...dh.map(h => h.temperature));
-  }
-  const cur = obs?.properties?.temperature?.value != null
-    ? Math.round(obs.properties.temperature.value * 9 / 5 + 32) : null;
-  const srcs = [];
-  if (hi != null) srcs.push({ t: hi, w: 0.45 });
-  if (hrMax != null) srcs.push({ t: hrMax, w: 0.35 });
-  if (cur != null && hi != null) srcs.push({ t: Math.round(cur + (hi - cur) * 0.55), w: 0.2 });
-  const tw = srcs.reduce((s, x) => s + x.w, 0);
-  const ens = tw > 0 ? Math.round(srcs.reduce((s, x) => s + x.t * x.w, 0) / tw) : hi;
-  const sig = srcs.length >= 2 ? Math.max(1.5, Math.sqrt(srcs.reduce((s, x) => s + (x.t - ens) ** 2, 0) / srcs.length)) : 3;
-  return { ens, sig, cur, hi, hrMax, desc };
+  // Current forecast/obs from NWS via server proxy (avoids CORS + ensures proper headers)
+  const cur = await fetch("/api/weather_current", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lat: city.lat, lon: city.lon, station: city.station }),
+  }).then(r => r.ok ? r.json() : null);
+
+  // Historical daily highs from NOAA CDO (10-year +/-10d window), cached server-side
+  const hist = await fetch("/api/weather_history", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lat: city.lat, lon: city.lon, years: 10, windowDays: 10 }),
+  }).then(r => r.ok ? r.json() : null);
+
+  if (!cur) return null;
+
+  // Combine current forecast with historical distribution to get a more data-driven sigma.
+  // If NOAA history is available, use its std (bounded) as uncertainty.
+  const sig = (hist && typeof hist.std === "number" && hist.std > 0)
+    ? Math.max(1.5, Math.min(12, hist.std))
+    : cur.sig;
+
+  // Center on current ensemble estimate; history mainly informs uncertainty.
+  const ens = cur.ens;
+
+  return { ...cur, ens, sig, hist };
 }
 
 function evalWeatherMkt(mkt, wx) {
@@ -135,7 +149,7 @@ function evalWeatherMkt(mkt, wx) {
   const thresh = parseInt(m[1]);
   const above = !/below|lower|less|under/i.test(title);
   const raw = above ? 1 - normCDF(thresh, wx.ens, wx.sig) : normCDF(thresh, wx.ens, wx.sig);
-  const prob = Math.max(0.02, Math.min(0.98, raw));
+  const prob = Math.max(0.001, Math.min(0.999, raw));
   const edge = (prob - price) * 100;
   const kelly = kellyFraction(prob, price);
   return {

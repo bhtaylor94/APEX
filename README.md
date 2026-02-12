@@ -83,3 +83,15 @@ apex-bot/
 ## Disclaimer
 
 This is for educational/research purposes. Trading prediction markets involves financial risk. Use demo mode first. No guarantees of profit.
+
+
+## NOAA Weather Data (Current + Historical)
+
+This app can use:
+- NWS API (no key) for current forecasts/observations.
+- NOAA Climate Data Online (CDO) Web Services v2 for historical daily highs (requires token).
+
+Set env vars:
+- `NWS_USER_AGENT` (recommended by NWS)
+- `NOAA_CDO_TOKEN` (request from NOAA token page)
+
