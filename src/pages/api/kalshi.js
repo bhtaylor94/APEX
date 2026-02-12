@@ -11,16 +11,32 @@ function getBase() {
   return process.env.NEXT_PUBLIC_KALSHI_ENV === "demo" ? DEMO_BASE : PROD_BASE;
 }
 
-// Restore newlines in PEM key that Vercel env vars may have mangled
+// Reconstruct a valid PEM key from whatever Vercel gives us
 function fixPem(raw) {
   let k = raw.trim();
+
   // Remove wrapping quotes
   if ((k[0] === '"' && k[k.length - 1] === '"') || (k[0] === "'" && k[k.length - 1] === "'")) {
     k = k.slice(1, -1);
   }
-  // Replace escaped newlines with real ones
+
+  // Replace escaped newlines
   k = k.replace(/\\n/g, "\n");
-  return k;
+
+  // Detect key type from whatever header fragment exists
+  const isRsa = /RSA/i.test(k);
+  const header = isRsa ? "-----BEGIN RSA PRIVATE KEY-----" : "-----BEGIN PRIVATE KEY-----";
+  const footer = isRsa ? "-----END RSA PRIVATE KEY-----" : "-----END PRIVATE KEY-----";
+
+  // Strip ALL header/footer variants (even malformed ones with wrong dash count)
+  let b64 = k
+    .replace(/-+BEGIN[^-]*-+/g, "")
+    .replace(/-+END[^-]*-+/g, "")
+    .replace(/[\s\r\n]+/g, "");
+
+  // Reformat into proper 64-char PEM lines
+  const lines = b64.match(/.{1,64}/g) || [];
+  return `${header}\n${lines.join("\n")}\n${footer}`;
 }
 
 // Kalshi's official JS signing method (from their docs)
