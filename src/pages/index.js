@@ -632,35 +632,53 @@ const execTrade = async (s) => {
   };
 
   
-  const closePos = async (posId, unrealPnl) => {
-  try {
-    const p = positions.find(x => x.id === posId);
+  const closePos = async (id, pnl = 0) => {
+    const p = positions.find((x) => x.id === id);
     if (!p) return;
 
-    // Sell by taking the opposite side
-    const side = p.side === "yes" ? "no" : "yes";
+    // If connected, send a sell order (limit at current mid). Then optimistically remove from UI.
+    if (connected && p.live) {
+      try {
+        const mkts = await kGet("/markets", { ticker: p.ticker });
+        const mkt = mkts?.markets?.[0] || mkts?.results?.[0] || mkts?.[0];
+        const yesMidC =
+          mkt?.yes_bid != null
+            ? (mkt.yes_bid + (mkt.yes_ask || mkt.yes_bid)) / 2
+            : (mkt?.yes_price || mkt?.last_price || 50);
 
-    const body = {
-      action: "buy",
-      client_order_id: ["close", posId, String(Date.now())].join("-"),
-      count: Number(p.contracts || 1),
-      side,
-      ticker: p.ticker,
-      type: "market"
-    };
+        const yesMid = yesMidC / 100;
 
-    await authReq("/orders", "POST", body);
+        const body = {
+          ticker: p.ticker,
+          action: "sell",
+          side: p.side,
+          type: "limit",
+          count: p.contracts,
+          ...(p.side === "yes"
+            ? { yes_price: Math.round(yesMid * 100) }
+            : { no_price: Math.round((1 - yesMid) * 100) }),
+          client_order_id: `apex-close-${Date.now()}`,
+        };
 
-    // Optimistic UI: remove immediately
-    setPositions(prev => prev.filter(x => x.id !== posId));
+        // NOTE: Kalshi create order endpoint is /orders
+        await authReq("/orders", "POST", body);
 
-    // Then refresh from Kalshi so UI clears even if the fill is slow
-    setTimeout(syncPortfolioPositions, 1500);
-  } catch (e) {
-    console.error("closePos failed", e);
-  }
-};
-;
+        // Refresh from Kalshi so UI clears even if the sell fills slowly
+        setTimeout(syncPortfolioPositions, 1500);
+      } catch (e) {
+        // ignore; UI still removes locally, portfolio sync will reconcile
+      }
+    }
+
+    setPositions((prev) => {
+      const hit = prev.find((x) => x.id === id);
+      if (hit) {
+        pushLog("CLOSE", hit);
+        setSt((s) => ({ ...s, pnl: s.pnl + pnl, wins: s.wins + (pnl > 0 ? 1 : 0) }));
+      }
+      return prev.filter((x) => x.id !== id);
+    });
+  };
 
 useEffect(() => {
     if (!on) return;
