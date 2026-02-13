@@ -15,6 +15,11 @@ export default async function handler(req, res) {
     const ticker = await tickerRes.json();
     const rawKlines = await klinesRes.json();
 
+    if (!Array.isArray(rawKlines)) {
+      const msg = rawKlines && (rawKlines.msg || rawKlines.message) ? (rawKlines.msg || rawKlines.message) : JSON.stringify(rawKlines);
+      throw new Error(`Binance klines unexpected response: ${msg}`);
+    }
+
     const klines = rawKlines.map((k) => ({
       openTime: k[0],
       open: parseFloat(k[1]),
@@ -36,7 +41,7 @@ export default async function handler(req, res) {
       timestamp: Date.now(),
     });
   } catch (e) {
-    console.error("BTC price error:", e.message);
+    console.erroror("BTC price error:", e.message);
     res.status(500).json({ error: e.message });
   }
 }

@@ -199,7 +199,8 @@ export default function Dashboard() {
         try {
           const res = await fetch(`/api/kalshi/markets?series_ticker=${st}&status=open&limit=20`);
           const data = await res.json();
-          if (data.markets) allMarkets.push(...data.markets);
+          const ms = Array.isArray(data?.markets) ? data.markets : [];
+          if (ms.length) allMarkets.push(...ms);
         } catch { /* skip */ }
       }
 
@@ -207,7 +208,8 @@ export default function Dashboard() {
       try {
         const res = await fetch("/api/kalshi/markets?status=open&limit=100");
         const data = await res.json();
-        const btcOnes = (data.markets || []).filter(m => {
+        const all = Array.isArray(data?.markets) ? data.markets : [];
+        const btcOnes = all.filter(m => {
           const t = (m.title || "").toLowerCase();
           return (t.includes("bitcoin") || t.includes("btc")) && (t.includes("up or down") || t.includes("above") || t.includes("price today") || t.includes("price range"));
         });

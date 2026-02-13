@@ -18,44 +18,63 @@ function getPublicBaseUrl() {
 
 function formatPemKey(raw) {
   if (!raw) return raw;
-  let key = raw;
 
-  // Vercel env vars escape \n as literal \\n
-  if (key.includes("\\n")) {
-    key = key.replace(/\\n/g, "\n");
-  }
+  // Normalize common env-var encodings (Vercel often stores PEM as one line or with literal \n)
+  let key = String(raw).trim();
 
-  // Strip surrounding quotes if present
+  // Strip wrapping quotes
   key = key.replace(/^["']|["']$/g, "");
 
-  // Already properly formatted
-  if (key.includes("-----BEGIN") && key.includes("\n") && key.trim().endsWith("-----")) {
-    return key.trim();
+  // Convert literal \n to real newlines
+  key = key.replace(/\\n/g, "\n");
+
+  // Normalize CRLF
+  key = key.replace(/\r\n/g, "\n");
+
+  const hasBegin = key.includes("-----BEGIN");
+  const hasEnd = key.includes("-----END");
+
+  // If PEM is on one line (BEGIN...base64...END), reconstruct with wrapped base64
+  if (hasBegin && hasEnd && !key.includes("\n")) {
+    const beginMatch = key.match(/-----BEGIN [A-Z ]+-----/);
+    const endMatch = key.match(/-----END [A-Z ]+-----/);
+    if (beginMatch && endMatch) {
+      const header = beginMatch[0];
+      const footer = endMatch[0];
+      const body = key
+        .replace(header, "")
+        .replace(footer, "")
+        .replace(/\s+/g, "");
+      const lines = body.match(/.{1,64}/g) || [];
+      return `${header}\n${lines.join("\n")}\n${footer}`.trim();
+    }
   }
 
   // Raw base64 without PEM wrapper
-  if (!key.includes("-----BEGIN")) {
+  if (!hasBegin) {
     const clean = key.replace(/[\s"']+/g, "");
     const lines = clean.match(/.{1,64}/g) || [];
-    return `-----BEGIN RSA PRIVATE KEY-----\n${lines.join("\n")}\n-----END RSA PRIVATE KEY-----`;
+    // Prefer PKCS#8 wrapper
+    return `-----BEGIN PRIVATE KEY-----\n${lines.join("\n")}\n-----END PRIVATE KEY-----`;
   }
 
-  // All on one line — reformat
+  // Ensure header/footer are separated by newlines and body is wrapped at 64 chars
   key = key
-    .replace(/-----BEGIN RSA PRIVATE KEY-----\s*/, "-----BEGIN RSA PRIVATE KEY-----\n")
-    .replace(/\s*-----END RSA PRIVATE KEY-----/, "\n-----END RSA PRIVATE KEY-----");
+    .replace(/(-----BEGIN [A-Z ]+-----)\s*/, "$1\n")
+    .replace(/\s*(-----END [A-Z ]+-----)/, "\n$1");
 
-  const match = key.match(
-    /-----BEGIN RSA PRIVATE KEY-----\n([\s\S]+)\n-----END RSA PRIVATE KEY-----/
-  );
+  const match = key.match(/-----BEGIN [A-Z ]+-----\n([\s\S]+)\n-----END [A-Z ]+-----/);
   if (match) {
     const b64 = match[1].replace(/\s+/g, "");
     const lines = b64.match(/.{1,64}/g) || [];
-    return `-----BEGIN RSA PRIVATE KEY-----\n${lines.join("\n")}\n-----END RSA PRIVATE KEY-----`;
+    const header = key.match(/-----BEGIN [A-Z ]+-----/)[0];
+    const footer = key.match(/-----END [A-Z ]+-----/)[0];
+    return `${header}\n${lines.join("\n")}\n${footer}`.trim();
   }
 
   return key.trim();
 }
+
 
 function signRequest(privateKeyPem, timestamp, method, path) {
   const pathOnly = path.split("?")[0];
