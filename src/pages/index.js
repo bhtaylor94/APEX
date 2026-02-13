@@ -1,5 +1,4 @@
 import BotControlsMobile from "../components/BotControlsMobile";
-import BotControlPanel from "../components/BotControlPanel";
 // pages/index.js — Apex BTC Bot Dashboard
 import { useState, useEffect, useCallback, useRef } from "react";
 import Head from "next/head";
@@ -98,7 +97,7 @@ function Gauge({ label, value, score, format }) {
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "5px" }}>
         <span style={{ fontSize: "10px", color: "var(--dim)", textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</span>
         <span style={{ fontSize: "12px", color, fontWeight: 700 }}>{format ? format(value) : typeof value === "number" ? value.toFixed(1) : "--"}</span>
-      <BotControlPanel /></div>
+</div>
       <div style={{ height: "3px", background: "var(--border)", borderRadius: "2px", overflow: "hidden" }}>
         <div style={{ height: "100%", width: `${((score + 1) / 2) * 100}%`, background: color, borderRadius: "2px", transition: "width 0.3s" }} />
       </div>
@@ -425,6 +424,10 @@ export default function Dashboard() {
   return (
     <>
       <Head><title>Apex BTC Bot — Kalshi Autonomous Trader</title></Head>
+      <style jsx global>{`
+        .apex-mobile-controls { display: block; margin: 12px auto 0; }
+        @media (min-width: 900px) { .apex-mobile-controls { display: none; } }
+      `}</style>
       <div style={{ minHeight: "100vh" }}>
 
         {/* ── Header ── */}
@@ -654,6 +657,3 @@ export default function Dashboard() {
   );
 }
 
-/* Mobile bot controls */
-export function __BotControlsMount__(){ return null }
-// Add <BotControlsMobile /> somewhere in your page JSX if you don't see it automatically.
