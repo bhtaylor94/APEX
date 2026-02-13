@@ -1,3 +1,21 @@
+function loadPemKey(raw) {
+  if (!raw) return "";
+  // If user stored key with literal \n, fix it
+  let k = String(raw).trim().replace(/\\n/g, "\n");
+
+  // If it's base64 (no PEM header), decode
+  if (!k.includes("BEGIN") && /^[A-Za-z0-9+/=\r\n]+$/.test(k) && k.length > 200) {
+    try {
+      const buf = Buffer.from(k.replace(/\s+/g, ""), "base64");
+      const decoded = buf.toString("utf8");
+      if (decoded.includes("BEGIN")) k = decoded.trim();
+    } catch {}
+  }
+
+  // Ensure it looks like PEM
+  return k;
+}
+
 import crypto from "crypto";
 
 function normalizePem(pem) {
@@ -30,7 +48,7 @@ export class KalshiClient {
 
     const pem = normalizePem(process.env.KALSHI_PRIVATE_KEY || "");
     if (!this.keyId || !pem) throw new Error("Missing Kalshi credentials (KALSHI_API_KEY_ID/KALSHI_PRIVATE_KEY)");
-    this.privateKey = crypto.createPrivateKey(pem);
+    this.privateKey = crypto.createPrivateKey(loadPemKey(process.env.KALSHI_PRIVATE_KEY));
   }
 
   sign(method, pathNoQuery, tsMs) {
