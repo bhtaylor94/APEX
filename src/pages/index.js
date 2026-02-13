@@ -58,7 +58,7 @@ const E = {
     sc.maCross = s5 && s20 ? ((s5 - s20) / s20 > 0.001 ? 0.4 : (s5 - s20) / s20 < -0.001 ? -0.4 : 0) : 0;
     const w = { rsi: 0.2, macd: 0.2, momentum: 0.25, bb: 0.15, vwm: 0.1, maCross: 0.1 };
     let comp = 0; for (const [k, s] of Object.entries(sc)) comp += s * (w[k] || 0);
-    const dir = comp > 0.15 ? "up" : comp < -0.15 ? "down" : "neutral";
+    const dir = comp > 0.08 ? "up" : comp < -0.08 ? "down" : "neutral";
     const conf = Math.min(Math.abs(comp) / 0.6, 1);
     return {
       direction: dir, confidence: conf, compositeScore: comp, currentPrice: p,
@@ -194,7 +194,7 @@ export default function Dashboard() {
     try {
       // Search multiple BTC series
       const allMarkets = [];
-      const seriesTickers = ["KXBTCUD", "KXBTCUDR", "KXBTC15"];
+      const seriesTickers = ["KXBTC15M", "kxbtc15m"];
 
       for (const st of seriesTickers) {
         try {
@@ -274,6 +274,9 @@ export default function Dashboard() {
 
     const { signal: sig } = btcResult;
     const mkts = await fetchMarkets();
+    if (!mkts || mkts.length === 0) {
+      addLog("No markets returned from Kalshi (check series_ticker/status).", "warn");
+    }
     await fetchPositions();
     await fetchSettlements();
     await fetchBalance();
@@ -301,8 +304,11 @@ export default function Dashboard() {
     // Evaluate each market for opportunities
     for (const market of mkts) {
       const title = (market.title || "").toLowerCase();
-      const isUpDown = title.includes("up or down") || title.includes("up/down");
-      if (!isUpDown) continue; // Focus on up/down markets
+      const isUpDown =
+      title.includes("up or down") ||
+      title.includes("up/down") ||
+      (title.includes("15") && title.includes("minute") && (title.includes("btc") || title.includes("bitcoin")));
+    if (!isUpDown) continue; // Focus on BTC 15m up/down-style markets
 
       const baseProbability = 0.5 + sig.confidence * 0.35;
       let side, marketPrice;
