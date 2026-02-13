@@ -1,39 +1,113 @@
 // lib/btc-engine.js
 // BTC Price feed + Technical analysis indicators
-// Uses Binance public API (free, no auth, ~1s updates)
+// Uses Coinbase Exchange public API (no auth). Binance is geo-restricted for many US deployments.
 
-const BINANCE_BASE = "https://api.binance.com/api/v3";
+const COINBASE_BASE = "https://api.exchange.coinbase.com";
+const COINBASE_PRODUCT = "BTC-USD";
+
+function intervalToGranularity(interval) {
+  // Coinbase granularity is in seconds.
+  // Supported granularities are typically: 60, 300, 900, 3600, 21600, 86400.
+  switch (interval) {
+    case "1m":
+      return 60;
+    case "5m":
+      return 300;
+    case "15m":
+      return 900;
+    case "1h":
+      return 3600;
+    case "6h":
+      return 21600;
+    case "1d":
+      return 86400;
+    default:
+      return 60;
+  }
+}
+
+function headers() {
+  // Some edge networks are picky without a UA.
+  return {
+    "User-Agent": "ApexBot/1.0",
+    Accept: "application/json",
+  };
+}
 
 export async function fetchBTCTicker() {
-  const res = await fetch(`${BINANCE_BASE}/ticker/24hr?symbol=BTCUSDT`);
-  if (!res.ok) throw new Error(`Binance ticker ${res.status}`);
-  const data = await res.json();
+  // Coinbase: /products/<product-id>/ticker
+  const tickerRes = await fetch(`${COINBASE_BASE}/products/${COINBASE_PRODUCT}/ticker`, {
+    headers: headers(),
+  });
+  if (!tickerRes.ok) {
+    const txt = await tickerRes.text().catch(() => "");
+    throw new Error(`Coinbase ticker ${tickerRes.status} ${txt}`);
+  }
+  const ticker = await tickerRes.json();
+
+  // Coinbase: /products/<product-id>/stats (24h)
+  const statsRes = await fetch(`${COINBASE_BASE}/products/${COINBASE_PRODUCT}/stats`, {
+    headers: headers(),
+  });
+  if (!statsRes.ok) {
+    const txt = await statsRes.text().catch(() => "");
+    throw new Error(`Coinbase stats ${statsRes.status} ${txt}`);
+  }
+  const stats = await statsRes.json();
+
+  const price = parseFloat(ticker.price);
+  const open = parseFloat(stats.open);
+  const priceChange = price - open;
+  const priceChangePct = open > 0 ? (priceChange / open) * 100 : 0;
+
   return {
-    price: parseFloat(data.lastPrice),
-    volume24h: parseFloat(data.volume),
-    priceChange: parseFloat(data.priceChange),
-    priceChangePct: parseFloat(data.priceChangePercent),
-    high24h: parseFloat(data.highPrice),
-    low24h: parseFloat(data.lowPrice),
+    price,
+    volume24h: parseFloat(stats.volume),
+    priceChange,
+    priceChangePct,
+    high24h: parseFloat(stats.high),
+    low24h: parseFloat(stats.low),
     timestamp: Date.now(),
   };
 }
 
 export async function fetchBTCKlines(interval = "1m", limit = 100) {
-  const res = await fetch(
-    `${BINANCE_BASE}/klines?symbol=BTCUSDT&interval=${interval}&limit=${limit}`
-  );
-  if (!res.ok) throw new Error(`Binance klines ${res.status}`);
+  const granularity = intervalToGranularity(interval);
+  const end = new Date();
+  const start = new Date(end.getTime() - granularity * 1000 * Math.max(10, limit));
+
+  // Coinbase candles return: [ time, low, high, open, close, volume ]
+  // and are typically returned in reverse chronological order.
+  const url = new URL(`${COINBASE_BASE}/products/${COINBASE_PRODUCT}/candles`);
+  url.searchParams.set("granularity", String(granularity));
+  url.searchParams.set("start", start.toISOString());
+  url.searchParams.set("end", end.toISOString());
+
+  const res = await fetch(url.toString(), { headers: headers() });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`Coinbase candles ${res.status} ${txt}`);
+  }
   const data = await res.json();
-  return data.map((k) => ({
-    openTime: k[0],
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-    closeTime: k[6],
-  }));
+  if (!Array.isArray(data)) {
+    throw new Error(`Coinbase candles unexpected response`);
+  }
+
+  const candles = data
+    .slice(0, limit)
+    .map((k) => ({
+      // k[0] is epoch seconds
+      openTime: k[0] * 1000,
+      low: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      open: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+      closeTime: (k[0] + granularity) * 1000,
+    }))
+    .sort((a, b) => a.openTime - b.openTime);
+
+  return candles;
 }
 
 // ── Technical Indicators ──
