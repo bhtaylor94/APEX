@@ -1,3 +1,4 @@
+import BotControlPanel from "../components/BotControlPanel";
 // pages/index.js — Apex BTC Bot Dashboard
 import { useState, useEffect, useCallback, useRef } from "react";
 import Head from "next/head";
@@ -96,7 +97,7 @@ function Gauge({ label, value, score, format }) {
       <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "5px" }}>
         <span style={{ fontSize: "10px", color: "var(--dim)", textTransform: "uppercase", letterSpacing: "0.5px" }}>{label}</span>
         <span style={{ fontSize: "12px", color, fontWeight: 700 }}>{format ? format(value) : typeof value === "number" ? value.toFixed(1) : "--"}</span>
-      </div>
+      <BotControlPanel /></div>
       <div style={{ height: "3px", background: "var(--border)", borderRadius: "2px", overflow: "hidden" }}>
         <div style={{ height: "100%", width: `${((score + 1) / 2) * 100}%`, background: color, borderRadius: "2px", transition: "width 0.3s" }} />
       </div>

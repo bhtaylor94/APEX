@@ -9,7 +9,7 @@ export function defaultConfig() {
     tradeSizeUsd: 5,
     maxOpenPositions: 1,
 
-    minConfidence: 0.65,
+    minConfidence: 0.55,
 
     takeProfitPct: 0.20,
     stopLossPct: 0.12,
