@@ -244,25 +244,10 @@ export default function Dashboard() {
   }, []);
 
   // ── Order execution ──
-  const placeOrder = useCallback(async (ticker, side, count, price) => {
-    try {
-      const body = {
-        ticker, side, action: "buy", count, type: "limit",
-        [side === "yes" ? "yes_price" : "no_price"]: price,
-      };
-      const res = await fetch("/api/kalshi/order", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      return data;
-    } catch (e) {
-      addLog(`Order failed: ${e.message}`, "error");
-      throw e;
-    }
-  }, [addLog]);
+  const placeOrder = async () => {
+    addLog("UI execution disabled — background bot only", "warn");
+    return null;
+  };
 
   // ── Bot scan cycle ──
   const runScan = useCallback(async () => {
