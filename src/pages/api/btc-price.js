@@ -41,7 +41,7 @@ export default async function handler(req, res) {
       timestamp: Date.now(),
     });
   } catch (e) {
-    console.erroror("BTC price error:", e.message);
+    console.error("BTC price error:", e.message);
     res.status(500).json({ error: e.message });
   }
 }
