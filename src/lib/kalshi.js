@@ -4,11 +4,8 @@
 
 import crypto from "crypto";
 
-const PROD_BASE = "https://trading-api.kalshi.com/trade-api/v2";
+const PROD_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 const DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2";
-
-// Also works via the elections subdomain (all markets, not just elections)
-const PROD_BASE_ALT = "https://api.elections.kalshi.com/trade-api/v2";
 
 function getBaseUrl() {
   return process.env.NEXT_PUBLIC_KALSHI_ENV === "demo" ? DEMO_BASE : PROD_BASE;
@@ -16,7 +13,7 @@ function getBaseUrl() {
 
 function getPublicBaseUrl() {
   // Public endpoints work on the elections URL without auth
-  return PROD_BASE_ALT;
+  return PROD_BASE;
 }
 
 function formatPemKey(raw) {
@@ -74,14 +71,15 @@ function signRequest(privateKeyPem, timestamp, method, path) {
 }
 
 function getAuthHeaders(method, path) {
-  const apiKeyId = process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID;
+  const apiKeyId = process.env.KALSHI_API_KEY_ID || process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID;
   const privateKey = process.env.KALSHI_PRIVATE_KEY;
 
   if (!apiKeyId || !privateKey) {
     throw new Error("Kalshi API credentials not configured");
   }
 
-  const timestamp = Math.floor(Date.now() / 1000).toString();
+  // Kalshi expects a millisecond timestamp (string)
+  const timestamp = Date.now().toString();
   const fullPath = `/trade-api/v2${path}`;
   const signature = signRequest(privateKey, timestamp, method, fullPath);
 
@@ -121,7 +119,7 @@ export async function kalshiPublicFetch(path) {
 
 export function isConfigured() {
   return !!(
-    process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID &&
+    process.env.KALSHI_API_KEY_ID || process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID &&
     process.env.KALSHI_PRIVATE_KEY
   );
 }
