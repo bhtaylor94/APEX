@@ -18,8 +18,6 @@ function rsi(closes, period = 14) {
 }
 
 export async function fetchCoinbaseCandles({ granularity=60, limit=120 } = {}) {
-  // Coinbase Exchange candles: /products/BTC-USD/candles
-  // returns [ time, low, high, open, close, volume ]
   const end = Math.floor(Date.now() / 1000);
   const start = end - granularity * limit;
 
@@ -34,16 +32,8 @@ export async function fetchCoinbaseCandles({ granularity=60, limit=120 } = {}) {
   const data = await res.json();
   if (!Array.isArray(data)) throw new Error("Coinbase candles unexpected response");
 
-  // Sort ascending by time
   data.sort((a,b) => a[0]-b[0]);
-  return data.map(d => ({
-    t: d[0],
-    o: d[3],
-    h: d[2],
-    l: d[1],
-    c: d[4],
-    v: d[5]
-  }));
+  return data.map(d => ({ t:d[0], l:d[1], h:d[2], o:d[3], c:d[4], v:d[5] }));
 }
 
 export function computeSignal(candles) {
@@ -52,19 +42,16 @@ export function computeSignal(candles) {
 
   const emaFast = ema(closes.slice(-60), 9);
   const emaSlow = ema(closes.slice(-60), 21);
-  const trendUp = emaFast > emaSlow;
-  const trendDown = emaFast < emaSlow;
 
   const r = rsi(closes, 14);
 
-  // Confidence: trend separation + RSI distance from 50
-  const sep = Math.min(1, Math.abs(emaFast - emaSlow) / last * 50); // scaled
+  const sep = Math.min(1, Math.abs(emaFast - emaSlow) / last * 50);
   const rsiConf = Math.min(1, Math.abs(r - 50) / 25);
   const confidence = Math.max(0, Math.min(1, 0.55 * sep + 0.45 * rsiConf));
 
   let dir = "NONE";
-  if (trendUp && r >= 45 && r <= 75) dir = "UP";
-  if (trendDown && r <= 55 && r >= 25) dir = "DOWN";
+  if (emaFast > emaSlow && r >= 45 && r <= 75) dir = "UP";
+  if (emaFast < emaSlow && r <= 55 && r >= 25) dir = "DOWN";
 
   return { dir, confidence, emaFast, emaSlow, rsi: r, last };
 }

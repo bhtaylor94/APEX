@@ -4,10 +4,8 @@ function normalizePem(pem) {
   if (!pem) return "";
   const trimmed = pem.trim();
 
-  // If pasted with literal "\n"
   if (trimmed.includes("\\n")) return trimmed.replace(/\\n/g, "\n");
 
-  // If it's one-line PEM: BEGIN...KEY-----MIIE...-----END...
   if (trimmed.includes("BEGIN") && trimmed.includes("END") && !trimmed.includes("\n")) {
     const m = trimmed.match(/(-----BEGIN [^-]+-----)(.+)(-----END [^-]+-----)/);
     if (!m) return trimmed;
@@ -23,21 +21,20 @@ function normalizePem(pem) {
 
 export class KalshiClient {
   constructor() {
-    this.keyId = process.env.KALSHI_API_KEY_ID || process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID || "";
-    this.env = (process.env.KALSHI_ENV || process.env.NEXT_PUBLIC_KALSHI_ENV || "prod").toLowerCase();
+    this.keyId = process.env.KALSHI_API_KEY_ID || "";
+    this.env = (process.env.KALSHI_ENV || "prod").toLowerCase();
     this.baseUrl =
       this.env === "demo"
         ? "https://demo-api.kalshi.co/trade-api/v2"
         : "https://api.elections.kalshi.com/trade-api/v2";
 
     const pem = normalizePem(process.env.KALSHI_PRIVATE_KEY || "");
-    if (!this.keyId || !pem) throw new Error("Missing Kalshi credentials (KALSHI_API_KEY_ID and/or KALSHI_PRIVATE_KEY)");
+    if (!this.keyId || !pem) throw new Error("Missing Kalshi credentials (KALSHI_API_KEY_ID/KALSHI_PRIVATE_KEY)");
     this.privateKey = crypto.createPrivateKey(pem);
   }
 
-  sign(method, path, tsMs) {
-    // Kalshi docs: sign concat(timestamp + method + path) and timestamp must be ms.  [oai_citation:0‡Kalshi API Docs](https://docs.kalshi.com/getting_started/api_keys?utm_source=chatgpt.com)
-    const payload = [tsMs, method.toUpperCase(), path].join("");
+  sign(method, pathNoQuery, tsMs) {
+    const payload = [tsMs, method.toUpperCase(), pathNoQuery].join("");
     const signer = crypto.createSign("RSA-SHA256");
     signer.update(payload);
     signer.end();
@@ -46,8 +43,8 @@ export class KalshiClient {
 
   async request(method, path, bodyObj) {
     const tsMs = Date.now().toString();
-    const cleanPath = path.split("?")[0]; // per Kalshi auth troubleshooting  [oai_citation:1‡Kalshi API Docs](https://docs.kalshi.com/getting_started/quick_start_authenticated_requests?utm_source=chatgpt.com)
-    const sig = this.sign(method, cleanPath, tsMs);
+    const pathNoQuery = path.split("?")[0];
+    const sig = this.sign(method, pathNoQuery, tsMs);
 
     const headers = {
       "Content-Type": "application/json",
@@ -56,7 +53,7 @@ export class KalshiClient {
       "KALSHI-ACCESS-SIGNATURE": sig
     };
 
-    const res = await fetch([this.baseUrl, path].join(""), {
+    const res = await fetch(this.baseUrl + path, {
       method,
       headers,
       body: bodyObj ? JSON.stringify(bodyObj) : undefined
@@ -73,18 +70,18 @@ export class KalshiClient {
     return data;
   }
 
-  // Portfolio
-  getBalance() {
-    return this.request("GET", "/portfolio/balance");
+  getMarkets({ series_ticker, status="open", limit=50 } = {}) {
+    const qs = new URLSearchParams();
+    if (series_ticker) qs.set("series_ticker", series_ticker);
+    if (status) qs.set("status", status);
+    qs.set("limit", String(limit));
+    return this.request("GET", "/markets?" + qs.toString());
   }
 
-  // Market data
-  getOrderbook(marketTicker, depth=1) {
-    return this.request("GET", ["/markets/", encodeURIComponent(marketTicker), "/orderbook?depth=", depth].join(""));
-  }
-
-  // Orders (Create Order endpoint)  [oai_citation:2‡Kalshi API Docs](https://docs.kalshi.com/api-reference/orders/create-order?utm_source=chatgpt.com)
-  createOrder({ ticker, type="market", action="buy", side="yes", count, yes_price }) {
-    return this.request("POST", "/portfolio/orders", { ticker, type, action, side, count, yes_price });
+  createOrder({ ticker, type="market", action="buy", side="yes", count, priceCents }) {
+    const payload = { ticker, type, action, side, count };
+    if (side === "yes") payload.yes_price = priceCents;
+    if (side === "no") payload.no_price = priceCents;
+    return this.request("POST", "/portfolio/orders", payload);
   }
 }

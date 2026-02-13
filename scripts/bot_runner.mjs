@@ -5,12 +5,10 @@ import { fetchCoinbaseCandles, computeSignal } from "./btc_signal.mjs";
 
 function nowMs() { return Date.now(); }
 function dayKey() { return new Date().toISOString().slice(0,10); }
-
-function clamp(n, a, b){ return Math.max(a, Math.min(b, n)); }
+function clamp(n,a,b){ return Math.max(a, Math.min(b, n)); }
 
 async function main() {
   const cfg = Object.assign({}, defaultConfig(), await kvGetJson("bot:config"));
-
   console.log("CONFIG:", cfg);
 
   if (!cfg.enabled) {
@@ -18,105 +16,91 @@ async function main() {
     return;
   }
 
-  // IMPORTANT: You must set the exact market tickers you want to trade
-  // in Upstash config. This avoids guessing the wrong BTC contract.
-  const MARKET_UP = cfg.marketTickerUp;
-  const MARKET_DOWN = cfg.marketTickerDown;
-  if (!MARKET_UP || !MARKET_DOWN) {
-    console.log("Missing cfg.marketTickerUp / cfg.marketTickerDown. Refusing to trade.");
-    return;
-  }
-
   const state = Object.assign(
-    { position: null, cooldownUntil: 0, daily: { date: dayKey(), pnlUsd: 0, trades: 0, lossStreak: 0 } },
+    { position: null, cooldownUntil: 0, daily: { date: dayKey(), pnlUsd: 0, trades: 0 } },
     await kvGetJson("bot:state")
   );
 
-  // Reset daily counters if new day
-  if (state.daily?.date !== dayKey()) {
-    state.daily = { date: dayKey(), pnlUsd: 0, trades: 0, lossStreak: 0 };
-  }
+  if (state.daily?.date !== dayKey()) state.daily = { date: dayKey(), pnlUsd: 0, trades: 0 };
 
   if (state.cooldownUntil && nowMs() < state.cooldownUntil) {
     console.log("Cooldown active until", new Date(state.cooldownUntil).toISOString());
     return;
   }
-
   if (state.daily.trades >= cfg.maxTradesPerDay) {
     console.log("Max trades/day reached.");
     return;
   }
-
   if (state.daily.pnlUsd <= -Math.abs(cfg.dailyMaxLossUsd)) {
-    console.log("Daily max loss reached. Halting trades for the day.");
+    console.log("Daily max loss reached.");
     return;
   }
 
-  // Fetch BTC candles (Coinbase) and compute signal
   const candles = await fetchCoinbaseCandles({ granularity: 60, limit: 120 });
   const sig = computeSignal(candles);
-
   console.log("SIGNAL:", sig);
-
-  if (sig.confidence < cfg.minConfidence || sig.dir === "NONE") {
-    console.log("No trade: signal too weak or NONE.");
-    return;
-  }
 
   const kalshi = new KalshiClient();
 
-  // Helper to get best ask/bid for YES side
-  async function bestYesPrices(marketTicker) {
-    const ob = await kalshi.getOrderbook(marketTicker, 1);
-    const yesAsks = ob?.orderbook?.yes_asks || [];
-    const yesBids = ob?.orderbook?.yes_bids || [];
-    const bestAsk = yesAsks.length ? yesAsks[0][0] : null; // price in cents
-    const bestBid = yesBids.length ? yesBids[0][0] : null;
-    return { bestAsk, bestBid };
+  // Pick active 15-minute market (soonest closing open market in series)
+  const mktsResp = await kalshi.getMarkets({ series_ticker: cfg.seriesTicker, status: "open", limit: 50 });
+  const markets = Array.isArray(mktsResp?.markets) ? mktsResp.markets : [];
+  if (!markets.length) {
+    console.log("No open markets for series:", cfg.seriesTicker);
+    return;
   }
+  markets.sort((a,b) => new Date(a.close_time).getTime() - new Date(b.close_time).getTime());
+  const m = markets[0];
+  const closeMs = new Date(m.close_time).getTime();
+  const minsToClose = (closeMs - nowMs()) / 60000;
 
-  // Decide which market to trade based on UP/DOWN
-  const targetMarket = sig.dir === "UP" ? MARKET_UP : MARKET_DOWN;
+  console.log("ACTIVE MARKET:", {
+    ticker: m.ticker,
+    yes: m.yes_sub_title,
+    no: m.no_sub_title,
+    close_time: m.close_time,
+    minsToClose: minsToClose.toFixed(2),
+    yes_ask: m.yes_ask,
+    no_ask: m.no_ask,
+    yes_bid: m.yes_bid,
+    no_bid: m.no_bid
+  });
 
-  // Position management
-  const pos = state.position;
+  // Exit logic
+  if (state.position) {
+    const pos = state.position;
+    const minsLeft = (pos.closeTimeMs - nowMs()) / 60000;
 
-  // Exit rules if we have a position
-  if (pos) {
-    const { bestBid } = await bestYesPrices(pos.marketTicker);
-    if (!bestBid) {
-      console.log("No bestBid available; skipping exit check.");
+    const bidCents = pos.side === "yes" ? (m.yes_bid ?? null) : (m.no_bid ?? null);
+    if (!bidCents) {
+      console.log("No bid for held side; skipping exit check.");
       return;
     }
 
-    const entry = pos.entryYesPriceCents;
-    const current = bestBid;
-    const pnlPct = (current - entry) / entry;
-
-    const openMins = (nowMs() - pos.openedAtMs) / 60000;
+    const entry = pos.entryPriceCents;
+    const current = bidCents;
+    const pnlPct = (current - entry) / Math.max(1, entry);
 
     const hitTP = pnlPct >= cfg.takeProfitPct;
     const hitSL = pnlPct <= -cfg.stopLossPct;
-    const hitTime = openMins >= cfg.timeStopMinutes;
-    const reversal = (sig.dir !== pos.side && sig.confidence >= clamp(cfg.minConfidence + 0.10, 0, 0.95));
+    const mustExitForTime = minsLeft <= cfg.minMinutesToCloseToHold;
 
-    console.log("POSITION:", { entry, current, pnlPct: pnlPct.toFixed(3), openMins: openMins.toFixed(1), hitTP, hitSL, hitTime, reversal });
+    const reversal = (sig.dir !== pos.direction && sig.confidence >= clamp(cfg.minConfidence + 0.10, 0, 0.95));
 
-    if (!hitTP && !hitSL && !hitTime && !reversal) {
+    console.log("POSITION:", { entry, current, pnlPct: pnlPct.toFixed(3), minsLeft: minsLeft.toFixed(2), hitTP, hitSL, mustExitForTime, reversal });
+
+    if (!hitTP && !hitSL && !mustExitForTime && !reversal) {
       console.log("Holding position.");
       return;
     }
 
-    if (cfg.mode !== "live") {
-      console.log("PAPER SELL:", pos.marketTicker, pos.count, "reason:", { hitTP, hitSL, hitTime, reversal });
-      // Simulate pnl: contract is $1 at settle, but we approximate using bid
+    if (cfg.mode === "live") {
+      console.log("LIVE SELL:", { ticker: pos.marketTicker, side: pos.side, count: pos.count });
+      await kalshi.createOrder({ ticker: pos.marketTicker, type: "market", action: "sell", side: pos.side, count: pos.count, priceCents: 1 });
+    } else {
+      console.log("PAPER SELL:", { ticker: pos.marketTicker, side: pos.side, count: pos.count });
       const pnlUsd = ((current - entry) / 100) * pos.count;
       state.daily.pnlUsd = Number((state.daily.pnlUsd + pnlUsd).toFixed(2));
-    } else {
-      console.log("LIVE SELL:", pos.marketTicker, pos.count, "YES @ market");
-      // Sell YES using market order (action sell)
-      await kalshi.createOrder({ ticker: pos.marketTicker, type: "market", action: "sell", side: "yes", count: pos.count, yes_price: 1 });
-      // We don’t know exact fill price here without querying fills; keep pnl approximate until we add fill fetch.
     }
 
     state.position = null;
@@ -124,46 +108,63 @@ async function main() {
     state.daily.trades += 1;
 
     await kvSetJson("bot:state", state);
-    console.log("Exited. Updated state saved.");
+    console.log("Exited. State saved.");
     return;
   }
 
-  // Entry rules (no position)
-  const { bestAsk } = await bestYesPrices(targetMarket);
-  if (!bestAsk) {
-    console.log("No liquidity (bestAsk missing). No entry.");
+  // Entry logic
+  if (minsToClose <= cfg.minMinutesToCloseToEnter) {
+    console.log("Too close to close to enter. Skipping entry.");
+    return;
+  }
+  if (sig.dir === "NONE" || sig.confidence < cfg.minConfidence) {
+    console.log("No entry: weak or NONE signal.");
     return;
   }
 
-  // Simple sizing: tradeSizeUsd / (price in dollars) -> contracts
-  const priceUsd = bestAsk / 100;
+  const yesIsUp = (m.yes_sub_title || "").toLowerCase().includes("up");
+  const noIsUp  = (m.no_sub_title  || "").toLowerCase().includes("up");
+  if (!yesIsUp && !noIsUp) {
+    console.log("Cannot infer Up/Down mapping from subtitles. Refusing to trade.");
+    return;
+  }
+
+  const desiredSide =
+    sig.dir === "UP"
+      ? (yesIsUp ? "yes" : "no")
+      : (yesIsUp ? "no" : "yes");
+
+  const askCents = desiredSide === "yes" ? (m.yes_ask ?? null) : (m.no_ask ?? null);
+  if (!askCents) {
+    console.log("No ask for desired side; skipping entry.");
+    return;
+  }
+
+  const priceUsd = askCents / 100;
   const count = Math.max(1, Math.floor(cfg.tradeSizeUsd / Math.max(0.01, priceUsd)));
 
-  if (count < 1) {
-    console.log("Trade size too small for current ask. No entry.");
-    return;
-  }
+  console.log("ENTRY PLAN:", { direction: sig.dir, desiredSide, askCents, count });
 
-  if (cfg.mode !== "live") {
-    console.log("PAPER BUY:", targetMarket, count, "YES @", bestAsk);
+  if (cfg.mode === "live") {
+    console.log("LIVE BUY:", { ticker: m.ticker, side: desiredSide, count, askCents });
+    await kalshi.createOrder({ ticker: m.ticker, type: "market", action: "buy", side: desiredSide, count, priceCents: askCents });
   } else {
-    console.log("LIVE BUY:", targetMarket, count, "YES @", bestAsk);
-    // Buy YES market order (or limit). We'll do market with a max yes_price cap.
-    await kalshi.createOrder({ ticker: targetMarket, type: "market", action: "buy", side: "yes", count, yes_price: bestAsk });
+    console.log("PAPER BUY:", { ticker: m.ticker, side: desiredSide, count, askCents });
   }
 
   state.position = {
-    side: sig.dir,
-    marketTicker: targetMarket,
-    entryYesPriceCents: bestAsk,
+    marketTicker: m.ticker,
+    side: desiredSide,            // "yes" or "no"
+    direction: sig.dir,           // "UP" or "DOWN"
+    entryPriceCents: askCents,
     count,
-    openedAtMs: nowMs()
+    openedAtMs: nowMs(),
+    closeTimeMs: closeMs
   };
 
   state.cooldownUntil = nowMs() + cfg.cooldownMinutes * 60000;
   await kvSetJson("bot:state", state);
-
-  console.log("Entered position. State saved.");
+  console.log("Entered. State saved.");
 }
 
 main().catch((e) => {
