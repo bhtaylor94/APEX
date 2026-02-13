@@ -1,3 +1,4 @@
+import BotControlsMobile from "../components/BotControlsMobile";
 import BotControlPanel from "../components/BotControlPanel";
 // pages/index.js — Apex BTC Bot Dashboard
 import { useState, useEffect, useCallback, useRef } from "react";
@@ -652,3 +653,7 @@ export default function Dashboard() {
     </>
   );
 }
+
+/* Mobile bot controls */
+export function __BotControlsMount__(){ return null }
+// Add <BotControlsMobile /> somewhere in your page JSX if you don't see it automatically.
