@@ -308,14 +308,6 @@ export default async function handler(req, res) {
         client_order_id: `apex-cron-exit-${Date.now()}`,
       };
       try {
-      // HARD ENTRY GUARD
-      const lastTrade = lastTradeByTicker.get(String(sig.ticker || "")) || 0;
-      if (lastTrade && (Date.now() - lastTrade) < HARD.REENTRY_COOLDOWN_MS) { log.push({ t: Date.now(), msg: `SKIP cooldown ${sig.ticker}` }); continue; }
-      const tradeProb = tradeProbForSide(Number(sig.probYes ?? sig.prob ?? sig.yesProb ?? sig.price ?? 0), side);
-      const tradePrice = tradePriceForSide(Number(sig.price ?? sig.yesPrice ?? 0), side);
-      if (!inBand(tradeProb)) { log.push({ t: Date.now(), msg: `SKIP band ${Math.round(tradeProb*100)}%` }); continue; }
-      if (!(tradePrice >= HARD.PRICE_MIN && tradePrice <= HARD.PRICE_MAX)) { log.push({ t: Date.now(), msg: `SKIP price ${(tradePrice*100).toFixed(0)}c` }); continue; }
-
         const r = await authReq("/orders", "POST", sellBody);
         exitOrders.push({ ...ex, ok: true, resp: r?.order?.order_id || r?.order_id || true });
       } catch (e) {
