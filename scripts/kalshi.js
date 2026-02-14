@@ -1,5 +1,12 @@
 import crypto from "crypto";
 
+function readKalshiPrivateKey() {
+  const raw = (readKalshiPrivateKey() || "").trim();
+  // If key came through as a single line with literal \n, convert to real newlines.
+  const normalized = raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
+  return normalized.trim();
+}
+
 const ENV = (process.env.NEXT_PUBLIC_KALSHI_ENV || process.env.KALSHI_ENV || "prod").toLowerCase();
 
 // Per Kalshi docs: demo uses demo-api.kalshi.co ; production uses api.elections.kalshi.com (trade-api/v2)
@@ -9,7 +16,7 @@ const BASE =
     : "https://api.elections.kalshi.com";
 
 const API_KEY_ID = process.env.KALSHI_API_KEY_ID || process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID || "";
-const PRIVATE_KEY_PEM = process.env.KALSHI_PRIVATE_KEY || "";
+const PRIVATE_KEY_PEM = readKalshiPrivateKey() || "";
 
 function mustEnv(name, v) {
   if (!v) throw new Error("Missing env: " + name);
