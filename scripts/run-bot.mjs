@@ -76,13 +76,13 @@ async function tryExit(cfg, pos) {
   // Fetch orderbook for the position ticker
   // Ensure we have a ticker for orderbook pricing
   if (!tickerForOB) tickerForOB = resolveTicker();
-  if (!tickerForOB) {
+  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB;
     console.log("No trade — could not determine ticker for orderbook");
     return;
   }
   // Ensure we have a ticker for orderbook pricing
   if (!tickerForOB) tickerForOB = resolveTicker();
-  if (!tickerForOB) {
+  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB;
     console.log("No trade — could not determine ticker for orderbook");
     return;
   }
@@ -140,6 +140,7 @@ function pickBestMarketCandidate(markets) {
 }
 
 async function main() {
+  tickerForOB = null;
   const cfg = await loadConfig();
   console.log("CONFIG:", cfg);
 
@@ -231,10 +232,10 @@ async function main() {
   
 // ALWAYS derive executable prices from orderbook (Kalshi listMarkets often has null asks/bids)
 {
-  if (!tickerForOB) { console.log("No trade — could not determine ticker for orderbook."); return; }
+  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB; console.log("No trade — could not determine ticker for orderbook."); return; }
 
   // Robust ticker resolution (prevents ReferenceError if a name doesn't exist in this scope)
-  const tickerForOB =
+  tickerForOB =
     ((typeof selectedMarket !== "undefined") && selectedMarket && selectedMarket.ticker) ||
     ((typeof selected !== "undefined") && selected && selected.ticker) ||
     ((typeof market !== "undefined") && market && market.ticker) ||
@@ -243,11 +244,11 @@ async function main() {
     ((typeof best !== "undefined") && best && best.ticker) ||
     null;
 
-  if (!tickerForOB) {
+  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB;
     console.log("No trade — could not determine ticker for orderbook");
     return;
   }
-const ob = await getOrderbook(tickerForOB, 1);
+const ob = await getOrderbook((tickerForOB || selected?.ticker), 1);
 
 // Kalshi orderbook shape: { yes: [{price,count}...], no: [{price,count}...] }
 const yesAsk = ob?.yes?.[0]?.price ?? null;
