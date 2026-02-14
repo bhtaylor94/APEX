@@ -76,13 +76,13 @@ async function tryExit(cfg, pos) {
   // Fetch orderbook for the position ticker
   // Ensure we have a ticker for orderbook pricing
   if (!tickerForOB) tickerForOB = resolveTicker();
-  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB;
+  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB; tickerForOB = selected?.ticker || tickerForOB;
     console.log("No trade — could not determine ticker for orderbook");
     return;
   }
   // Ensure we have a ticker for orderbook pricing
   if (!tickerForOB) tickerForOB = resolveTicker();
-  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB;
+  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB; tickerForOB = selected?.ticker || tickerForOB;
     console.log("No trade — could not determine ticker for orderbook");
     return;
   }
@@ -140,6 +140,7 @@ function pickBestMarketCandidate(markets) {
 }
 
 async function main() {
+  tickerForOB = null;
   tickerForOB = null;
   const cfg = await loadConfig();
   console.log("CONFIG:", cfg);
@@ -232,7 +233,7 @@ async function main() {
   
 // ALWAYS derive executable prices from orderbook (Kalshi listMarkets often has null asks/bids)
 {
-  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB; console.log("No trade — could not determine ticker for orderbook."); return; }
+  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB; tickerForOB = selected?.ticker || tickerForOB; console.log("No trade — could not determine ticker for orderbook."); return; }
 
   // Robust ticker resolution (prevents ReferenceError if a name doesn't exist in this scope)
   tickerForOB =
@@ -244,7 +245,7 @@ async function main() {
     ((typeof best !== "undefined") && best && best.ticker) ||
     null;
 
-  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB;
+  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB; tickerForOB = selected?.ticker || tickerForOB;
     console.log("No trade — could not determine ticker for orderbook");
     return;
   }
