@@ -200,9 +200,8 @@ async function main() {
       return;
     }
     if (ex.holding) {
-      console.log("Holding open position — skipping entry this run.");
-      return;
-    }
+      console.log("Holding open position — continuing (entries allowed).");
+}
   } catch (e) {
     console.log("Exit manager error (non-fatal):", e?.message || e);
   }
