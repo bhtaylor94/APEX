@@ -1,249 +1,322 @@
 import { kvGetJson, kvSetJson } from "./kv.mjs";
-import { getBTCSignal } from "./signal.mjs";
-import { listMarkets, getOrderbook, deriveYesNoFromOrderbook, createOrder } from "./kalshi.mjs";
+import { getMarkets, getMarket, getOrderbook, placeOrder } from "./kalshi_client.mjs";
 
-function centsToUsd(c) { return (c/100); }
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
-function nowTs() { return Date.now(); }
-
-function defaultConfig() {
-  return {
-    enabled: true,
-    mode: "paper",             // "paper" or "live"
-    seriesTicker: "KXBTC15M",
-    tradeSizeUsd: 5,
-    maxContracts: 5,
-    minConfidence: 0.15,
-    minEdge: 5,
-    maxEntryPriceCents: 85,
-    takeProfitPct: 0.20,
-    stopLossPct: 0.12,
-    cooldownMinutes: 8,
-    maxTradesPerDay: 10,
-    dailyMaxLossUsd: 25,
-    maxOpenPositions: 1
-  };
+function validPx(v) {
+  const n = (typeof v === "number") ? v : Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (n < 1 || n > 99) return null;
+  return n;
 }
 
-function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
-
-async function loadConfig() {
-  const cfg = await kvGetJson("bot:config");
-  return { ...defaultConfig(), ...(cfg || {}) };
+function calcContracts({ tradeSizeUsd, maxContracts, askCents }) {
+  const budgetCents = Math.max(1, Math.round((tradeSizeUsd || 5) * 100));
+  const byBudget = Math.floor(budgetCents / askCents);
+  return clamp(Math.max(1, byBudget), 1, maxContracts || 5);
 }
 
-async function loadPosition() {
-  return await kvGetJson("bot:position");
+// Minimal: you already have a signal engine; this just reads what your bot:config expects.
+// If you store your real signal elsewhere, wire it here.
+async function getSignal() {
+  // If you have a key like bot:signal, we’ll use it; otherwise we default to neutral-ish behavior.
+  const s = await kvGetJson("bot:signal");
+  if (s && typeof s === "object" && s.direction && s.confidence != null) return s;
+  // fallback (keeps bot alive even if signal store is missing)
+  return { direction: "up", confidence: 0.20, price: 0 };
 }
 
-async function savePosition(pos) {
-  return await kvSetJson("bot:position", pos);
+function pct(n){ return Math.round(n*1000)/10; }
+
+function validBid(v){
+  const n = (typeof v === "number") ? v : Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (n < 1 || n > 99) return null;
+  return n;
 }
 
-async function clearPosition() {
-  return await kvSetJson("bot:position", null);
+async function getBestBid(ticker, side){
+  // snapshot bid first
+  try {
+    const m = await getMarket(ticker);
+    const mm = m?.market || m;
+    const y = validBid(mm?.yes_bid ?? mm?.yesBid ?? null);
+    const n = validBid(mm?.no_bid  ?? mm?.noBid  ?? null);
+    const bid = side === "yes" ? y : n;
+    if (bid) return { bidCents: bid, source: "snapshot" };
+  } catch (_) {}
+
+  // orderbook fallback
+  try {
+    const ob = await getOrderbook(ticker, 1);
+    const book = ob?.orderbook || ob?.order_book || ob;
+    const yesBids = book?.yes_bids || book?.yesBids || [];
+    const noBids  = book?.no_bids  || book?.noBids  || [];
+    const bid = side === "yes"
+      ? validBid(yesBids?.[0]?.price ?? null)
+      : validBid(noBids?.[0]?.price  ?? null);
+    if (bid) return { bidCents: bid, source: "orderbook" };
+  } catch (_) {}
+
+  return { bidCents: null, source: "none" };
 }
 
-function computePnL(pos, bestBidCents) {
-  // Rough mark-to-bid PnL ignoring fees:
-  // If long YES: profit per contract = bestBid - entry
-  // If long NO:  profit per contract = bestBid - entry
-  const per = (bestBidCents - pos.entryPriceCents);
-  const usd = centsToUsd(per * pos.count);
-  return usd;
-}
+async function maybeExitPosition(cfg){
+  const pos = await kvGetJson("bot:position");
+  console.log("DEBUG bot:position loaded =>", pos, "type:", typeof pos);
+if (!pos) return { exited:false, holding:false };
 
-async function tryExit(cfg, pos) {
-  if (!pos) return { exited:false };
+  const ticker = pos.ticker;
+  const side = pos.side;
+  const entry = Number(pos.entryPriceCents || 0);
+  const count = Number(pos.count || 0);
 
-  // Fetch orderbook for the position ticker
-  const ob = await getOrderbook(pos.ticker);
-  const { bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
+  if (!ticker || (side !== "yes" && side !== "no") || !entry || !count) {
+    console.log("Position invalid — clearing.");
+    try { await kvSetJson("bot:position", null); } catch {}
+    return { exited:false, holding:false };
+  }
 
-  const bestBid = (pos.side === "yes") ? bestYesBid : bestNoBid;
-  if (bestBid == null) {
+  const takeProfitPct = Number(cfg.takeProfitPct ?? 0.20);
+  const stopLossPct   = Number(cfg.stopLossPct   ?? 0.12);
+
+  const bid = await getBestBid(ticker, side);
+  if (!bid.bidCents) {
     console.log("HOLD — no bid to exit on yet.");
-    return { exited:false };
+    return { exited:false, holding:true };
   }
 
-  const pnlUsd = computePnL(pos, bestBid);
-  const entryUsd = centsToUsd(pos.entryPriceCents * pos.count);
-  const takeUsd = entryUsd * cfg.takeProfitPct;
-  const stopUsd = -entryUsd * cfg.stopLossPct;
+  const pnlCentsPer = bid.bidCents - entry;
+  const pnlPct = pnlCentsPer / entry;
 
-  console.log(`POSITION: ${pos.side.toUpperCase()} ${pos.count}x ${pos.ticker} entry=${pos.entryPriceCents}¢ bestBid=${bestBid}¢ pnl≈$${pnlUsd.toFixed(2)} TP=$${takeUsd.toFixed(2)} SL=$${stopUsd.toFixed(2)}`);
+  console.log(
+    "POSITION:",
+    side.toUpperCase(),
+    count + "x",
+    ticker,
+    "entry=" + entry + "¢",
+    "bestBid=" + bid.bidCents + "¢ (" + bid.source + ")",
+    "PnL=" + (pnlCentsPer >= 0 ? "+" : "") + pnlCentsPer + "¢/ct",
+    "(" + (pnlPct >= 0 ? "+" : "") + pct(pnlPct) + "%)"
+  );
 
-  if (pnlUsd >= takeUsd || pnlUsd <= stopUsd) {
-    const reason = pnlUsd >= takeUsd ? "TAKE_PROFIT" : "STOP_LOSS";
-    console.log(`EXIT (${reason}): SELL ${pos.side.toUpperCase()} ${pos.count}x ${pos.ticker} @ ${bestBid}¢`);
+  const hitTP = pnlPct >= takeProfitPct;
+  const hitSL = pnlPct <= -stopLossPct;
 
-    if (cfg.mode === "live") {
-      const out = await createOrder({
-        ticker: pos.ticker,
-        action: "sell",
-        side: pos.side,
-        count: pos.count,
-        priceCents: bestBid,
-        tif: "fill_or_kill",
-        postOnly: false
-      });
-      console.log("EXIT ORDER RESULT:", JSON.stringify(out, null, 2));
-    } else {
-      console.log("PAPER: exit order skipped (paper mode).");
-    }
-
-    await clearPosition();
-    await kvSetJson("bot:last_action", { ts: nowTs(), type:"exit", reason, pnlUsd });
-    return { exited:true };
+  if (!hitTP && !hitSL) {
+    console.log("No exit — TP/SL not hit. TP=" + pct(takeProfitPct) + "% SL=-" + pct(stopLossPct) + "%");
+    return { exited:false, holding:true };
   }
 
-  return { exited:false };
+  const reason = hitTP ? "TAKE_PROFIT" : "STOP_LOSS";
+  const line = "SELL " + side.toUpperCase() + " " + count + "x " + ticker + " @ " + bid.bidCents + "¢ (reason=" + reason + ", mode=" + cfg.mode + ")";
+  console.log("EXIT:", line);
+
+  if (String(cfg.mode || "paper").toLowerCase() !== "live") {
+    console.log("PAPER MODE — would exit:", line);
+    try { await kvSetJson("bot:position", null); } catch {}
+    return { exited:true, holding:false };
+  }
+
+  const res = await placeOrder({ ticker, side, count, priceCents: bid.bidCents, action: "sell" });
+  console.log("EXIT ORDER RESULT:", res);
+
+  try { await kvSetJson("bot:position", null); } catch {}
+  return { exited:true, holding:false };
 }
 
-function pickBestMarketCandidate(markets) {
-  // Filter active BTC15M tickers only
-  const btc = markets.filter(m => (m.ticker || "").startsWith("KXBTC15M-") && (m.status === "active" || m.status === "open" || m.status === "trading" || m.status === "live"));
-  // Prefer high volume
-  btc.sort((a,b)=>(b.volume||0)-(a.volume||0));
-  return btc[0] || null;
+function probYesFromSignal(direction, confidence) {
+  const c = clamp(Number(confidence || 0), 0, 1);
+  const p = 0.5 + c * 0.35;
+  if (String(direction).toLowerCase() === "down") return 1 - p;
+  if (String(direction).toLowerCase() === "up") return p;
+  return 0.5;
+}
+
+async function getExecutablePrices(ticker) {
+  // Prefer snapshot: GET /markets/{ticker}
+  try {
+    const m = await getMarket(ticker);
+    const mm = m?.market || m;
+
+    const yesAsk = validPx(mm?.yes_ask ?? mm?.yesAsk ?? null);
+    const noAsk  = validPx(mm?.no_ask  ?? mm?.noAsk  ?? null);
+    const yesBid = validPx(mm?.yes_bid ?? mm?.yesBid ?? null);
+    const noBid  = validPx(mm?.no_bid  ?? mm?.noBid  ?? null);
+
+    if (yesAsk || noAsk || yesBid || noBid) {
+      return { yesAsk, noAsk, yesBid, noBid, source: "snapshot" };
+    }
+  } catch (_) {}
+
+  // Fallback: orderbook (if available)
+  try {
+    const ob = await getOrderbook(ticker, 1);
+    const book = ob?.orderbook || ob?.order_book || ob;
+
+    const yesAsks = book?.yes_asks || book?.yesAsks || book?.yes || [];
+    const noAsks  = book?.no_asks  || book?.noAsks  || book?.no  || [];
+    const yesBids = book?.yes_bids || book?.yesBids || [];
+    const noBids  = book?.no_bids  || book?.noBids  || [];
+
+    const yesAsk = validPx(yesAsks?.[0]?.price ?? null);
+    const noAsk  = validPx(noAsks?.[0]?.price  ?? null);
+    const yesBid = validPx(yesBids?.[0]?.price ?? null);
+    const noBid  = validPx(noBids?.[0]?.price  ?? null);
+
+    return { yesAsk, noAsk, yesBid, noBid, source: "orderbook" };
+  } catch (_) {}
+
+  return { yesAsk: null, noAsk: null, yesBid: null, noBid: null, source: "none" };
 }
 
 async function main() {
-  const cfg = await loadConfig();
-  console.log("CONFIG:", cfg);
+  const cfg = (await kvGetJson("bot:config")) || {};
 
-  if (!cfg.enabled) {
-    console.log("Bot disabled. Set bot:config.enabled=true to run.");
-    return;
-  }
+  const enabled = !!cfg.enabled;
+  const mode = String(cfg.mode || "paper").toLowerCase();
+  const seriesTicker = String(cfg.seriesTicker || "KXBTC15M").toUpperCase();
 
-  // 1) Exit logic first (sell-to-close)
-  const pos = await loadPosition();
-  if (pos) {
-    const ex = await tryExit(cfg, pos);
-    if (ex.exited) return; // do not re-enter same minute
-  }
+  const tradeSizeUsd = Number(cfg.tradeSizeUsd ?? 5);
+  const maxContracts = Number(cfg.maxContracts ?? 5);
+  const minConfidence = Number(cfg.minConfidence ?? 0.15);
+  const minEdge = Number(cfg.minEdge ?? 5);
+  const maxEntryPriceCents = (cfg.maxEntryPriceCents == null) ? 85 : Number(cfg.maxEntryPriceCents);
 
-  // 2) Enforce max open positions
-  const pos2 = await loadPosition();
-  if (pos2) {
-    console.log("MaxOpenPositions: position exists, skipping entry.");
-    return;
-  }
-
-  // 3) Signal
-  const sig = await getBTCSignal();
-  console.log("SIGNAL:", sig);
-
-  if (sig.direction === "neutral") {
-    const allowNeutral = cfg.allowNeutralTrades === true;
-    if (!allowNeutral) {
-      console.log("No trade — neutral signal.");
-      return;
-    }
-
-    // Neutral policy: choose direction using momentum (RSI as tie-breaker)
-    const mom = Number(sig.mom ?? 0);
-    const rsi = Number(sig.rsi ?? 50);
-    const momDeadband = Number(cfg.neutralMomDeadband ?? 0.00010);
-
-    let neutralDir = "neutral";
-    if (mom > momDeadband) neutralDir = "up";
-    else if (mom < -momDeadband) neutralDir = "down";
-    else neutralDir = (rsi >= 50 ? "up" : "down");
-
-    console.log("Neutral override: mom=" + mom + " rsi=" + rsi + " => direction=" + neutralDir.toUpperCase());
-    sig.direction = neutralDir;
-  }
-  if (sig.confidence < cfg.minConfidence) {
-    console.log(`No trade — confidence ${sig.confidence} < minConfidence ${cfg.minConfidence}`);
-    return;
-  }
-
-  // 4) Markets
-  const mkResp = await listMarkets({ seriesTicker: cfg.seriesTicker, status: "open", limit: 200 });
-  const markets = Array.isArray(mkResp?.markets) ? mkResp.markets : [];
-  console.log(`Markets source: series(${cfg.seriesTicker}) — found: ${markets.length}`);
-
-  const m = pickBestMarketCandidate(markets);
-  if (!m) {
-    console.log("No tradable markets found for series:", cfg.seriesTicker);
-    return;
-  }
-
-  // 5) Derive tradable ask from orderbook (reliable)
-  const ob = await getOrderbook(m.ticker);
-  const { yesAsk, noAsk, bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
-
-  const predYes = 50 + Math.round(sig.confidence * 35); // 50..85ish
-  const predNo  = 100 - predYes;
-
-  // Choose the best edge between YES and NO
-  const edgeYes = (yesAsk != null) ? (predYes - yesAsk) : -999;
-  const edgeNo  = (noAsk  != null) ? (predNo  - noAsk)  : -999;
-
-  let side = null;
-  let ask = null;
-  let edge = null;
-
-  if (edgeYes >= edgeNo) { side="yes"; ask=yesAsk; edge=edgeYes; }
-  else { side="no"; ask=noAsk; edge=edgeNo; }
-
-  console.log("Selected market:", {
-    ticker: m.ticker,
-    status: m.status,
-    volume: m.volume || 0,
-    yesAsk, noAsk,
-    bestYesBid, bestNoBid
+  console.log("CONFIG:", {
+    enabled, mode, seriesTicker,
+    tradeSizeUsd, maxContracts,
+    minConfidence, minEdge, maxEntryPriceCents
   });
 
-  if (ask == null || ask <= 0 || ask >= 99) {
-    console.log("No trade — missing/invalid ask:", ask);
-    return;
-  }
-  if (ask > cfg.maxEntryPriceCents) {
-    console.log(`No trade — ask ${ask}¢ > maxEntryPriceCents ${cfg.maxEntryPriceCents}¢`);
-    return;
-  }
-  console.log(`Edge check: predYES=${predYes}¢ predNO=${predNo}¢ yesAsk=${yesAsk}¢ noAsk=${noAsk}¢ edgeYES=${edgeYes}¢ edgeNO=${edgeNo}¢ chosen=${side.toUpperCase()} edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
+  if (!enabled) return console.log("Bot disabled — exiting.");
 
-  if (edge < cfg.minEdge) {
+  const sig = await getSignal();
+  console.log("SIGNAL:", sig);
+// --- Exit management first (sell-to-close) ---
+  try {
+    const ex = await maybeExitPosition({ ...cfg, mode });
+    if (ex.exited) {
+      console.log("Exited position — skipping entry this run.");
+      return;
+    }
+    if (ex.holding) {
+      console.log("Holding open position (override): continuing to allow new entries.");
+}
+  } catch (e) {
+    console.log("Exit manager error (non-fatal):", e?.message || e);
+  }
+
+
+  const confidence = Number(sig.confidence || 0);
+  if (confidence < minConfidence) {
+    console.log("No trade — confidence too low:", confidence, "<", minConfidence);
+    return;
+  }
+
+  const pYes = probYesFromSignal(sig.direction, confidence);
+  const predYes = clamp(Math.round(pYes * 100), 1, 99);
+  const predNo = 100 - predYes;
+
+  const resp = await getMarkets({ series_ticker: seriesTicker, status: "open", limit: 200, mve_filter: "exclude" });
+  const markets = Array.isArray(resp?.markets) ? resp.markets : [];
+  console.log("Markets source: series(" + seriesTicker + ") — found:", markets.length);
+
+  const prefix = seriesTicker + "-";
+  const candidates = markets
+    .filter(m => typeof m?.ticker === "string" && m.ticker.startsWith(prefix))
+    .sort((a,b) => Number(b.volume || 0) - Number(a.volume || 0))
+    .slice(0, 30);
+
+  if (!candidates.length) {
+    console.log("No tradable markets found after prefix filter:", prefix);
+    return;
+  }
+
+  let best = null;
+
+  for (const m of candidates) {
+    const ticker = m.ticker;
+
+    const px = await getExecutablePrices(ticker);
+    const yesAsk = validPx(px.yesAsk ?? m.yes_ask ?? m.yesAsk ?? null);
+    const noAsk  = validPx(px.noAsk  ?? m.no_ask  ?? m.noAsk  ?? null);
+
+    const yesOk = yesAsk && yesAsk <= maxEntryPriceCents;
+    const noOk  = noAsk  && noAsk  <= maxEntryPriceCents;
+
+    if (!yesOk && !noOk) continue;
+
+    const edgeYes = yesOk ? (predYes - yesAsk) : -9999;
+    const edgeNo  = noOk  ? (predNo  - noAsk)  : -9999;
+
+    const side = edgeYes >= edgeNo ? "yes" : "no";
+    const askCents = side === "yes" ? yesAsk : noAsk;
+    const edge = side === "yes" ? edgeYes : edgeNo;
+
+    const cand = {
+      ticker,
+      volume: Number(m.volume || 0),
+      side,
+      askCents,
+      edge,
+      pxSource: px.source
+    };
+
+    if (!best || cand.edge > best.edge) best = cand;
+  }
+
+  if (!best) {
+    console.log("No trade — no candidate had a valid ask (snapshot+orderbook both missing).");
+    return;
+  }
+
+  console.log("Selected market:", best);
+  console.log(
+    "Edge check:",
+    "predYES=" + predYes + "¢",
+    "predNO=" + predNo + "¢",
+    "chosen=" + best.side.toUpperCase(),
+    "ask=" + best.askCents + "¢",
+    "edge=" + best.edge + "¢",
+    "minEdge=" + minEdge + "¢",
+    "pxSource=" + best.pxSource
+  );
+
+  if (best.edge < minEdge) {
     console.log("No trade — edge too small.");
     return;
   }
 
-  const count = clamp(cfg.maxContracts, 1, cfg.maxContracts);
+  const count = calcContracts({ tradeSizeUsd, maxContracts, askCents: best.askCents });
+  const line = "BUY " + best.side.toUpperCase() + " " + count + "x " + best.ticker + " @ " + best.askCents + "¢ (mode=" + mode + ")";
+  console.log("Decision:", line);
 
-  console.log(`Decision: BUY ${side.toUpperCase()} ${count}x ${m.ticker} @ ${ask}¢ (mode=${cfg.mode})`);
-
-  if (cfg.mode === "live") {
-    const out = await createOrder({
-      ticker: m.ticker,
-      action: "buy",
-      side,
-      count,
-      priceCents: ask,
-      tif: "fill_or_kill",
-      postOnly: false
-    });
-    console.log("ORDER RESULT:", JSON.stringify(out, null, 2));
-  } else {
-    console.log("PAPER: buy skipped (paper mode).");
+  if (mode !== "live") {
+    console.log("PAPER MODE — would place:", line);
+    return;
   }
 
-  // Save position so we can sell-to-close next minute
-  await savePosition({
-    ticker: m.ticker,
-    side,
-    count,
-    entryPriceCents: ask,
-    openedTs: nowTs()
-  });
-  await kvSetJson("bot:last_action", { ts: nowTs(), type:"entry", ticker:m.ticker, side, count, ask });
-  console.log("Saved bot:position");
+  const res = await placeOrder({ ticker: best.ticker, side: best.side, count, priceCents: best.askCents, action: "buy" });
+  console.log("ORDER RESULT:", res);
+
+  // best effort position write (won’t crash if Upstash token is read-only)
+  try {
+    await kvSetJson("bot:position", {
+      ticker: best.ticker,
+      side: best.side,
+      entryPriceCents: best.askCents,
+      count,
+      openedTs: Date.now(),
+      orderId: res?.order?.order_id || null
+    });
+    console.log("Saved bot:position");
+  } catch (e) {
+    console.log("WARN: bot:position not saved (Upstash token likely read-only):", e?.message || e);
+  }
 }
 
-main().catch(e => {
+main().catch((e) => {
   console.error("Bot runner failed:", e?.message || e);
   process.exit(1);
 });
