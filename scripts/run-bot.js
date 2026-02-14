@@ -26,6 +26,7 @@ function cfgDefaults(cfg) {
     maxTradesPerDay: Number(c.maxTradesPerDay ?? 10),
     dailyMaxLossUsd: Number(c.dailyMaxLossUsd ?? 25),
     maxOpenPositions: Number(c.maxOpenPositions ?? 1),
+    maxEntryPriceCents: Number(c.maxEntryPriceCents ?? 85),
   };
 }
 
@@ -89,7 +90,10 @@ if (!market) {
 
     // Mark-to-market using mid of derived bid/ask (fallback to bid if ask missing)
     const bid = side === "yes" ? ob.bestYesBid : ob.bestNoBid;
-    const ask = side === "yes" ? ob.yesAsk : ob.noAsk;
+    // Prefer market snapshot ask (more reliable), fallback to derived ask from orderbook
+  const snapshotAsk = side === "yes" ? Number(market.yes_ask ?? NaN) : Number(market.no_ask ?? NaN);
+  const derivedAsk = side === "yes" ? ob.yesAsk : ob.noAsk;
+  const ask = Number.isFinite(snapshotAsk) ? snapshotAsk : derivedAsk;
     const mid = (bid != null && ask != null) ? Math.round((bid + ask) / 2) : (bid != null ? bid : ask);
 
     if (mid == null) {
@@ -171,6 +175,11 @@ if (!market) {
   const ask = side === "yes" ? ob.yesAsk : ob.noAsk;
   if (ask == null || ask <= 0 || ask >= 99) {
     console.log("No trade — missing/invalid ask:", ask);
+    return;
+  }
+
+  if (ask > cfg.maxEntryPriceCents) {
+    console.log(`No trade — ask too expensive: ${ask}¢ > maxEntryPrice ${cfg.maxEntryPriceCents}¢`);
     return;
   }
 
