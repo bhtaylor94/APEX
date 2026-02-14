@@ -1,5 +1,9 @@
 import { getMarkets, getMarket, getOrderbook, placeOrder } from "./kalshi_client.mjs";
 import { kvGetJson, kvSetJson } from "./kv.js";
+async function clearBotPosition() {
+  await kvSetJson("bot:position", null);
+}
+
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
 function validPx(v) {
@@ -72,7 +76,6 @@ if (!pos) return { exited:false, holding:false };
 
   if (!ticker || (side !== "yes" && side !== "no") || !entry || !count) {
     console.log("Position invalid — clearing.");
-    try { await kvSetJson("bot:position", null); } catch {}
     return { exited:false, holding:false };
   }
 
@@ -113,14 +116,11 @@ if (!pos) return { exited:false, holding:false };
 
   if (String(cfg.mode || "paper").toLowerCase() !== "live") {
     console.log("PAPER MODE — would exit:", line);
-    try { await kvSetJson("bot:position", null); } catch {}
     return { exited:true, holding:false };
   }
 
   const res = await placeOrder({ ticker, side, count, priceCents: bid.bidCents, action: "sell" });
   console.log("EXIT ORDER RESULT:", res);
-
-  try { await kvSetJson("bot:position", null); } catch {}
   return { exited:true, holding:false };
 }
 
