@@ -1,253 +1,259 @@
-import { kvGetJson, kvSetJson, kvIncr } from "./kv.js";
-import { getMarketsBySeries, getMarket, getOrderbook, deriveAsksFromBids, createOrder } from "./kalshi.js";
+import { kvGetJson, kvSetJson } from "./kv.js";
 import { getBTCSignal } from "./signal.js";
+import { getBTCMarkets, getOrderbook, placeOrder, getMarket } from "./kalshi.js";
+import { calcExitTargets, shouldForceExit } from "./exit_logic.js";
 
 function nowMs() { return Date.now(); }
-function clampInt(n, a, b) { return Math.max(a, Math.min(b, Math.floor(n))); }
 
-function centsToUsd(c) { return (c / 100).toFixed(2); }
-
-function computeTradeCount(tradeSizeUsd, askCents, maxContracts) {
-  if (!Number.isFinite(askCents) || askCents <= 0) return 0;
-  const budgetCents = Math.floor(Number(tradeSizeUsd) * 100);
-  const maxByBudget = Math.floor(budgetCents / askCents);
-  return clampInt(Math.min(maxByBudget, Number(maxContracts || 1)), 0, 100000);
+function normalizeSeries(s) {
+  const x = String(s || "").trim();
+  if (!x) return "KXBTC15M";
+  return x.toUpperCase();
 }
 
-function predictedYesCents(signalDirection, confidence) {
-  // simple mapping: base 50, skew with confidence
-  // confidence in [0..1]
-  const c = Math.max(0, Math.min(1, Number(confidence || 0)));
-  const skew = Math.round(c * 35); // up to 35c away from 50
-  if (signalDirection === "up") return 50 + skew;
-  if (signalDirection === "down") return 50 - skew;
-  return 50;
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+
+function pickSideAndEdge({ signalDir, confidence, yesAsk, noAsk }) {
+  // Very simple model:
+  // predicted YES prob = 0.5 + 0.35*confidence when UP
+  // predicted YES prob = 0.5 - 0.35*confidence when DOWN
+  const c = clamp(confidence, 0, 1);
+  const pYes = signalDir === "up" ? (0.5 + 0.35 * c) : signalDir === "down" ? (0.5 - 0.35 * c) : 0.5;
+  const pNo = 1 - pYes;
+
+  const predYesC = Math.round(pYes * 100);
+  const predNoC = Math.round(pNo * 100);
+
+  const edgeYes = (yesAsk != null) ? (predYesC - yesAsk) : -999;
+  const edgeNo  = (noAsk  != null) ? (predNoC  - noAsk)  : -999;
+
+  if (edgeYes >= edgeNo) {
+    return { side: "yes", ask: yesAsk, edge: edgeYes, predYesC, predNoC };
+  }
+  return { side: "no", ask: noAsk, edge: edgeNo, predYesC, predNoC };
 }
 
-async function pickBestBTC15mMarket(seriesTicker) {
-  const resp = await getMarketsBySeries(seriesTicker, 200);
-  const markets = Array.isArray(resp?.markets) ? resp.markets : [];
-  if (!markets.length) return null;
+async function tryExitPosition({ cfg, pos }) {
+  // Validate market still active
+  const m = await getMarket(pos.ticker).catch(() => null);
+  if (!m || (m.status && String(m.status).toLowerCase() !== "active")) {
+    console.log("Position market not active anymore — clearing position.");
+    await kvSetJson("bot:position", null);
+    return { exited: false, cleared: true };
+  }
 
-  // Prefer the highest volume active market
-  markets.sort((a, b) => (Number(b.volume || 0) - Number(a.volume || 0)));
-  return markets[0] || null;
+  // Orderbook best bid needed to taker-exit
+  const ob = await getOrderbook(pos.ticker).catch(() => null);
+  const bestYesBid = ob?.bestYesBid ?? null;
+  const bestNoBid  = ob?.bestNoBid  ?? null;
+
+  const minutesToClose = Number.isFinite(m.close_ts) ? Math.max(0, Math.floor((m.close_ts * 1000 - nowMs()) / 60000)) : null;
+
+  const { tp, sl } = calcExitTargets({
+    side: pos.side,
+    entryCents: pos.entryPriceCents,
+    takeProfitPct: cfg.takeProfitPct ?? 0.20,
+    stopLossPct: cfg.stopLossPct ?? 0.12
+  });
+
+  const forceExit = shouldForceExit({
+    minutesToClose,
+    minMinutesToCloseToHold: cfg.minMinutesToCloseToHold ?? 2
+  });
+
+  // If YES position, we SELL YES into YES bids. If NO position, SELL NO into NO bids.
+  const bestBid = pos.side === "yes" ? bestYesBid : bestNoBid;
+
+  // Decide target exit price:
+  // - if forceExit: accept bestBid if exists
+  // - else: take profit if bid >= tp, stop if bid <= sl (if exists)
+  let decision = null;
+
+  if (bestBid == null) {
+    console.log("HOLD — no bid to exit on yet.");
+    // Place/refresh a resting maker exit if configured
+    // (This is what makes it autonomous even when bids are missing.)
+    if (cfg.enableRestingExit !== false) {
+      const target = forceExit ? sl : tp; // if near close, try get out at stop-ish price; otherwise target profit
+      console.log(`RESTING EXIT: placing GTC SELL ${pos.side.toUpperCase()} @ ${target}¢ (post-only=${!!cfg.makerPostOnly})`);
+      if (cfg.mode === "live") {
+        await placeOrder({
+          ticker: pos.ticker,
+          action: "sell",
+          side: pos.side,
+          count: pos.count,
+          priceCents: target,
+          timeInForce: "good_till_canceled",
+          postOnly: !!cfg.makerPostOnly,
+          reduceOnly: true
+        });
+      } else {
+        console.log("PAPER: would place resting exit.");
+      }
+    }
+    return { exited: false };
+  }
+
+  if (forceExit) {
+    decision = { why: `forceExit minutesToClose=${minutesToClose}`, px: bestBid, tif: "immediate_or_cancel" };
+  } else if (bestBid >= tp) {
+    decision = { why: `takeProfit bid=${bestBid}>=${tp}`, px: bestBid, tif: "immediate_or_cancel" };
+  } else if (bestBid <= sl) {
+    decision = { why: `stopLoss bid=${bestBid}<=${sl}`, px: bestBid, tif: "immediate_or_cancel" };
+  } else {
+    console.log(`HOLD — bid=${bestBid}¢ tp=${tp}¢ sl=${sl}¢ (minutesToClose=${minutesToClose ?? "?"})`);
+    return { exited: false };
+  }
+
+  console.log(`EXIT NOW (${decision.why}): SELL ${pos.side.toUpperCase()} ${pos.count}x ${pos.ticker} @ ${decision.px}¢ (${cfg.mode})`);
+  if (cfg.mode === "live") {
+    const r = await placeOrder({
+      ticker: pos.ticker,
+      action: "sell",
+      side: pos.side,
+      count: pos.count,
+      priceCents: decision.px,
+      timeInForce: decision.tif,
+      postOnly: false,
+      reduceOnly: true
+    });
+    console.log("EXIT ORDER RESULT:", r);
+  } else {
+    console.log("PAPER: would exit now.");
+  }
+
+  // Clear position after placing exit (conservative)
+  await kvSetJson("bot:position", null);
+  return { exited: true };
 }
 
 async function main() {
-  const cfg = (await kvGetJson("bot:config")) || {};
-  const config = {
-    enabled: !!cfg.enabled,
-    mode: cfg.mode || "paper",
-    seriesTicker: (cfg.seriesTicker || "KXBTC15M").toUpperCase(),
-    tradeSizeUsd: Number(cfg.tradeSizeUsd ?? 5),
-    maxContracts: Number(cfg.maxContracts ?? 5),
-    minConfidence: Number(cfg.minConfidence ?? 0.15),
-    minEdge: Number(cfg.minEdge ?? 5),
-    maxEntryPriceCents: Number(cfg.maxEntryPriceCents ?? 85),
-    maxOpenPositions: Number(cfg.maxOpenPositions ?? 1),
-    takeProfitPct: Number(cfg.takeProfitPct ?? 0.2),
-    stopLossPct: Number(cfg.stopLossPct ?? 0.12),
-  };
+  const cfgRaw = await kvGetJson("bot:config");
+  const cfg = cfgRaw || {};
+  cfg.seriesTicker = normalizeSeries(cfg.seriesTicker);
 
-  console.log("CONFIG:", config);
+  console.log("CONFIG:", cfg);
 
-  if (!config.enabled) {
-    console.log("Bot disabled. Set bot:config.enabled=true to run.");
+  if (!cfg.enabled) {
+    console.log("Bot disabled (enabled=false).");
     return;
   }
 
-  // ---- read signal
+  // Load existing position
+  const pos = await kvGetJson("bot:position");
+  if (pos && cfg.maxOpenPositions === 1) {
+    // Try exit first; no new entries while holding
+    await tryExitPosition({ cfg, pos });
+    console.log("MaxOpenPositions: position exists, skipping entry.");
+    return;
+  }
+
+  // Signal
   const sig = await getBTCSignal();
   console.log("SIGNAL:", sig);
 
-  // Normalize signal
-  const direction = String(sig?.direction || sig?.dir || "none").toLowerCase();
-  const confidence = Number(sig?.confidence || 0);
+  if (!sig || !sig.direction || sig.direction === "none" || sig.direction === "neutral") {
+    console.log("No directional signal.");
+    return;
+  }
+  if ((sig.confidence ?? 0) < (cfg.minConfidence ?? 0.15)) {
+    console.log(`No trade — confidence too low (${sig.confidence} < ${cfg.minConfidence}).`);
+    return;
+  }
 
-  // ---- load open position (if any)
-  let pos = await kvGetJson("bot:position");
+  // Markets
+  const markets = await getBTCMarkets(cfg.seriesTicker);
+  if (!markets.length) {
+    console.log("No tradable markets found for series:", cfg.seriesTicker);
+    return;
+  }
 
-  // ---- POSITION MANAGEMENT: try to sell-to-close first
-  if (pos && pos.ticker && pos.side && pos.count) {
-    try {
-      const m = await getMarket(pos.ticker);
-      const status = (m?.market?.status || m?.status || "").toLowerCase();
+  // pick best by volume with usable ask from snapshot-derived asks
+  // (orderbooks often omit asks; derive from opposite best bid)
+  let chosen = null;
 
-      // if market no longer active, clear position (it will settle)
-      if (status && status !== "active") {
-        console.log("Position market no longer active (" + status + ") — clearing.");
-        await kvSetJson("bot:position", null);
-        pos = null;
-      } else {
-        const ob = await getOrderbook(pos.ticker, 10);
-        const { bestYesBid, bestNoBid } = deriveAsksFromBids(ob);
+  for (const m of markets.slice(0, 50)) {
+    const ticker = m.ticker;
+    const ob = await getOrderbook(ticker).catch(() => null);
 
-        const exitBid = pos.side === "yes" ? bestYesBid : bestNoBid;
-        if (!Number.isFinite(exitBid)) {
-          console.log("HOLD — no bid to exit on yet.");
-          // do not clear pos
-        } else {
-          const entry = Number(pos.entryCents);
-          const tp = Math.round(entry * (1 + config.takeProfitPct));
-          const sl = Math.round(entry * (1 - config.stopLossPct));
+    const yesAsk = ob?.yesAsk ?? null;
+    const noAsk  = ob?.noAsk  ?? null;
 
-          console.log(`Position: ${pos.side.toUpperCase()} ${pos.count}x ${pos.ticker} entry=${entry}¢  exitBid=${exitBid}¢  TP=${tp}¢ SL=${sl}¢`);
+    if (!yesAsk && !noAsk) continue;
 
-          const shouldTP = exitBid >= tp;
-          const shouldSL = exitBid <= sl;
+    const decision = pickSideAndEdge({
+      signalDir: sig.direction,
+      confidence: sig.confidence ?? 0,
+      yesAsk,
+      noAsk
+    });
 
-          if (shouldTP || shouldSL) {
-            const reason = shouldTP ? "TAKE_PROFIT" : "STOP_LOSS";
-            console.log(`EXIT (${reason}): SELL ${pos.side.toUpperCase()} ${pos.count}x ${pos.ticker} @ ${exitBid}¢ (mode=${config.mode})`);
+    const ask = decision.ask;
+    if (ask == null || ask <= 0 || ask >= 99) continue;
+    if (cfg.maxEntryPriceCents != null && ask > cfg.maxEntryPriceCents) continue;
 
-            if (config.mode === "live") {
-              const out = await createOrder({
-                ticker: pos.ticker,
-                action: "sell",
-                side: pos.side,
-                count: pos.count,
-                priceCents: exitBid,
-                tif: "immediate_or_cancel",
-              });
-              console.log("EXIT ORDER RESULT:", out);
-            } else {
-              console.log("PAPER: would place exit order here.");
-            }
-
-            await kvSetJson("bot:last_exit", { ts: nowMs(), ticker: pos.ticker, side: pos.side, count: pos.count, exitBid, reason });
-            await kvSetJson("bot:position", null);
-            pos = null;
-          } else {
-            console.log("HOLD — TP/SL not hit.");
-          }
-        }
-      }
-    } catch (e) {
-      console.log("Position check error — keeping position for next run:", e?.message || e);
+    if (decision.edge >= (cfg.minEdge ?? 5)) {
+      chosen = {
+        ticker,
+        side: decision.side,
+        askCents: ask,
+        edge: decision.edge,
+        predYesC: decision.predYesC,
+        predNoC: decision.predNoC,
+        volume: m.volume ?? 0
+      };
+      break;
     }
   }
 
-  // ---- ENTRY: do not enter if maxOpenPositions reached
-  if (pos && config.maxOpenPositions >= 1) {
-    console.log("MaxOpenPositions: position exists, skipping entry.");
-    await kvSetJson("bot:last_run", { ts: nowMs(), action: "hold", note: "position_open" });
+  if (!chosen) {
+    console.log("No trade — no candidate met edge/ask constraints.");
     return;
   }
 
-  // ---- ENTRY: need a non-neutral direction and enough confidence
-  if (direction !== "up" && direction !== "down") {
-    console.log("No trade — direction is NONE/NEUTRAL.");
-    await kvSetJson("bot:last_run", { ts: nowMs(), action: "no_trade", note: "neutral" });
-    return;
-  }
-  if (confidence < config.minConfidence) {
-    console.log(`No trade — confidence ${confidence.toFixed(3)} < ${config.minConfidence}.`);
-    await kvSetJson("bot:last_run", { ts: nowMs(), action: "no_trade", note: "low_confidence", confidence });
-    return;
-  }
+  const count = Math.min(cfg.maxContracts ?? 5, Math.max(1, Math.floor((cfg.tradeSizeUsd ?? 5) * 100 / chosen.askCents)));
+  console.log(
+    `Decision: BUY ${chosen.side.toUpperCase()} ${count}x ${chosen.ticker} @ ${chosen.askCents}¢ | edge=${chosen.edge}¢ predYES=${chosen.predYesC} predNO=${chosen.predNoC} (${cfg.mode})`
+  );
 
-  // ---- pick market
-  const market = await pickBestBTC15mMarket(config.seriesTicker);
-  if (!market?.ticker) {
-    console.log("No tradable markets found for series:", config.seriesTicker);
-    await kvSetJson("bot:last_run", { ts: nowMs(), action: "no_trade", note: "no_markets" });
+  if (cfg.mode === "paper") {
+    console.log("PAPER: would place entry order.");
+    await kvSetJson("bot:last_run", { action: "paper_entry", ...chosen, count, ts: nowMs() });
     return;
   }
 
-  // ---- use orderbook bids to derive asks
-  const ob = await getOrderbook(market.ticker, 10);
-  const { bestYesBid, bestNoBid, yesAsk, noAsk } = deriveAsksFromBids(ob);
-
-  // If asks are null, no liquidity
-  if (!Number.isFinite(yesAsk) && !Number.isFinite(noAsk)) {
-    console.log("No trade — no derived asks. bestYesBid=", bestYesBid, "bestNoBid=", bestNoBid);
-    await kvSetJson("bot:last_run", { ts: nowMs(), action: "no_trade", note: "no_liquidity" });
-    return;
-  }
-
-  // ---- Option 1: compute edge for BOTH sides, pick best
-  const predYES = predictedYesCents(direction, confidence);
-  const predNO  = 100 - predYES;
-
-  const edgeYES = Number.isFinite(yesAsk) ? (predYES - yesAsk) : -999;
-  const edgeNO  = Number.isFinite(noAsk)  ? (predNO  - noAsk)  : -999;
-
-  let side = null;
-  let askCents = null;
-  let edge = null;
-
-  if (edgeYES >= edgeNO) { side = "yes"; askCents = yesAsk; edge = edgeYES; }
-  else { side = "no"; askCents = noAsk; edge = edgeNO; }
-
-  console.log(`Edge check: predYES=${predYES}¢ predNO=${predNO}¢ yesAsk=${yesAsk}¢ noAsk=${noAsk}¢ edgeYES=${edgeYES}¢ edgeNO=${edgeNO}¢ chosen=${side.toUpperCase()} edge=${edge}¢ minEdge=${config.minEdge}¢`);
-
-  if (!Number.isFinite(askCents) || askCents <= 0 || askCents >= 99) {
-    console.log("No trade — invalid ask:", askCents);
-    await kvSetJson("bot:last_run", { ts: nowMs(), action: "no_trade", note: "invalid_ask", askCents });
-    return;
-  }
-
-  if (askCents > config.maxEntryPriceCents) {
-    console.log(`No trade — ask ${askCents}¢ > maxEntryPriceCents ${config.maxEntryPriceCents}¢`);
-    await kvSetJson("bot:last_run", { ts: nowMs(), action: "no_trade", note: "too_expensive", askCents });
-    return;
-  }
-
-  if (edge < config.minEdge) {
-    console.log("No trade — edge too small.");
-    await kvSetJson("bot:last_run", { ts: nowMs(), action: "no_trade", note: "edge_small", edge, askCents });
-    return;
-  }
-
-  const count = computeTradeCount(config.tradeSizeUsd, askCents, config.maxContracts);
-  if (count < 1) {
-    console.log("No trade — size calc produced 0 contracts.");
-    await kvSetJson("bot:last_run", { ts: nowMs(), action: "no_trade", note: "size_zero" });
-    return;
-  }
-
-  console.log(`Decision: BUY ${side.toUpperCase()} ${count}x ${market.ticker} @ ${askCents}¢ (mode=${config.mode})`);
-
-  if (config.mode === "live") {
-    const out = await createOrder({
-      ticker: market.ticker,
-      action: "buy",
-      side,
-      count,
-      priceCents: askCents,
-      tif: "immediate_or_cancel",
-    });
-    console.log("ORDER RESULT:", out);
-  } else {
-    console.log("PAPER: would place entry order here.");
-  }
-
-  // Store position so future runs can attempt to exit
-  await kvSetJson("bot:position", {
-    ticker: market.ticker,
-    side,
+  // LIVE entry (IOC taker)
+  const r = await placeOrder({
+    ticker: chosen.ticker,
+    action: "buy",
+    side: chosen.side,
     count,
-    entryCents: askCents,
+    priceCents: chosen.askCents,
+    timeInForce: "immediate_or_cancel",
+    postOnly: false,
+    reduceOnly: false
+  });
+
+  console.log("ORDER RESULT:", r);
+
+  // Persist position using fill price (prefer API response)
+  const filledPrice = chosen.side === "yes" ? (r?.order?.yes_price ?? chosen.askCents) : (r?.order?.no_price ?? chosen.askCents);
+
+  const newPos = {
+    ticker: chosen.ticker,
+    side: chosen.side,
+    count,
+    entryPriceCents: filledPrice,
     entryTs: nowMs(),
-  });
+    orderId: r?.order?.order_id || null
+  };
 
-  await kvIncr("bot:trades_today");
-  await kvSetJson("bot:last_run", {
-    ts: nowMs(),
-    action: "entry",
-    ticker: market.ticker,
-    side,
-    count,
-    askCents,
-    edge,
-    confidence,
-  });
-
+  await kvSetJson("bot:position", newPos);
   console.log("Saved bot:position");
 }
 
 main().catch(async (e) => {
   console.error("Bot runner failed:", e);
+  try { await kvSetJson("bot:last_run", { action: "error", error: String(e?.message || e), ts: Date.now() }); } catch {}
   process.exit(1);
 });
