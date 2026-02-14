@@ -84,17 +84,25 @@ export async function getOrderbook(ticker, depth = 1) {
 export async function placeOrder({ ticker, side, count, priceCents }) {
   // side must be "yes" or "no"
   if (side !== "yes" && side !== "no") throw new Error("Invalid side: " + side);
+  if (!Number.isFinite(count) || count <= 0) throw new Error("Invalid count: " + count);
+  if (!Number.isFinite(priceCents) || priceCents <= 0 || priceCents >= 99) {
+    throw new Error("Invalid priceCents: " + priceCents);
+  }
 
+  // IMPORTANT: Kalshi requires EXACTLY ONE of yes_price/no_price
   const body = {
     ticker,
     action: "buy",
     type: "limit",
-    side,                // REQUIRED
+    side,
     count,
-    yes_price: side === "yes" ? priceCents : (100 - priceCents),
-    no_price:  side === "no"  ? priceCents : (100 - priceCents),
     client_order_id: ""
   };
 
+  if (side === "yes") body.yes_price = priceCents;
+  if (side === "no")  body.no_price  = priceCents;
+
   return kalshiFetch("/trade-api/v2/portfolio/orders", { method: "POST", body, auth: true });
 }
+
+
