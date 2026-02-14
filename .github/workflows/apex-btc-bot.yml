@@ -16,6 +16,8 @@ jobs:
       - run: npm install
       - run: node scripts/run-bot.js
         env:
+          KALSHI_API_BASE_URL: https://api.elections.kalshi.com/trade-api/v2
+
           NODE_OPTIONS: --openssl-legacy-provider
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}

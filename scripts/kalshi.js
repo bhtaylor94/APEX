@@ -18,9 +18,9 @@ function mustEnv(name) {
 function baseUrl() {
   // If you already have a different base in your repo, keep this stable:
   // Kalshi Trade API v2 base commonly used:
-  // https://trading-api.kalshi.com/trade-api/v2   (or api.elections.* for some products)
+  // https://api.elections.kalshi.com/trade-api/v2   (or api.elections.* for some products)
   // Your existing code likely already works for GETs/POSTs, so keep same:
-  return process.env.KALSHI_BASE_URL || "https://trading-api.kalshi.com/trade-api/v2";
+  return process.env.KALSHI_BASE_URL || "https://api.elections.kalshi.com/trade-api/v2";
 }
 
 // --- Kalshi auth: keep whatever you already had working for executed orders.
