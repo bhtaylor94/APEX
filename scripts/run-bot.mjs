@@ -200,7 +200,9 @@ async function main() {
   
 // ALWAYS derive executable prices from orderbook (Kalshi listMarkets often has null asks/bids)
 {
-const ob = await getOrderbook(selected.ticker, 1);
+  const tickerForOB = (typeof selected !== "undefined" && selected?.ticker) || (typeof market !== "undefined" && market?.ticker) || (typeof picked !== "undefined" && picked?.ticker) || (typeof best !== "undefined" && best?.ticker) || null;
+  if (!tickerForOB) { console.log("No trade — could not determine ticker for orderbook."); return; }
+const ob = await getOrderbook(tickerForOB, 1);
 
 // Kalshi orderbook shape: { yes: [{price,count}...], no: [{price,count}...] }
 const yesAsk = ob?.yes?.[0]?.price ?? null;
