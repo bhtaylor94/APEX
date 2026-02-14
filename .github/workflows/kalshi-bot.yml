@@ -1,50 +1,51 @@
-name: Kalshi BTC 15m Bot
+name: Apex BTC Bot
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # GitHub min: 5 minutes
-  workflow_dispatch: {}
-
-      - name: Debug – show runner + grep for patch markers
-        run: |
-          echo "PWD:"; pwd
-          echo "BRANCH:"; git branch --show-current || true
-          echo "LATEST COMMIT:"; git log -1 --oneline
-          echo ""
-          echo "List scripts/:"
-          ls -la scripts || true
-          echo ""
-          echo "Workflow is running this command next:"
-          echo "node scripts/run-bot.js"
-          echo ""
-          echo "Does scripts/run-bot.js contain patch markers?"
-          grep -n "fetchBtc15mUpDownMarkets\|pickKxBtc15mMarket\|Markets source:\|BTC 15m Up/Down markets found" -n scripts/run-bot.js || true
-          echo ""
-          echo "Does scripts/bot_runner.mjs contain patch markers?"
-          grep -n "fetchBtc15mUpDownMarkets\|pickKxBtc15mMarket\|Markets source:\|BTC 15m Up/Down markets found" -n scripts/bot_runner.mjs || true
+    - cron: "*/1 * * * *"
+  workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Use Node
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 18
 
       - name: Install deps
         run: npm install
 
+      - name: DEBUG – show repo + runner contents
+        run: |
+          echo "PWD:"
+          pwd
+          echo ""
+          echo "Branch:"
+          git branch --show-current || true
+          echo ""
+          echo "Latest commit:"
+          git log -1 --oneline
+          echo ""
+          echo "scripts/ directory:"
+          ls -la scripts || true
+          echo ""
+          echo "---- grep markers in run-bot.js ----"
+          grep -n "No open markets\|BTC 15m\|pickKx\|fetchBtc" scripts/run-bot.js || true
+          echo ""
+          echo "---- grep markers in bot_runner.mjs ----"
+          grep -n "No open markets\|BTC 15m\|pickKx\|fetchBtc" scripts/bot_runner.mjs || true
+
       - name: Run bot
+        run: node scripts/run-bot.js
         env:
+          NODE_OPTIONS: --openssl-legacy-provider
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
-          KALSHI_ENV: ${{ secrets.KALSHI_ENV }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-        run: node scripts/bot_runner.mjs
