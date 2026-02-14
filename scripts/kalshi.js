@@ -71,7 +71,7 @@ async function kalshiFetch(pathWithQuery, { method = "GET", body = null } = {}) 
   try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
 
   if (!res.ok) {
-    const msg2 = (data && (data.error || data.message)) ? (data.error || data.message) : text;
+    const msg2 = (data && (data.error || data.message)) ? (typeof (data.error || data.message) === "string" ? (data.error || data.message) : JSON.stringify((data.error || data.message))) : (typeof data === "object" ? JSON.stringify(data) : text);
     throw new Error(`Kalshi ${method} ${pathWithQuery} failed (${res.status}): ${msg2}`);
   }
 
