@@ -136,8 +136,24 @@ async function main() {
   console.log("SIGNAL:", sig);
 
   if (sig.direction === "neutral") {
-    console.log("No trade — neutral signal.");
-    return;
+    const allowNeutral = cfg.allowNeutralTrades === true;
+    if (!allowNeutral) {
+      console.log("No trade — neutral signal.");
+      return;
+    }
+
+    // Neutral policy: choose direction using momentum (RSI as tie-breaker)
+    const mom = Number(sig.mom ?? 0);
+    const rsi = Number(sig.rsi ?? 50);
+    const momDeadband = Number(cfg.neutralMomDeadband ?? 0.00010);
+
+    let neutralDir = "neutral";
+    if (mom > momDeadband) neutralDir = "up";
+    else if (mom < -momDeadband) neutralDir = "down";
+    else neutralDir = (rsi >= 50 ? "up" : "down");
+
+    console.log("Neutral override: mom=" + mom + " rsi=" + rsi + " => direction=" + neutralDir.toUpperCase());
+    sig.direction = neutralDir;
   }
   if (sig.confidence < cfg.minConfidence) {
     console.log(`No trade — confidence ${sig.confidence} < minConfidence ${cfg.minConfidence}`);
