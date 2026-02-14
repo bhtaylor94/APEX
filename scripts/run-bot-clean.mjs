@@ -118,7 +118,9 @@ if (!pos) return { exited:false, holding:false };
     return { exited:true, holding:false };
   }
 
-  const res = await placeOrder({ ticker, side, count, priceCents: bid.bidCents, action: "sell" });
+  const res = await // --- End exit pricing hardening ---
+
+placeOrder({ ticker, side, count, priceCents: bid.bidCents, action: "sell", tif: "immediate_or_cancel", postOnly: false });
   console.log("EXIT ORDER RESULT:", res);
 
   try { await kvSetJson("bot:position", null); } catch {}
