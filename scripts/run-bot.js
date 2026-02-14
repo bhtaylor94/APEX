@@ -55,7 +55,7 @@ async function main() {
     return;
   }
 
-  const seriesTicker = String(cfg.seriesTicker || "KXBTC15M").toUpperCase();
+  const seriesTicker = String(cfg.seriesTicker || "kxbtc15m");
 
   const sig = await getBTCSignal(cfg);
   console.log("SIGNAL:", sig);
