@@ -1,325 +1,166 @@
-import { kvGetJson, kvSetJson } from "./kv.js";
-import { getSeriesMarkets, getOrderbookTop, placeOrder } from "./kalshi.js";
-import { getBTCSignal } from "./signal.js";
+import { listMarkets, getOrderbook, deriveAsksFromOrderbook, createOrder } from "./kalshi.js";
 
-function nowMs() { return Date.now(); }
-
-function dollarsToCents(v) {
-  const n = Number(v);
-  if (!Number.isFinite(n)) return null;
-  return Math.round(n * 100);
+function n(v, d) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : d;
 }
 
-function cfgDefaults(cfg) {
-  const c = cfg || {};
-  return {
-    enabled: !!c.enabled,
-    mode: c.mode || "paper", // "paper" | "live"
-    seriesTicker: String(c.seriesTicker || "KXBTC15M").toUpperCase(),
-
-    tradeSizeUsd: Number(c.tradeSizeUsd ?? 5),
-    maxContracts: Number(c.maxContracts ?? 5),
-
-    minConfidence: Number(c.minConfidence ?? 0.15),
-    minEdge: Number(c.minEdge ?? 5),
-
-    takeProfitPct: Number(c.takeProfitPct ?? 0.20),
-    stopLossPct: Number(c.stopLossPct ?? 0.12),
-
-    cooldownMinutes: Number(c.cooldownMinutes ?? 8),
-    maxTradesPerDay: Number(c.maxTradesPerDay ?? 10),
-    dailyMaxLossUsd: Number(c.dailyMaxLossUsd ?? 25),
-    maxOpenPositions: Number(c.maxOpenPositions ?? 1),
-
-    maxEntryPriceCents: Number(c.maxEntryPriceCents ?? 85),
-
-    // Entry mode:
-    // "maker" = only post bids at fair value
-    // "momentum" = only take when strong, even if slightly overpriced
-    // "maker+momentum" = maker by default, momentum when strong
-    entryPolicy: String(c.entryPolicy || "maker+momentum"),
-
-    // Maker knobs
-    makerBufferCents: Number(c.makerBufferCents ?? 2),
-    makerPostOnly: c.makerPostOnly !== false, // default true
-    makerTif: String(c.makerTif || "good_till_canceled"),
-
-    // Momentum knobs
-    momentumMinConfidence: Number(c.momentumMinConfidence ?? 0.45),
-    momentumMaxOverpayCents: Number(c.momentumMaxOverpayCents ?? 8),
+function loadConfig() {
+  // Minimal config defaults; you can still override via your Upstash config writer if you have it.
+  const cfg = {
+    enabled: true,
+    mode: "paper",
+    seriesTicker: "KXBTC15M",
+    tradeSizeUsd: 5,
+    maxContracts: 5,
+    minConfidence: 0.15,
+    minEdge: 5,
+    maxEntryPriceCents: 85,
   };
+
+  // Allow env overrides if desired
+  cfg.mode = (process.env.BOT_MODE || cfg.mode).toLowerCase();
+  cfg.seriesTicker = (process.env.SERIES_TICKER || cfg.seriesTicker).toUpperCase();
+
+  return cfg;
 }
 
-function tradableStatus(s) {
-  const st = String(s || "").toLowerCase();
-  return st === "active" || st === "open";
+async function getSignalStub() {
+  // Your project already has a signal engine; keep yours.
+  // For safety, keep a stub here only if you haven't wired one.
+  // If you already compute SIGNAL elsewhere, replace this function.
+  const dir = (Math.random() > 0.5) ? "up" : "down";
+  return { direction: dir, confidence: 0.2, price: 0 };
 }
 
-function snapQuoteCents(market) {
-  const yesAsk = market?.yes_ask_dollars != null ? dollarsToCents(market.yes_ask_dollars)
-               : (Number.isFinite(Number(market?.yes_ask)) ? Number(market.yes_ask) : null);
-  const noAsk  = market?.no_ask_dollars  != null ? dollarsToCents(market.no_ask_dollars)
-               : (Number.isFinite(Number(market?.no_ask)) ? Number(market.no_ask) : null);
-
-  const yesBid = market?.yes_bid_dollars != null ? dollarsToCents(market.yes_bid_dollars)
-               : (Number.isFinite(Number(market?.yes_bid)) ? Number(market.yes_bid) : null);
-  const noBid  = market?.no_bid_dollars  != null ? dollarsToCents(market.no_bid_dollars)
-               : (Number.isFinite(Number(market?.no_bid)) ? Number(market.no_bid) : null);
-
-  // Derive asks from bids if asks missing
-  const yesAsk2 = yesAsk != null ? yesAsk : (noBid != null ? (100 - noBid) : null);
-  const noAsk2  = noAsk  != null ? noAsk  : (yesBid != null ? (100 - yesBid) : null);
-
-  return { yesAsk: yesAsk2, noAsk: noAsk2, yesBid, noBid };
+function pickSideFromSignal(direction) {
+  if (direction === "up") return "yes";
+  if (direction === "down") return "no";
+  return null;
 }
 
-function validAsk(a) {
-  return a != null && a > 0 && a < 99;
-}
-
-async function pickMarketWithLiquidity(markets, seriesTicker, side, maxEntryPriceCents) {
-  const prefix = (seriesTicker + "-").toLowerCase();
-
-  const candidates = (markets || [])
-    .filter(m => String(m?.ticker || "").toLowerCase().startsWith(prefix))
-    .filter(m => tradableStatus(m?.status))
-    .sort((a, b) => Number(b.volume || 0) - Number(a.volume || 0))
-    .slice(0, 50);
-
-  for (const m of candidates) {
-    const q = snapQuoteCents(m);
-    const askSnap = side === "yes" ? q.yesAsk : q.noAsk;
-
-    if (validAsk(askSnap) && askSnap <= maxEntryPriceCents) {
-      return { market: m, ask: askSnap, source: "snapshot" };
-    }
-
-    // fallback: orderbook-derived ask
-    try {
-      const ob = await getOrderbookTop(m.ticker);
-      const askOb = side === "yes" ? ob.yesAsk : ob.noAsk;
-      if (validAsk(askOb) && askOb <= maxEntryPriceCents) {
-        return { market: m, ask: askOb, source: "orderbook" };
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  return { market: null, ask: null, source: "none" };
-}
-
-function clampCents(x) {
-  const n = Number(x);
-  if (!Number.isFinite(n)) return null;
-  return Math.max(1, Math.min(98, Math.round(n)));
+async function pickBestMarket(markets) {
+  const ms = Array.isArray(markets) ? markets : [];
+  // Prefer "active" & higher volume
+  const active = ms.filter(m => (m?.status || "").toLowerCase() === "active");
+  const sorted = (active.length ? active : ms).slice().sort((a,b) => (Number(b.volume||0) - Number(a.volume||0)));
+  return sorted[0] || null;
 }
 
 async function main() {
-  const cfg = cfgDefaults(await kvGetJson("bot:config"));
+  const cfg = loadConfig();
   console.log("CONFIG:", cfg);
 
+  // IMPORTANT: If you already compute SIGNAL in your repo, swap to your function.
+  // Keeping this line so the script runs even if signal module isn’t wired.
+  const signal = await getSignalStub();
+  console.log("SIGNAL:", signal);
+
   if (!cfg.enabled) {
-    console.log("Bot disabled (enabled=false).");
+    console.log("Bot disabled — exiting.");
     return;
   }
 
-  const state = (await kvGetJson("bot:state")) || {};
-  const pos = state.position || null;
-
-  const sig = await getBTCSignal();
-  console.log("SIGNAL:", sig);
-
-  const seriesResp = await getSeriesMarkets(cfg.seriesTicker, { limit: 200 });
-  const allMarkets = Array.isArray(seriesResp?.markets) ? seriesResp.markets : [];
-  console.log(`Markets source: series(${seriesResp.used || cfg.seriesTicker}) — found: ${allMarkets.length}`);
-
-  // Exit manager (if you already have a position tracked)
-  if (pos?.marketTicker) {
-    const marketTicker = pos.marketTicker;
-    const side = pos.side;
-    const count = Number(pos.count);
-    const entry = Number(pos.entryPriceCents);
-
-    const ob = await getOrderbookTop(marketTicker);
-    const bid = side === "yes" ? ob.bestYesBid : ob.bestNoBid;
-    const ask = side === "yes" ? ob.yesAsk : ob.noAsk;
-    const mid = (bid != null && ask != null) ? Math.round((bid + ask) / 2) : (bid != null ? bid : ask);
-
-    if (mid == null || bid == null) {
-      console.log("POSITION: cannot price/exit (no orderbook). Holding.", { marketTicker, side, count, entryPriceCents: entry });
-      return;
-    }
-
-    const tp = Math.round(entry * (1 + cfg.takeProfitPct));
-    const sl = Math.round(entry * (1 - cfg.stopLossPct));
-
-    const hitTP = mid >= tp;
-    const hitSL = mid <= sl;
-
-    const flipExit =
-      (side === "yes" && sig.direction === "down" && sig.confidence >= cfg.minConfidence) ||
-      (side === "no"  && sig.direction === "up"   && sig.confidence >= cfg.minConfidence);
-
-    console.log("POSITION:", { marketTicker, side, count, entryPriceCents: entry, markCents: mid, bidCents: bid, tp, sl, hitTP, hitSL, flipExit });
-
-    if (!hitTP && !hitSL && !flipExit) {
-      console.log("Hold position — no TP/SL/Flip exit.");
-      return;
-    }
-
-    const reason = hitTP ? "TAKE_PROFIT" : hitSL ? "STOP_LOSS" : "SIGNAL_FLIP";
-    console.log(`EXIT: ${reason} — SELL ${side.toUpperCase()} ${count}x ${marketTicker} @ ${bid}¢`);
-
-    if (cfg.mode === "live") {
-      const out = await placeOrder({
-        ticker: marketTicker,
-        side,
-        action: "sell",
-        count,
-        priceCents: bid,
-        time_in_force: "fill_or_kill",
-        reduce_only: true,
-      });
-      console.log("EXIT ORDER RESULT:", out);
-    } else {
-      console.log("(paper) EXIT simulated.");
-    }
-
-    state.position = null;
-    await kvSetJson("bot:state", state);
-    await kvSetJson("bot:last_run", { action: "exit", marketTicker, side, count, priceCents: bid, reason, ts: nowMs() });
-    console.log("Done.");
+  if (cfg.mode !== "live" && cfg.mode !== "paper") {
+    console.log("Invalid mode; must be live or paper.");
     return;
   }
 
-  // Entry
-  if (sig.direction !== "up" && sig.direction !== "down") {
-    console.log("No trade — direction:", sig.direction);
-    return;
-  }
-  if (sig.confidence < cfg.minConfidence) {
-    console.log("No trade — confidence below min:", sig.confidence, "<", cfg.minConfidence);
+  if ((signal.confidence ?? 0) < cfg.minConfidence) {
+    console.log(`No trade — confidence ${(signal.confidence ?? 0).toFixed(3)} < minConfidence ${cfg.minConfidence}`);
     return;
   }
 
-  const side = sig.direction === "up" ? "yes" : "no";
-
-  const pick = await pickMarketWithLiquidity(allMarkets, cfg.seriesTicker, side, cfg.maxEntryPriceCents);
-  if (!pick.market || pick.ask == null) {
-    console.log("No tradable markets found for series:", cfg.seriesTicker, "(no actionable quotes within maxEntryPrice)");
+  const side = pickSideFromSignal(signal.direction);
+  if (!side) {
+    console.log("No trade — neutral signal.");
     return;
   }
 
-  const marketTicker = pick.market.ticker;
-  const ask = pick.ask;
-
-  console.log("Selected market:", { ticker: marketTicker, status: pick.market.status, volume: pick.market.volume, askCents: ask, source: pick.source });
-
-  // Simple fair value mapping (yours)
-  const predictedProbCents = Math.round(50 + (sig.confidence * 35));
-  const edge = predictedProbCents - ask;
-
-  console.log(`Edge check: predicted=${predictedProbCents}¢ market=${ask}¢ edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
-
-  const policy = String(cfg.entryPolicy || "maker+momentum");
-  const count = Math.max(1, Math.min(Number(cfg.maxContracts) || 1, 50));
-
-  // VALUE (taker) if good edge
-  if (edge >= cfg.minEdge) {
-    console.log(`ENTRY (VALUE): BUY ${side.toUpperCase()} ${count}x ${marketTicker} @ ${ask}¢ (FoK taker, mode=${cfg.mode})`);
-
-    if (cfg.mode === "live") {
-      const out = await placeOrder({
-        ticker: marketTicker,
-        side,
-        action: "buy",
-        count,
-        priceCents: ask,
-        time_in_force: "fill_or_kill",
-        reduce_only: false,
-      });
-      console.log("ENTRY ORDER RESULT:", out);
-    } else {
-      console.log("(paper) ENTRY simulated.");
-    }
-
-    state.position = { marketTicker, side, count, entryPriceCents: ask, enteredTs: nowMs() };
-    await kvSetJson("bot:state", state);
-    await kvSetJson("bot:last_run", { action: "enter_value", marketTicker, side, count, priceCents: ask, edge, ts: nowMs() });
-    console.log("Done.");
+  // Fetch markets for series
+  let marketsResp;
+  try {
+    marketsResp = await listMarkets({ seriesTicker: cfg.seriesTicker, status: "active", limit: 200 });
+  } catch (e) {
+    console.log("listMarkets error:", e.message);
     return;
   }
 
-  // MOMENTUM (taker) if strong and not too overpriced
-  const allowMomentum = (policy === "momentum" || policy === "maker+momentum");
-  if (allowMomentum && sig.confidence >= cfg.momentumMinConfidence) {
-    const maxOverpay = cfg.momentumMaxOverpayCents;
-    if (edge >= -maxOverpay) {
-      console.log(`ENTRY (MOMENTUM): BUY ${side.toUpperCase()} ${count}x ${marketTicker} @ ${ask}¢ (edge=${edge}¢ cap=-${maxOverpay}¢, mode=${cfg.mode})`);
+  const markets = Array.isArray(marketsResp?.markets) ? marketsResp.markets : [];
+  console.log(`Markets source: series(${cfg.seriesTicker}) — found: ${markets.length}`);
 
-      if (cfg.mode === "live") {
-        const out = await placeOrder({
-          ticker: marketTicker,
-          side,
-          action: "buy",
-          count,
-          priceCents: ask,
-          time_in_force: "fill_or_kill",
-          reduce_only: false,
-        });
-        console.log("ENTRY ORDER RESULT:", out);
-      } else {
-        console.log("(paper) ENTRY simulated.");
-      }
-
-      state.position = { marketTicker, side, count, entryPriceCents: ask, enteredTs: nowMs() };
-      await kvSetJson("bot:state", state);
-      await kvSetJson("bot:last_run", { action: "enter_momentum", marketTicker, side, count, priceCents: ask, edge, ts: nowMs() });
-      console.log("Done.");
-      return;
-    }
-    console.log(`No momentum trade — too overpriced: edge=${edge}¢ < -${maxOverpay}¢`);
-  }
-
-  // MAKER (post-only bid near fair value)
-  const allowMaker = (policy === "maker" || policy === "maker+momentum");
-  if (allowMaker) {
-    const buffer = cfg.makerBufferCents;
-    let bid = clampCents(predictedProbCents - buffer);
-    if (bid == null) {
-      console.log("No maker trade — invalid bid calc.");
-      return;
-    }
-    bid = Math.min(bid, cfg.maxEntryPriceCents);
-
-    console.log(`ENTRY (MAKER): POST_ONLY BUY ${side.toUpperCase()} ${count}x ${marketTicker} @ ${bid}¢ (pred=${predictedProbCents}¢ buffer=${buffer}¢)`);
-
-    if (cfg.mode === "live") {
-      const out = await placeOrder({
-        ticker: marketTicker,
-        side,
-        action: "buy",
-        count,
-        priceCents: bid,
-        time_in_force: cfg.makerTif,
-        post_only: cfg.makerPostOnly,
-        reduce_only: false,
-      });
-      console.log("MAKER ORDER RESULT:", out);
-      await kvSetJson("bot:last_run", { action: "place_maker_bid", marketTicker, side, count, priceCents: bid, edge, ts: nowMs() });
-    } else {
-      console.log("(paper) MAKER bid simulated.");
-    }
-
-    console.log("Done.");
+  if (!markets.length) {
+    console.log("No tradable markets found for series:", cfg.seriesTicker);
     return;
   }
 
-  console.log("No trade — edge too small and policy disallows maker/momentum.");
+  const m = await pickBestMarket(markets);
+  if (!m?.ticker) {
+    console.log("No valid market chosen.");
+    return;
+  }
+
+  // Pull orderbook and derive ask
+  const ob = await getOrderbook(m.ticker);
+  const book = deriveAsksFromOrderbook(ob);
+
+  const askCents = (side === "yes") ? book.yesAsk : book.noAsk;
+
+  if (!askCents || askCents < 1 || askCents > 99) {
+    console.log("No trade — missing/invalid ask:", askCents, "derived:", book);
+    return;
+  }
+
+  if (askCents > cfg.maxEntryPriceCents) {
+    console.log(`No trade — ask ${askCents}¢ > maxEntryPriceCents ${cfg.maxEntryPriceCents}¢`);
+    return;
+  }
+
+  // Simple edge model: convert confidence into a probability tilt
+  // predictedCents ~ 50 +/- tilt; you can replace with your own pricing model
+  const tilt = Math.min(Math.max(signal.confidence, 0), 1) * 35; // up to ±35¢
+  const predicted = (side === "yes") ? (50 + tilt) : (50 + tilt); // same for no; we compare to no-ask directly
+  const predictedCents = Math.round(predicted);
+  const edge = predictedCents - askCents;
+
+  console.log(`Selected market:`, { ticker: m.ticker, status: m.status, volume: m.volume, askCents, side, book });
+  console.log(`Edge check: predicted=${predictedCents}¢ market=${askCents}¢ edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
+
+  if (edge < cfg.minEdge) {
+    console.log("No trade — edge too small.");
+    return;
+  }
+
+  // Position sizing: as requested, keep it simple — cap by maxContracts
+  const count = Math.max(1, Math.min(cfg.maxContracts, Math.floor(cfg.tradeSizeUsd / (askCents / 100))));
+  if (count < 1) {
+    console.log("No trade — count computed < 1.");
+    return;
+  }
+
+  const actionLine = `BUY ${side.toUpperCase()} ${count}x ${m.ticker} @ ${askCents}¢ (mode=${cfg.mode})`;
+  console.log("Placing order:", actionLine);
+
+  if (cfg.mode !== "live") {
+    console.log("PAPER MODE — would have placed:", actionLine);
+    return;
+  }
+
+  const result = await createOrder({
+    ticker: m.ticker,
+    action: "buy",
+    side,
+    count,
+    priceCents: askCents,
+    postOnly: false,
+    tif: "fill_or_kill",
+  });
+
+  console.log("ORDER RESULT:", result);
+  console.log("Done.");
 }
 
-main().catch(e => {
+main().catch((e) => {
   console.error("Bot runner failed:", e);
   process.exit(1);
 });

@@ -1,52 +1,60 @@
-import crypto from "crypto";
+import crypto from "node:crypto";
 
-const BASE =
-  (process.env.KALSHI_ENV || process.env.NEXT_PUBLIC_KALSHI_ENV || "prod").toLowerCase() === "demo"
-    ? "https://demo-api.kalshi.co/trade-api/v2"
-    : "https://api.elections.kalshi.com/trade-api/v2";
-
-function mustEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error("Missing env var: " + name);
-  return v;
+function envStr(k, d="") {
+  const v = process.env[k];
+  return (v && String(v).trim()) ? String(v) : d;
 }
 
-function signRequest({ method, path, body }) {
-  const keyId = mustEnv("KALSHI_API_KEY_ID");
-  const pem = mustEnv("KALSHI_PRIVATE_KEY");
+function getBaseUrl() {
+  // Kalshi docs show production market-data at api.elections.kalshi.com (covers ALL markets).  [oai_citation:2‡Kalshi API Documentation](https://docs.kalshi.com/getting_started/quick_start_market_data?utm_source=chatgpt.com)
+  // Demo typically uses demo-api.kalshi.co.
+  const e = (envStr("KALSHI_ENV", envStr("NEXT_PUBLIC_KALSHI_ENV", "prod")) || "prod").toLowerCase();
+  if (e.includes("demo")) return "https://demo-api.kalshi.co";
+  return "https://api.elections.kalshi.com";
+}
 
-  // Kalshi uses RSA-PSS signatures. Their docs show these headers:
-  // KALSHI-ACCESS-KEY, KALSHI-ACCESS-SIGNATURE, KALSHI-ACCESS-TIMESTAMP
-  const ts = String(Date.now());
+function toPathNoQuery(p) {
+  // p can be "/portfolio/orders?limit=5" -> sign only "/trade-api/v2/portfolio/orders"  [oai_citation:3‡Kalshi API Documentation](https://docs.kalshi.com/getting_started/quick_start_authenticated_requests?utm_source=chatgpt.com)
+  return String(p).split("?")[0];
+}
 
-  const bodyStr = body ? JSON.stringify(body) : "";
-  const msg = [ts, method.toUpperCase(), path, bodyStr].join("");
+function signKalshi({ timestampMs, method, path }) {
+  const keyId = envStr("KALSHI_API_KEY_ID");
+  const privateKeyPem = envStr("KALSHI_PRIVATE_KEY");
 
-  const signer = crypto.createSign("RSA-SHA256");
-  signer.update(msg);
-  signer.end();
+  if (!keyId || !privateKeyPem) {
+    throw new Error("missing kalshi keys (KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY)");
+  }
 
-  const sig = signer.sign(
-    {
-      key: pem,
-      padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-      saltLength: 32,
-    },
-    "base64"
-  );
+  const msg = String(timestampMs) + String(method).toUpperCase() + String(path);
+  const sig = crypto.sign("sha256", Buffer.from(msg, "utf8"), {
+    key: privateKeyPem,
+    padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: 32,
+  });
 
   return {
     "KALSHI-ACCESS-KEY": keyId,
-    "KALSHI-ACCESS-SIGNATURE": sig,
-    "KALSHI-ACCESS-TIMESTAMP": ts,
+    "KALSHI-ACCESS-TIMESTAMP": String(timestampMs),
+    "KALSHI-ACCESS-SIGNATURE": sig.toString("base64"),
   };
 }
 
-async function kalshiFetch(path, { method = "GET", body = null, auth = true } = {}) {
-  const url = BASE + path;
+async function kalshiFetch(method, path, body, { auth=false } = {}) {
+  const base = getBaseUrl();
+  const cleanPath = toPathNoQuery(path);
+
+  // Ensure we ALWAYS request /trade-api/v2/...
+  const fullPath = cleanPath.startsWith("/trade-api/") ? cleanPath : ("/trade-api/v2" + (cleanPath.startsWith("/") ? cleanPath : ("/" + cleanPath)));
+  const url = base + fullPath;
+
   const headers = { "Content-Type": "application/json" };
 
-  if (auth) Object.assign(headers, signRequest({ method, path, body }));
+  if (auth) {
+    const ts = Date.now();
+    const signed = signKalshi({ timestampMs: ts, method, path: fullPath }); // sign the FULL /trade-api/v2/... path
+    Object.assign(headers, signed);
+  }
 
   const res = await fetch(url, {
     method,
@@ -56,89 +64,84 @@ async function kalshiFetch(path, { method = "GET", body = null, auth = true } = 
 
   const text = await res.text();
   let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
 
   if (!res.ok) {
-    throw new Error(
-      "Kalshi " + method + " " + path + " failed (" + res.status + "): " + (typeof data === "string" ? data : JSON.stringify(data))
-    );
+    const msg = (typeof data === "object" && data)
+      ? JSON.stringify(data)
+      : String(text || "");
+    throw new Error(`Kalshi ${method} ${fullPath} failed (${res.status}): ${msg}`);
   }
+
   return data;
 }
 
-// PUBLIC (no auth) — orderbook returns bids only
-export async function getOrderbookTop(marketTicker) {
-  const ob = await kalshiFetch("/markets/" + encodeURIComponent(marketTicker) + "/orderbook", { auth: false });
-  // expected shape: { orderbook: { yes: [[price, size]...], no: [[price, size]...] } } (bids only)
-  const book = ob?.orderbook || ob?.order_book || ob;
-  const yes = Array.isArray(book?.yes) ? book.yes : [];
-  const no  = Array.isArray(book?.no)  ? book.no  : [];
+// -------- public data --------
 
-  const bestYesBid = yes.length ? Number(yes[0][0]) : null;
-  const bestNoBid  = no.length  ? Number(no[0][0])  : null;
-
-  // Derived asks (Kalshi docs: YES bid at X == NO ask at 100-X; NO bid at Y == YES ask at 100-Y)
-  const yesAsk = bestNoBid != null ? (100 - bestNoBid) : null;
-  const noAsk  = bestYesBid != null ? (100 - bestYesBid) : null;
-
-  return { bestYesBid, bestNoBid, yesAsk, noAsk, raw: ob };
+export async function listMarkets({ seriesTicker, status="active", limit=200 } = {}) {
+  // Market data does not require auth per docs, but works either way.  [oai_citation:4‡Kalshi API Documentation](https://docs.kalshi.com/getting_started/quick_start_market_data?utm_source=chatgpt.com)
+  const qs = new URLSearchParams();
+  if (seriesTicker) qs.set("series_ticker", seriesTicker);
+  if (status) qs.set("status", status);
+  if (limit) qs.set("limit", String(limit));
+  const path = "/markets" + (qs.toString() ? ("?" + qs.toString()) : "");
+  return kalshiFetch("GET", path, null, { auth: false });
 }
 
-export async function listOpenMarkets(limit = 500) {
-  // IMPORTANT: do NOT pass status=open; Kalshi response statuses include "active" etc.
-  // Leaving status empty returns markets of any status. (Docs: Get Markets)
-  return kalshiFetch("/markets?limit=" + limit, { auth: false });
+export async function getOrderbook(ticker) {
+  const t = String(ticker || "").trim();
+  if (!t) throw new Error("missing ticker for orderbook");
+  return kalshiFetch("GET", `/markets/${encodeURIComponent(t)}/orderbook`, null, { auth: false });
 }
 
-export async function placeOrder({
-  ticker,
-  side,           // "yes" | "no"
-  action,         // "buy" | "sell"
-  count,
-  priceCents,
-  time_in_force = "fill_or_kill",
-  reduce_only = false,
-}) {
-  // Create Order requires: ticker, side, action, count, and exactly one of yes_price/no_price (or *_dollars)
-  // Docs show reduce_only boolean exists.  [oai_citation:5‡Kalshi API Documentation](https://docs.kalshi.com/api-reference/orders/create-order)
+export function deriveAsksFromOrderbook(orderbook) {
+  // Orderbook returns BIDS only for yes/no. Asks are implied.  [oai_citation:5‡Kalshi API Documentation](https://docs.kalshi.com/api-reference/market/get-market-orderbook?utm_source=chatgpt.com)
+  const ob = orderbook?.orderbook || orderbook || {};
+  const yesBids = Array.isArray(ob.yes) ? ob.yes : [];
+  const noBids  = Array.isArray(ob.no)  ? ob.no  : [];
+
+  const bestYesBid = yesBids.reduce((m, lvl) => Math.max(m, Number(lvl?.[0] ?? -1)), -1);
+  const bestNoBid  = noBids.reduce((m, lvl) => Math.max(m, Number(lvl?.[0] ?? -1)), -1);
+
+  const yesAsk = bestNoBid >= 0 ? (100 - bestNoBid) : null;
+  const noAsk  = bestYesBid >= 0 ? (100 - bestYesBid) : null;
+
+  return {
+    bestYesBid: bestYesBid >= 0 ? bestYesBid : null,
+    bestNoBid:  bestNoBid  >= 0 ? bestNoBid  : null,
+    yesAsk: (yesAsk !== null && yesAsk >= 1 && yesAsk <= 99) ? yesAsk : null,
+    noAsk:  (noAsk  !== null && noAsk  >= 1 && noAsk  <= 99) ? noAsk  : null,
+  };
+}
+
+// -------- trading (auth required) --------
+
+export async function createOrder({ ticker, action="buy", side, count, priceCents, postOnly=false, tif="fill_or_kill" } = {}) {
+  const t = String(ticker || "").trim();
+  const s = String(side || "").toLowerCase();
+  const a = String(action || "").toLowerCase();
+  const c = Number(count);
+
+  if (!t) throw new Error("missing order ticker");
+  if (s !== "yes" && s !== "no") throw new Error("missing/invalid side (must be yes/no)");
+  if (a !== "buy" && a !== "sell") throw new Error("invalid action (buy/sell)");
+  if (!Number.isFinite(c) || c < 1) throw new Error("invalid count");
+
+  const px = Number(priceCents);
+  if (!Number.isFinite(px) || px < 1 || px > 99) throw new Error("invalid priceCents (1..99)");
+
   const body = {
-    ticker,
-    side,
-    action,
-    count,
-    time_in_force,
-    reduce_only: !!reduce_only,
+    ticker: t,
+    type: "limit",
+    action: a,
+    side: s,                  // REQUIRED (you hit missing side earlier)
+    count: c,
+    time_in_force: tif,        // "fill_or_kill" recommended for taker entries
+    post_only: !!postOnly,
   };
 
-  if (side === "yes") body.yes_price = priceCents;
-  else body.no_price = priceCents;
+  if (s === "yes") body.yes_price = px;
+  else body.no_price = px;
 
-  return kalshiFetch("/portfolio/orders", { method: "POST", body, auth: true });
-}
-
-export async function listMarkets({ limit = 200, status = null, series_ticker = null } = {}) {
-  const q = new URLSearchParams();
-  if (limit) q.set("limit", String(limit));
-  if (status) q.set("status", String(status));
-  if (series_ticker) q.set("series_ticker", String(series_ticker));
-  return kalshiFetch("/markets?" + q.toString(), { auth: false });
-}
-
-export async function getSeriesMarkets(seriesTicker, { limit = 200 } = {}) {
-  const st = String(seriesTicker || "");
-  const variants = [st, st.toLowerCase(), st.toUpperCase()]
-    .filter(Boolean)
-    .filter((v, i, a) => a.indexOf(v) === i);
-
-  for (const v of variants) {
-    try {
-      const resp = await listMarkets({ limit, series_ticker: v });
-      const markets = Array.isArray(resp?.markets) ? resp.markets : [];
-      if (markets.length) return { method: "series", used: v, markets };
-    } catch (e) {
-      // try next
-    }
-  }
-
-  return { method: "series", used: variants[0] || st, markets: [] };
+  return kalshiFetch("POST", "/portfolio/orders", body, { auth: true });
 }

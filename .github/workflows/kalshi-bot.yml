@@ -6,45 +6,16 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 18
-
-      - name: Install deps
-        run: npm install
-
-      - name: DEBUG – show repo + runner contents
-        run: |
-          echo "PWD:"
-          pwd
-          echo ""
-          echo "Branch:"
-          git branch --show-current || true
-          echo ""
-          echo "Latest commit:"
-          git log -1 --oneline
-          echo ""
-          echo "scripts/ directory:"
-          ls -la scripts || true
-          echo ""
-          echo "---- grep markers in run-bot.js ----"
-          grep -n "No open markets\|BTC 15m\|pickKx\|fetchBtc" scripts/run-bot.js || true
-          echo ""
-          echo "---- grep markers in bot_runner.mjs ----"
-          grep -n "No open markets\|BTC 15m\|pickKx\|fetchBtc" scripts/bot_runner.mjs || true
-
-      - name: Run bot
-        run: node scripts/run-bot.js
+      - run: npm ci || npm install
+      - run: node scripts/run-bot.js
         env:
+          KALSHI_ENV: ${{ secrets.KALSHI_ENV }}
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
