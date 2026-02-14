@@ -4,6 +4,15 @@ import { getBTCSignal } from "./signal.js";
 
 function nowMs() { return Date.now(); }
 
+
+
+function dollarsToCents(v) {
+  // Accept numbers or strings like "0.4900"
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n * 100);
+}
+
 function clampInt(n, a, b) { return Math.max(a, Math.min(b, Math.floor(n))); }
 
 function cfgDefaults(cfg) {
@@ -90,10 +99,26 @@ if (!market) {
 
     // Mark-to-market using mid of derived bid/ask (fallback to bid if ask missing)
     const bid = side === "yes" ? ob.bestYesBid : ob.bestNoBid;
-    // Prefer market snapshot ask (more reliable), fallback to derived ask from orderbook
-  const snapshotAsk = side === "yes" ? Number(market.yes_ask ?? NaN) : Number(market.no_ask ?? NaN);
+    // Prefer Market snapshot ask. Note: Kalshi removed cent fields in Jan 2026; use *_dollars when present.  [oai_citation:1‡Kalshi API Documentation](https://docs.kalshi.com/changelog?utm_source=chatgpt.com)
+  const snapCents = (() => {
+    if (side === "yes") {
+      // prefer dollars field
+      const d = market?.yes_ask_dollars;
+      const c = market?.yes_ask;
+      if (d != null) return dollarsToCents(d);
+      if (c != null && Number.isFinite(Number(c))) return Number(c);
+      return null;
+    } else {
+      const d = market?.no_ask_dollars;
+      const c = market?.no_ask;
+      if (d != null) return dollarsToCents(d);
+      if (c != null && Number.isFinite(Number(c))) return Number(c);
+      return null;
+    }
+  })();
+
   const derivedAsk = side === "yes" ? ob.yesAsk : ob.noAsk;
-  const ask = Number.isFinite(snapshotAsk) ? snapshotAsk : derivedAsk;
+  const ask = (snapCents != null) ? snapCents : derivedAsk;
     const mid = (bid != null && ask != null) ? Math.round((bid + ask) / 2) : (bid != null ? bid : ask);
 
     if (mid == null) {
@@ -174,7 +199,7 @@ if (!market) {
   const side = dir === "up" ? "yes" : "no";
   const ask = side === "yes" ? ob.yesAsk : ob.noAsk;
   if (ask == null || ask <= 0 || ask >= 99) {
-    console.log("No trade — missing/invalid ask:", ask);
+    console.log("No trade — missing/invalid ask:", ask, "snapCents=", (typeof snapCents!=="undefined"?snapCents:null), "derivedAsk=", derivedAsk);
     return;
   }
 
