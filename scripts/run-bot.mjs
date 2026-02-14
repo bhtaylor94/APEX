@@ -199,6 +199,7 @@ async function main() {
 
   
 // ALWAYS derive executable prices from orderbook (Kalshi listMarkets often has null asks/bids)
+{
 const ob = await getOrderbook(selected.ticker, 1);
 
 // Kalshi orderbook shape: { yes: [{price,count}...], no: [{price,count}...] }
@@ -208,6 +209,7 @@ const bestYesBid = (ob?.yes && ob2.yes.length) ? ob2.yes[ob2.yes.length - 1].pri
 const bestNoBid  = (ob?.no  && ob2.no.length)  ? ob2.no[ob2.no.length - 1].price  : null;
 
 console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid });
+}
 if (ask == null || ask <= 0 || ask >= 99) {
     console.log("const askCents = side === "yes" ? yesAsk : noAsk;
 
