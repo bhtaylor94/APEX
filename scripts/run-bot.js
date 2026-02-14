@@ -31,6 +31,28 @@ import { kvGetJson, kvSetJson } from "./kv.js";
 import { getBTCSignal } from "./signal.js";
 import { getBTCMarkets, placeKalshiOrder } from "./kalshi.js";
 
+
+async function pickKxBtc15mMarket(kalshi, seriesTicker) {
+  const st = String(seriesTicker || "KXBTC15M");
+  // IMPORTANT: don't force status=open; 15m markets are often 'unopened' until right before start.
+  const resp = await kalshi.listMarkets({ series_ticker: st, limit: 200 });
+  const markets = Array.isArray(resp?.markets) ? resp.markets : [];
+
+  const now = Math.floor(Date.now() / 1000);
+
+  const tradable = markets
+    .filter(m => ["open", "unopened", "paused"].includes(String(m.status || "").toLowerCase()))
+    .filter(m => (m.close_ts || 0) > now) // upcoming / current only
+    .sort((a,b) => (a.close_ts || 0) - (b.close_ts || 0)); // soonest close first
+
+  if (!tradable.length) {
+    return { market: null, count: markets.length, method: "series-no-status" };
+  }
+
+  return { market: tradable[0], count: markets.length, method: "series-no-status" };
+}
+
+
 (async () => {
   const config = await kvGetJson("bot:config");
   if (!config?.enabled) {
