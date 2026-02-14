@@ -63,7 +63,8 @@ async function getBestBid(ticker, side){
 
 async function maybeExitPosition(cfg){
   const pos = await kvGetJson("bot:position");
-  if (!pos) return { exited:false, holding:false };
+  console.log("DEBUG bot:position loaded =>", pos, "type:", typeof pos);
+if (!pos) return { exited:false, holding:false };
 
   const ticker = pos.ticker;
   const side = pos.side;
