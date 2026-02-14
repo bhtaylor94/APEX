@@ -212,7 +212,7 @@ console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid });
 }
 if (ask == null || ask <= 0 || ask >= 99) {
 
-No trade — missing/invalid ask:", ask);
+console.log("No trade — missing/invalid ask:", ask);
     return;
   }
   if (ask > cfg.maxEntryPriceCents) {
