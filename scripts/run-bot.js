@@ -1,64 +1,99 @@
 import { kvGetJson, kvSetJson } from "./kv.js";
-import { getOrderbookTop, getSeriesMarkets, placeOrder } from "./kalshi.js";
+import { getSeriesMarkets, getOrderbookTop, placeOrder } from "./kalshi.js";
 import { getBTCSignal } from "./signal.js";
 
 function nowMs() { return Date.now(); }
 
-
-
 function dollarsToCents(v) {
-  // Accept numbers or strings like "0.4900"
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
   return Math.round(n * 100);
 }
 
-function clampInt(n, a, b) { return Math.max(a, Math.min(b, Math.floor(n))); }
-
 function cfgDefaults(cfg) {
   const c = cfg || {};
   return {
     enabled: !!c.enabled,
-    mode: c.mode || "paper",               // "paper" | "live"
-    seriesTicker: (c.seriesTicker || "KXBTC15M").toUpperCase(),
+    mode: c.mode || "paper", // "paper" | "live"
+    seriesTicker: String(c.seriesTicker || "KXBTC15M").toUpperCase(),
+
     tradeSizeUsd: Number(c.tradeSizeUsd ?? 5),
     maxContracts: Number(c.maxContracts ?? 5),
+
     minConfidence: Number(c.minConfidence ?? 0.15),
     minEdge: Number(c.minEdge ?? 5),
 
-    // Exit logic:
-    takeProfitPct: Number(c.takeProfitPct ?? 0.20),  // 0.20 = +20% on entry cost
-    stopLossPct: Number(c.stopLossPct ?? 0.12),      // 0.12 = -12% on entry cost
+    takeProfitPct: Number(c.takeProfitPct ?? 0.20),
+    stopLossPct: Number(c.stopLossPct ?? 0.12),
 
-    // Safety rails:
     cooldownMinutes: Number(c.cooldownMinutes ?? 8),
     maxTradesPerDay: Number(c.maxTradesPerDay ?? 10),
     dailyMaxLossUsd: Number(c.dailyMaxLossUsd ?? 25),
     maxOpenPositions: Number(c.maxOpenPositions ?? 1),
+
     maxEntryPriceCents: Number(c.maxEntryPriceCents ?? 85),
   };
 }
 
-// Very small “market picker”:
-// - filters open markets by prefix KXBTC15M-
-// - picks the most liquid near-term market (highest volume)
-function pickMarket(allMarkets, seriesTicker) {
+function tradableStatus(s) {
+  const st = String(s || "").toLowerCase();
+  return st === "active" || st === "open";
+}
+
+function snapQuoteCents(market) {
+  // Pull cents if present, else dollars->cents if present
+  const yesAsk = market?.yes_ask_dollars != null ? dollarsToCents(market.yes_ask_dollars)
+               : (Number.isFinite(Number(market?.yes_ask)) ? Number(market.yes_ask) : null);
+  const noAsk  = market?.no_ask_dollars  != null ? dollarsToCents(market.no_ask_dollars)
+               : (Number.isFinite(Number(market?.no_ask)) ? Number(market.no_ask) : null);
+
+  const yesBid = market?.yes_bid_dollars != null ? dollarsToCents(market.yes_bid_dollars)
+               : (Number.isFinite(Number(market?.yes_bid)) ? Number(market.yes_bid) : null);
+  const noBid  = market?.no_bid_dollars  != null ? dollarsToCents(market.no_bid_dollars)
+               : (Number.isFinite(Number(market?.no_bid)) ? Number(market.no_bid) : null);
+
+  // If asks missing but bids exist, derive asks via complement rule:
+  // YES ask ≈ 100 - best NO bid; NO ask ≈ 100 - best YES bid
+  const yesAsk2 = yesAsk != null ? yesAsk : (noBid != null ? (100 - noBid) : null);
+  const noAsk2  = noAsk  != null ? noAsk  : (yesBid != null ? (100 - yesBid) : null);
+
+  return { yesAsk: yesAsk2, noAsk: noAsk2, yesBid, noBid };
+}
+
+function validAsk(a) {
+  return a != null && a > 0 && a < 99;
+}
+
+async function pickMarketWithLiquidity(markets, seriesTicker, side, maxEntryPriceCents) {
   const prefix = (seriesTicker + "-").toLowerCase();
 
-  // Kalshi responses may show status like: active/closed/etc. We only want tradable ones.
-  const TRADABLE = new Set(["open", "active"]); // treat "active" as tradable
+  const candidates = (markets || [])
+    .filter(m => String(m?.ticker || "").toLowerCase().startsWith(prefix))
+    .filter(m => tradableStatus(m?.status))
+    .sort((a, b) => Number(b.volume || 0) - Number(a.volume || 0))
+    .slice(0, 50);
 
-  const ms = (allMarkets || []).filter(m => {
-    const t = String(m.ticker || "").toLowerCase();
-    const st = String(m.status || "").toLowerCase();
-    if (!t.startsWith(prefix)) return false;
-    if (st && !TRADABLE.has(st)) return false; // exclude closed/settled/etc
-    return true;
-  });
+  for (const m of candidates) {
+    const q = snapQuoteCents(m);
+    const askSnap = side === "yes" ? q.yesAsk : q.noAsk;
 
-  // Pick most liquid
-  ms.sort((a, b) => (Number(b.volume || 0) - Number(a.volume || 0)));
-  return ms[0] || null;
+    if (validAsk(askSnap) && askSnap <= maxEntryPriceCents) {
+      return { market: m, ask: askSnap, source: "snapshot" };
+    }
+
+    // fallback: orderbook-derived ask
+    try {
+      const ob = await getOrderbookTop(m.ticker);
+      const askOb = side === "yes" ? ob.yesAsk : ob.noAsk;
+      if (validAsk(askOb) && askOb <= maxEntryPriceCents) {
+        return { market: m, ask: askOb, source: "orderbook" };
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return { market: null, ask: null, source: "none" };
 }
 
 async function main() {
@@ -70,89 +105,52 @@ async function main() {
     return;
   }
 
-  // Load state
   const state = (await kvGetJson("bot:state")) || {};
   const pos = state.position || null;
 
-  // Compute signal (your signal.js already returns direction/confidence/price)
   const sig = await getBTCSignal();
   console.log("SIGNAL:", sig);
 
-  // Pull markets by series_ticker (public, reliable)
   const seriesResp = await getSeriesMarkets(cfg.seriesTicker, { limit: 200 });
   const allMarkets = Array.isArray(seriesResp?.markets) ? seriesResp.markets : [];
-  console.log(`Markets source: ${seriesResp.method}(${seriesResp.used}) — found: ${allMarkets.length}`);
-  const market = pickMarket(allMarkets, cfg.seriesTicker);
-if (!market) {
-    console.log("No tradable markets found for series:", cfg.seriesTicker);
-    return;
-  }
+  console.log(`Markets source: series(${seriesResp.used || cfg.seriesTicker}) — found: ${allMarkets.length}`);
 
-  const marketTicker = market.ticker;
-  const ob = await getOrderbookTop(marketTicker);
-
-  // ---------- A) If we have an open position, manage exits ----------
-  if (pos && pos.marketTicker === marketTicker) {
-    const entry = Number(pos.entryPriceCents);
+  // If we have an open position, manage exits on that market ticker
+  if (pos?.marketTicker) {
+    const marketTicker = pos.marketTicker;
+    const side = pos.side;
     const count = Number(pos.count);
-    const side = pos.side; // "yes" | "no"
+    const entry = Number(pos.entryPriceCents);
 
-    // Mark-to-market using mid of derived bid/ask (fallback to bid if ask missing)
+    const ob = await getOrderbookTop(marketTicker);
     const bid = side === "yes" ? ob.bestYesBid : ob.bestNoBid;
-    // Prefer Market snapshot ask. Note: Kalshi removed cent fields in Jan 2026; use *_dollars when present.
-  const derivedAsk = side === "yes" ? ob.yesAsk : ob.noAsk;
-
-  const snapCents = (() => {
-    if (side === "yes") {
-      const d = market?.yes_ask_dollars;
-      const c = market?.yes_ask;
-      if (d != null) return dollarsToCents(d);
-      if (c != null && Number.isFinite(Number(c))) return Number(c);
-      return null;
-    } else {
-      const d = market?.no_ask_dollars;
-      const c = market?.no_ask;
-      if (d != null) return dollarsToCents(d);
-      if (c != null && Number.isFinite(Number(c))) return Number(c);
-      return null;
-    }
-  })();
-
-  const ask = (snapCents != null) ? snapCents : derivedAsk;
+    const ask = side === "yes" ? ob.yesAsk : ob.noAsk;
     const mid = (bid != null && ask != null) ? Math.round((bid + ask) / 2) : (bid != null ? bid : ask);
 
-    if (mid == null) {
-      console.log("No orderbook prices to manage exit. Holding.");
+    if (mid == null || bid == null) {
+      console.log("POSITION: cannot price/exit (no orderbook). Holding.", { marketTicker, side, count, entryPriceCents: entry });
       return;
     }
 
     const tp = Math.round(entry * (1 + cfg.takeProfitPct));
     const sl = Math.round(entry * (1 - cfg.stopLossPct));
 
-    console.log("POSITION:", { marketTicker, side, count, entryPriceCents: entry, markCents: mid, tp, sl });
-
     const hitTP = mid >= tp;
     const hitSL = mid <= sl;
 
-    // Optional: exit early if signal flips hard (simple rule)
-    const signalFlipExit =
+    const flipExit =
       (side === "yes" && sig.direction === "down" && sig.confidence >= cfg.minConfidence) ||
       (side === "no"  && sig.direction === "up"   && sig.confidence >= cfg.minConfidence);
 
-    if (!hitTP && !hitSL && !signalFlipExit) {
+    console.log("POSITION:", { marketTicker, side, count, entryPriceCents: entry, markCents: mid, bidCents: bid, tp, sl, hitTP, hitSL, flipExit });
+
+    if (!hitTP && !hitSL && !flipExit) {
       console.log("Hold position — no TP/SL/Flip exit.");
       return;
     }
 
-    // SELL at best bid to be marketable
-    const exitPrice = bid;
-    if (exitPrice == null) {
-      console.log("No bid to exit at. Holding.");
-      return;
-    }
-
     const reason = hitTP ? "TAKE_PROFIT" : hitSL ? "STOP_LOSS" : "SIGNAL_FLIP";
-    console.log(`EXIT: ${reason} — Selling ${side.toUpperCase()} ${count}x @ ${exitPrice}¢`);
+    console.log(`EXIT: ${reason} — SELL ${side.toUpperCase()} ${count}x ${marketTicker} @ ${bid}¢`);
 
     if (cfg.mode === "live") {
       const out = await placeOrder({
@@ -160,7 +158,7 @@ if (!market) {
         side,
         action: "sell",
         count,
-        priceCents: exitPrice,
+        priceCents: bid,
         time_in_force: "fill_or_kill",
         reduce_only: true,
       });
@@ -169,47 +167,38 @@ if (!market) {
       console.log("(paper) EXIT simulated.");
     }
 
-    // Clear position
     state.position = null;
     await kvSetJson("bot:state", state);
-    await kvSetJson("bot:last_run", { action: "exit", marketTicker, side, count, priceCents: exitPrice, reason, ts: nowMs() });
+    await kvSetJson("bot:last_run", { action: "exit", marketTicker, side, count, priceCents: bid, reason, ts: nowMs() });
     console.log("Done.");
     return;
   }
 
-  // ---------- B) If we do NOT have a position, consider entry ----------
-  // Enforce maxOpenPositions using state only (simple)
-  if (state.position) {
-    console.log("State says position exists on another market. Not entering.");
+  // Entry decision
+  if (sig.direction !== "up" && sig.direction !== "down") {
+    console.log("No trade — direction:", sig.direction);
     return;
   }
-
-  // Direction mapping: up => buy YES, down => buy NO
-  const dir = sig.direction;
-  if (dir !== "up" && dir !== "down") {
-    console.log("No trade — direction:", dir);
-    return;
-  }
-
   if (sig.confidence < cfg.minConfidence) {
     console.log("No trade — confidence below min:", sig.confidence, "<", cfg.minConfidence);
     return;
   }
 
-  const side = dir === "up" ? "yes" : "no";
-  const ask = side === "yes" ? ob.yesAsk : ob.noAsk;
-  if (ask == null || ask <= 0 || ask >= 99) {
-    console.log("No trade — missing/invalid ask:", ask, "snapCents=", (typeof snapCents !== "undefined" ? snapCents : null), "derivedAsk=", (typeof derivedAsk !== "undefined" ? derivedAsk : null));
+  const side = sig.direction === "up" ? "yes" : "no";
+
+  const pick = await pickMarketWithLiquidity(allMarkets, cfg.seriesTicker, side, cfg.maxEntryPriceCents);
+  if (!pick.market || pick.ask == null) {
+    console.log("No tradable markets found for series:", cfg.seriesTicker, "(no actionable quotes within maxEntryPrice)");
     return;
   }
 
-  if (ask > cfg.maxEntryPriceCents) {
-    console.log(`No trade — ask too expensive: ${ask}¢ > maxEntryPrice ${cfg.maxEntryPriceCents}¢`);
-    return;
-  }
+  const market = pick.market;
+  const marketTicker = market.ticker;
+  const ask = pick.ask;
 
-  // Simple “edge”: predictedProb - price (in cents)
-  const predictedProbCents = Math.round(50 + (sig.confidence * 35)); // same idea you used earlier
+  console.log("Selected market:", { ticker: marketTicker, status: market.status, volume: market.volume, askCents: ask, source: pick.source });
+
+  const predictedProbCents = Math.round(50 + (sig.confidence * 35));
   const edge = predictedProbCents - ask;
 
   console.log(`Edge check: predicted=${predictedProbCents}¢ market=${ask}¢ edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
@@ -218,9 +207,7 @@ if (!market) {
     return;
   }
 
-  // Size: fixed maxContracts (simple + safe)
-  const count = clampInt(cfg.maxContracts, 1, 50);
-
+  const count = Math.max(1, Math.min(Number(cfg.maxContracts) || 1, 50));
   console.log(`ENTRY: BUY ${side.toUpperCase()} ${count}x ${marketTicker} @ ${ask}¢ (mode=${cfg.mode})`);
 
   if (cfg.mode === "live") {
@@ -238,15 +225,7 @@ if (!market) {
     console.log("(paper) ENTRY simulated.");
   }
 
-  // Save position state so next cron run can manage exits
-  state.position = {
-    marketTicker,
-    side,
-    count,
-    entryPriceCents: ask,
-    enteredTs: nowMs(),
-  };
-
+  state.position = { marketTicker, side, count, entryPriceCents: ask, enteredTs: nowMs() };
   await kvSetJson("bot:state", state);
   await kvSetJson("bot:last_run", { action: "enter", marketTicker, side, count, priceCents: ask, edge, ts: nowMs() });
 
