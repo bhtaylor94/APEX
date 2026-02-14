@@ -122,13 +122,13 @@ const bestNoBid  = (ob?.no  && ob.no.length)  ? ob.no[ob.no.length - 1].price  :
 
 console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid });
 }
-if (ask == null || ask <= 0 || ask >= 99) {
+if (askCents == null || askCents <= 0 || askCents >= 99) {
 
-console.log("No trade — missing/invalid ask:", ask);
+console.log("No trade — missing/invalid askCents:", askCents);
 // [PATCH] removed illegal top-level return:     return;
   }
-  if (ask > cfg.maxEntryPriceCents) {
-    console.log(`No trade — ask ${ask}¢ > maxEntryPriceCents ${cfg.maxEntryPriceCents}¢`);
+  if (askCents > cfg.maxEntryPriceCents) {
+    console.log(`No trade — askCents ${askCents}¢ > maxEntryPriceCents ${cfg.maxEntryPriceCents}¢`);
 // [PATCH] removed illegal top-level return:     return;
   }
   console.log(`Edge check: predYES=${predYes}¢ predNO=${predNo}¢ yesAsk=${yesAsk}¢ noAsk=${noAsk}¢ edgeYES=${edgeYes}¢ edgeNO=${edgeNo}¢ chosen=${side.toUpperCase()} edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
@@ -140,7 +140,7 @@ console.log("No trade — missing/invalid ask:", ask);
 
   const count = clamp(cfg.maxContracts, 1, cfg.maxContracts);
 
-  console.log(`Decision: BUY ${side.toUpperCase()} ${count}x ${m.ticker} @ ${ask}¢ (mode=${cfg.mode})`);
+  console.log(`Decision: BUY ${side.toUpperCase()} ${count}x ${m.ticker} @ ${askCents}¢ (mode=${cfg.mode})`);
 
   if (cfg.mode === "live") {
     const out = await createOrder({
@@ -148,7 +148,7 @@ console.log("No trade — missing/invalid ask:", ask);
       action: "buy",
       side,
       count,
-      priceCents: ask,
+      priceCents: askCents,
       tif: "fill_or_kill",
       postOnly: false
     });
@@ -162,10 +162,10 @@ console.log("No trade — missing/invalid ask:", ask);
     ticker: m.ticker,
     side,
     count,
-    entryPriceCents: ask,
+    entryPriceCents: askCents,
     openedTs: nowTs()
   });
-  await kvSetJson("bot:last_action", { ts: nowTs(), type:"entry", ticker:m.ticker, side, count, ask });
+  await kvSetJson("bot:last_action", { ts: nowTs(), type:"entry", ticker:m.ticker, side, count, askCents });
   console.log("Saved bot:position");
 // [PATCH] removed stray top-level brace: }
 
