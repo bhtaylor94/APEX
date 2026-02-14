@@ -300,40 +300,51 @@ async function main() {
   console.log("ORDER RESULT:", res);
 
   // --- Persist bot state (Firebase KV) ---
+  // IMPORTANT: persist ONLY from executed order response to avoid scope/name issues.
   try {
-    // Prefer values that exist in this scope:
-    // ticker/side/askCents come from the Selected market object you log.
-    const ticker = (best?.ticker ?? picked?.ticker ?? chosen?.ticker ?? null);
-    const side = (best?.side ?? picked?.side ?? chosen?.side ?? null);
-    const entryPriceCents = (best?.askCents ?? picked?.askCents ?? chosen?.askCents ?? askCents ?? null);
-
-    if (ticker && side && Number.isFinite(entryPriceCents) && Number.isFinite(count)) {
-      await kvSetJson("bot:position", {
-        ticker,
-        side,
-        entryPriceCents,
-        count,
-        openedTs: Date.now(),
-        orderId: res?.order?.order_id || null
-      });
-
-      await kvSetJson("bot:last_run", {
-        ts: Date.now(),
-        action: "entry",
-        ticker,
-        side,
-        entryPriceCents,
-        count,
-        orderId: res?.order?.order_id || null
-      });
-
-      console.log("Saved bot:position + bot:last_run");
+    const o = res?.order || null;
+    if (!o?.ticker || !o?.side) {
+      console.log("WARN: KV persist skipped (missing res.order.ticker/side)");
     } else {
-      console.log("WARN: KV persist skipped (missing ticker/side/entry/count)", { ticker, side, entryPriceCents, count });
+      const side = String(o.side);
+      const entryPriceCents =
+        side === "yes"
+          ? Number(o.yes_price ?? o.yes_price_fp ?? null)
+          : Number(o.no_price ?? o.no_price_fp ?? null);
+
+      const count = Number(o.fill_count ?? o.initial_count ?? o.initial_count_fp ?? 0);
+
+      // Only persist if entry/count look valid
+      if (Number.isFinite(entryPriceCents) && entryPriceCents >= 1 && entryPriceCents <= 99 && Number.isFinite(count) && count > 0) {
+        await kvSetJson("bot:position", {
+          ticker: o.ticker,
+          side,
+          entryPriceCents,
+          count,
+          openedTs: Date.now(),
+          orderId: o.order_id || null
+        });
+
+        await kvSetJson("bot:last_run", {
+          ts: Date.now(),
+          action: "entry",
+          ticker: o.ticker,
+          side,
+          entryPriceCents,
+          count,
+          status: o.status || null,
+          orderId: o.order_id || null
+        });
+
+        console.log("Saved bot:position + bot:last_run (from res.order)");
+      } else {
+        console.log("WARN: KV persist skipped (invalid entry/count)", { entryPriceCents, count });
+      }
     }
   } catch (e) {
     console.log("WARN: KV persist failed:", e?.message || e);
   }
+
 
 
   // --- Persist run state (Firebase KV) ---
