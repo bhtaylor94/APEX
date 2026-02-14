@@ -32,6 +32,21 @@ function cfgDefaults(cfg) {
     maxOpenPositions: Number(c.maxOpenPositions ?? 1),
 
     maxEntryPriceCents: Number(c.maxEntryPriceCents ?? 85),
+
+    // Entry mode:
+    // "maker" = only post bids at fair value
+    // "momentum" = only take when strong, even if slightly overpriced
+    // "maker+momentum" = maker by default, momentum when strong
+    entryPolicy: String(c.entryPolicy || "maker+momentum"),
+
+    // Maker knobs
+    makerBufferCents: Number(c.makerBufferCents ?? 2),
+    makerPostOnly: c.makerPostOnly !== false, // default true
+    makerTif: String(c.makerTif || "good_till_canceled"),
+
+    // Momentum knobs
+    momentumMinConfidence: Number(c.momentumMinConfidence ?? 0.45),
+    momentumMaxOverpayCents: Number(c.momentumMaxOverpayCents ?? 8),
   };
 }
 
@@ -41,7 +56,6 @@ function tradableStatus(s) {
 }
 
 function snapQuoteCents(market) {
-  // Pull cents if present, else dollars->cents if present
   const yesAsk = market?.yes_ask_dollars != null ? dollarsToCents(market.yes_ask_dollars)
                : (Number.isFinite(Number(market?.yes_ask)) ? Number(market.yes_ask) : null);
   const noAsk  = market?.no_ask_dollars  != null ? dollarsToCents(market.no_ask_dollars)
@@ -52,8 +66,7 @@ function snapQuoteCents(market) {
   const noBid  = market?.no_bid_dollars  != null ? dollarsToCents(market.no_bid_dollars)
                : (Number.isFinite(Number(market?.no_bid)) ? Number(market.no_bid) : null);
 
-  // If asks missing but bids exist, derive asks via complement rule:
-  // YES ask ≈ 100 - best NO bid; NO ask ≈ 100 - best YES bid
+  // Derive asks from bids if asks missing
   const yesAsk2 = yesAsk != null ? yesAsk : (noBid != null ? (100 - noBid) : null);
   const noAsk2  = noAsk  != null ? noAsk  : (yesBid != null ? (100 - yesBid) : null);
 
@@ -96,6 +109,12 @@ async function pickMarketWithLiquidity(markets, seriesTicker, side, maxEntryPric
   return { market: null, ask: null, source: "none" };
 }
 
+function clampCents(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(1, Math.min(98, Math.round(n)));
+}
+
 async function main() {
   const cfg = cfgDefaults(await kvGetJson("bot:config"));
   console.log("CONFIG:", cfg);
@@ -115,7 +134,7 @@ async function main() {
   const allMarkets = Array.isArray(seriesResp?.markets) ? seriesResp.markets : [];
   console.log(`Markets source: series(${seriesResp.used || cfg.seriesTicker}) — found: ${allMarkets.length}`);
 
-  // If we have an open position, manage exits on that market ticker
+  // Exit manager (if you already have a position tracked)
   if (pos?.marketTicker) {
     const marketTicker = pos.marketTicker;
     const side = pos.side;
@@ -174,7 +193,7 @@ async function main() {
     return;
   }
 
-  // Entry decision
+  // Entry
   if (sig.direction !== "up" && sig.direction !== "down") {
     console.log("No trade — direction:", sig.direction);
     return;
@@ -192,44 +211,112 @@ async function main() {
     return;
   }
 
-  const market = pick.market;
-  const marketTicker = market.ticker;
+  const marketTicker = pick.market.ticker;
   const ask = pick.ask;
 
-  console.log("Selected market:", { ticker: marketTicker, status: market.status, volume: market.volume, askCents: ask, source: pick.source });
+  console.log("Selected market:", { ticker: marketTicker, status: pick.market.status, volume: pick.market.volume, askCents: ask, source: pick.source });
 
+  // Simple fair value mapping (yours)
   const predictedProbCents = Math.round(50 + (sig.confidence * 35));
   const edge = predictedProbCents - ask;
 
   console.log(`Edge check: predicted=${predictedProbCents}¢ market=${ask}¢ edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
-  if (edge < cfg.minEdge) {
-    console.log("No trade — edge too small.");
+
+  const policy = String(cfg.entryPolicy || "maker+momentum");
+  const count = Math.max(1, Math.min(Number(cfg.maxContracts) || 1, 50));
+
+  // VALUE (taker) if good edge
+  if (edge >= cfg.minEdge) {
+    console.log(`ENTRY (VALUE): BUY ${side.toUpperCase()} ${count}x ${marketTicker} @ ${ask}¢ (FoK taker, mode=${cfg.mode})`);
+
+    if (cfg.mode === "live") {
+      const out = await placeOrder({
+        ticker: marketTicker,
+        side,
+        action: "buy",
+        count,
+        priceCents: ask,
+        time_in_force: "fill_or_kill",
+        reduce_only: false,
+      });
+      console.log("ENTRY ORDER RESULT:", out);
+    } else {
+      console.log("(paper) ENTRY simulated.");
+    }
+
+    state.position = { marketTicker, side, count, entryPriceCents: ask, enteredTs: nowMs() };
+    await kvSetJson("bot:state", state);
+    await kvSetJson("bot:last_run", { action: "enter_value", marketTicker, side, count, priceCents: ask, edge, ts: nowMs() });
+    console.log("Done.");
     return;
   }
 
-  const count = Math.max(1, Math.min(Number(cfg.maxContracts) || 1, 50));
-  console.log(`ENTRY: BUY ${side.toUpperCase()} ${count}x ${marketTicker} @ ${ask}¢ (mode=${cfg.mode})`);
+  // MOMENTUM (taker) if strong and not too overpriced
+  const allowMomentum = (policy === "momentum" || policy === "maker+momentum");
+  if (allowMomentum && sig.confidence >= cfg.momentumMinConfidence) {
+    const maxOverpay = cfg.momentumMaxOverpayCents;
+    if (edge >= -maxOverpay) {
+      console.log(`ENTRY (MOMENTUM): BUY ${side.toUpperCase()} ${count}x ${marketTicker} @ ${ask}¢ (edge=${edge}¢ cap=-${maxOverpay}¢, mode=${cfg.mode})`);
 
-  if (cfg.mode === "live") {
-    const out = await placeOrder({
-      ticker: marketTicker,
-      side,
-      action: "buy",
-      count,
-      priceCents: ask,
-      time_in_force: "fill_or_kill",
-      reduce_only: false,
-    });
-    console.log("ENTRY ORDER RESULT:", out);
-  } else {
-    console.log("(paper) ENTRY simulated.");
+      if (cfg.mode === "live") {
+        const out = await placeOrder({
+          ticker: marketTicker,
+          side,
+          action: "buy",
+          count,
+          priceCents: ask,
+          time_in_force: "fill_or_kill",
+          reduce_only: false,
+        });
+        console.log("ENTRY ORDER RESULT:", out);
+      } else {
+        console.log("(paper) ENTRY simulated.");
+      }
+
+      state.position = { marketTicker, side, count, entryPriceCents: ask, enteredTs: nowMs() };
+      await kvSetJson("bot:state", state);
+      await kvSetJson("bot:last_run", { action: "enter_momentum", marketTicker, side, count, priceCents: ask, edge, ts: nowMs() });
+      console.log("Done.");
+      return;
+    }
+    console.log(`No momentum trade — too overpriced: edge=${edge}¢ < -${maxOverpay}¢`);
   }
 
-  state.position = { marketTicker, side, count, entryPriceCents: ask, enteredTs: nowMs() };
-  await kvSetJson("bot:state", state);
-  await kvSetJson("bot:last_run", { action: "enter", marketTicker, side, count, priceCents: ask, edge, ts: nowMs() });
+  // MAKER (post-only bid near fair value)
+  const allowMaker = (policy === "maker" || policy === "maker+momentum");
+  if (allowMaker) {
+    const buffer = cfg.makerBufferCents;
+    let bid = clampCents(predictedProbCents - buffer);
+    if (bid == null) {
+      console.log("No maker trade — invalid bid calc.");
+      return;
+    }
+    bid = Math.min(bid, cfg.maxEntryPriceCents);
 
-  console.log("Done.");
+    console.log(`ENTRY (MAKER): POST_ONLY BUY ${side.toUpperCase()} ${count}x ${marketTicker} @ ${bid}¢ (pred=${predictedProbCents}¢ buffer=${buffer}¢)`);
+
+    if (cfg.mode === "live") {
+      const out = await placeOrder({
+        ticker: marketTicker,
+        side,
+        action: "buy",
+        count,
+        priceCents: bid,
+        time_in_force: cfg.makerTif,
+        post_only: cfg.makerPostOnly,
+        reduce_only: false,
+      });
+      console.log("MAKER ORDER RESULT:", out);
+      await kvSetJson("bot:last_run", { action: "place_maker_bid", marketTicker, side, count, priceCents: bid, edge, ts: nowMs() });
+    } else {
+      console.log("(paper) MAKER bid simulated.");
+    }
+
+    console.log("Done.");
+    return;
+  }
+
+  console.log("No trade — edge too small and policy disallows maker/momentum.");
 }
 
 main().catch(e => {
