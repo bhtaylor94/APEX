@@ -242,6 +242,9 @@ async function getExecutablePrices(ticker) {
 }
 
 async function main() {
+  // FIX: marketSnapshot was referenced but never defined (we use orderbook anyway)
+  const marketSnapshot = null;
+
   const cfg = (await kvGetJson("bot:config")) || {};
 
   const enabled = !!cfg.enabled;
