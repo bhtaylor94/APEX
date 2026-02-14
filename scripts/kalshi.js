@@ -96,7 +96,7 @@ export function deriveAsksFromBids(orderbook) {
 export async function getMarketsBySeries(seriesTicker, limit = 200) {
   const st = String(seriesTicker || "").toUpperCase();
   const qs = new URLSearchParams({ status: "active", series_ticker: st, limit: String(limit) });
-  return kalshiFetch("GET", "/markets?" + qs.toString());
+  return kalshiFetch("GET", "/markets?with_orderbook=true&orderbook_depth=1" + qs.toString());
 }
 
 export async function getMarket(ticker) {
