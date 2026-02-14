@@ -299,6 +299,43 @@ async function main() {
   const res = await placeOrder({ ticker: best.ticker, side: best.side, count, priceCents: best.askCents, action: "buy" });
   console.log("ORDER RESULT:", res);
 
+  // --- Persist bot state (Firebase KV) ---
+  try {
+    // Prefer values that exist in this scope:
+    // ticker/side/askCents come from the Selected market object you log.
+    const ticker = (best?.ticker ?? picked?.ticker ?? chosen?.ticker ?? null);
+    const side = (best?.side ?? picked?.side ?? chosen?.side ?? null);
+    const entryPriceCents = (best?.askCents ?? picked?.askCents ?? chosen?.askCents ?? askCents ?? null);
+
+    if (ticker && side && Number.isFinite(entryPriceCents) && Number.isFinite(count)) {
+      await kvSetJson("bot:position", {
+        ticker,
+        side,
+        entryPriceCents,
+        count,
+        openedTs: Date.now(),
+        orderId: res?.order?.order_id || null
+      });
+
+      await kvSetJson("bot:last_run", {
+        ts: Date.now(),
+        action: "entry",
+        ticker,
+        side,
+        entryPriceCents,
+        count,
+        orderId: res?.order?.order_id || null
+      });
+
+      console.log("Saved bot:position + bot:last_run");
+    } else {
+      console.log("WARN: KV persist skipped (missing ticker/side/entry/count)", { ticker, side, entryPriceCents, count });
+    }
+  } catch (e) {
+    console.log("WARN: KV persist failed:", e?.message || e);
+  }
+
+
   // --- Persist run state (Firebase KV) ---
   try {
     const lastRun = {
