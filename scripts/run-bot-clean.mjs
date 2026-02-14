@@ -26,6 +26,104 @@ async function getSignal() {
   return { direction: "up", confidence: 0.20, price: 0 };
 }
 
+function pct(n){ return Math.round(n*1000)/10; }
+
+function validBid(v){
+  const n = (typeof v === "number") ? v : Number(v);
+  if (!Number.isFinite(n)) return null;
+  if (n < 1 || n > 99) return null;
+  return n;
+}
+
+async function getBestBid(ticker, side){
+  // snapshot bid first
+  try {
+    const m = await getMarket(ticker);
+    const mm = m?.market || m;
+    const y = validBid(mm?.yes_bid ?? mm?.yesBid ?? null);
+    const n = validBid(mm?.no_bid  ?? mm?.noBid  ?? null);
+    const bid = side === "yes" ? y : n;
+    if (bid) return { bidCents: bid, source: "snapshot" };
+  } catch (_) {}
+
+  // orderbook fallback
+  try {
+    const ob = await getOrderbook(ticker, 1);
+    const book = ob?.orderbook || ob?.order_book || ob;
+    const yesBids = book?.yes_bids || book?.yesBids || [];
+    const noBids  = book?.no_bids  || book?.noBids  || [];
+    const bid = side === "yes"
+      ? validBid(yesBids?.[0]?.price ?? null)
+      : validBid(noBids?.[0]?.price  ?? null);
+    if (bid) return { bidCents: bid, source: "orderbook" };
+  } catch (_) {}
+
+  return { bidCents: null, source: "none" };
+}
+
+async function maybeExitPosition(cfg){
+  const pos = await kvGetJson("bot:position");
+  if (!pos) return { exited:false, holding:false };
+
+  const ticker = pos.ticker;
+  const side = pos.side;
+  const entry = Number(pos.entryPriceCents || 0);
+  const count = Number(pos.count || 0);
+
+  if (!ticker || (side !== "yes" && side !== "no") || !entry || !count) {
+    console.log("Position invalid — clearing.");
+    try { await kvSetJson("bot:position", null); } catch {}
+    return { exited:false, holding:false };
+  }
+
+  const takeProfitPct = Number(cfg.takeProfitPct ?? 0.20);
+  const stopLossPct   = Number(cfg.stopLossPct   ?? 0.12);
+
+  const bid = await getBestBid(ticker, side);
+  if (!bid.bidCents) {
+    console.log("HOLD — no bid to exit on yet.");
+    return { exited:false, holding:true };
+  }
+
+  const pnlCentsPer = bid.bidCents - entry;
+  const pnlPct = pnlCentsPer / entry;
+
+  console.log(
+    "POSITION:",
+    side.toUpperCase(),
+    count + "x",
+    ticker,
+    "entry=" + entry + "¢",
+    "bestBid=" + bid.bidCents + "¢ (" + bid.source + ")",
+    "PnL=" + (pnlCentsPer >= 0 ? "+" : "") + pnlCentsPer + "¢/ct",
+    "(" + (pnlPct >= 0 ? "+" : "") + pct(pnlPct) + "%)"
+  );
+
+  const hitTP = pnlPct >= takeProfitPct;
+  const hitSL = pnlPct <= -stopLossPct;
+
+  if (!hitTP && !hitSL) {
+    console.log("No exit — TP/SL not hit. TP=" + pct(takeProfitPct) + "% SL=-" + pct(stopLossPct) + "%");
+    return { exited:false, holding:true };
+  }
+
+  const reason = hitTP ? "TAKE_PROFIT" : "STOP_LOSS";
+  const line = "SELL " + side.toUpperCase() + " " + count + "x " + ticker + " @ " + bid.bidCents + "¢ (reason=" + reason + ", mode=" + cfg.mode + ")";
+  console.log("EXIT:", line);
+
+  if (String(cfg.mode || "paper").toLowerCase() !== "live") {
+    console.log("PAPER MODE — would exit:", line);
+    try { await kvSetJson("bot:position", null); } catch {}
+    return { exited:true, holding:false };
+  }
+
+  const res = await placeOrder({ ticker, side, count, priceCents: bid.bidCents, action: "sell" });
+  console.log("EXIT ORDER RESULT:", res);
+
+  try { await kvSetJson("bot:position", null); } catch {}
+  return { exited:true, holding:false };
+}
+
 function probYesFromSignal(direction, confidence) {
   const c = clamp(Number(confidence || 0), 0, 1);
   const p = 0.5 + c * 0.35;
@@ -94,6 +192,21 @@ async function main() {
 
   const sig = await getSignal();
   console.log("SIGNAL:", sig);
+// --- Exit management first (sell-to-close) ---
+  try {
+    const ex = await maybeExitPosition({ ...cfg, mode });
+    if (ex.exited) {
+      console.log("Exited position — skipping entry this run.");
+      return;
+    }
+    if (ex.holding) {
+      console.log("Holding open position — skipping entry this run.");
+      return;
+    }
+  } catch (e) {
+    console.log("Exit manager error (non-fatal):", e?.message || e);
+  }
+
 
   const confidence = Number(sig.confidence || 0);
   if (confidence < minConfidence) {
