@@ -201,8 +201,9 @@ async function main() {
       return;
     }
     if (ex.holding) {
-      console.log("Holding open position (override): continuing to allow new entries.");
-}
+      console.log("Holding open position — skipping entry this run.");
+      return;
+    }
   } catch (e) {
     console.log("Exit manager error (non-fatal):", e?.message || e);
   }
