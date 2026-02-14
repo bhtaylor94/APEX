@@ -1,182 +1,171 @@
-import { listMarkets, getMarket, getOrderbook, deriveAsksFromOrderbook, createOrder } from "./kalshi.js";
+import { kvGetJson, kvSetJson } from "./kv.js";
+import { getBTCSignal } from "./signal.js";
+import { getMarkets, getOrderbook, placeOrder } from "./kalshi.js";
 
-function loadConfig() {
-  const cfg = {
-    enabled: true,
-    mode: "paper",
-    seriesTicker: "KXBTC15M",
-    tradeSizeUsd: 5,
-    maxContracts: 5,
-    minConfidence: 0.15,
-    minEdge: 5,
-    maxEntryPriceCents: 85,
-  };
-  if (process.env.BOT_MODE) cfg.mode = String(process.env.BOT_MODE).toLowerCase();
-  if (process.env.SERIES_TICKER) cfg.seriesTicker = String(process.env.SERIES_TICKER).toUpperCase();
-  return cfg;
+function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+
+function calcContracts({ tradeSizeUsd, maxContracts, askCents }) {
+  if (!askCents || askCents <= 0) return 0;
+  const budgetCents = Math.max(1, Math.round((tradeSizeUsd || 5) * 100));
+  const byBudget = Math.floor(budgetCents / askCents);
+  return clamp(Math.max(1, byBudget), 1, maxContracts || 5);
 }
 
-// Replace with your real signal engine when ready.
-async function getSignalStub() {
-  const direction = Math.random() > 0.5 ? "up" : "down";
-  return { direction, confidence: 0.2, price: 0 };
+function probFromSignal(direction, confidence) {
+  // You can improve this later; for now: 50% + scaled confidence
+  const c = clamp(confidence || 0, 0, 1);
+  const p = 0.5 + c * 0.35;
+  return direction === "down" ? (1 - p) : p;
 }
 
-function sideFromSignal(direction) {
-  if (direction === "up") return "yes";
-  if (direction === "down") return "no";
+async function pickTradableMarket(seriesTicker, desiredSide, maxEntryPriceCents) {
+  const series = String(seriesTicker || "KXBTC15M").toUpperCase();
+
+  const resp = await getMarkets({ series_ticker: series, status: "open", limit: 200, mve_filter: "exclude" });
+  const markets = Array.isArray(resp?.markets) ? resp.markets : [];
+
+  console.log("Markets source: series(" + series + ") — found: " + markets.length);
+
+  // Keep only BTC15M market tickers
+  const btc = markets.filter(m => typeof m?.ticker === "string" && m.ticker.startsWith(series + "-"));
+  if (!btc.length) return null;
+
+  // Sort by volume desc
+  btc.sort((a, b) => (b.volume || 0) - (a.volume || 0));
+
+  // Try top N by volume; for each, find ask either from snapshot or orderbook
+  const N = Math.min(30, btc.length);
+  for (let i = 0; i < N; i++) {
+    const m = btc[i];
+    const ticker = m.ticker;
+
+    // Snapshot ask may be missing / 99 — treat >=99 as non-tradable for entry
+    const snapAsk = desiredSide === "yes" ? m.yes_ask : m.no_ask;
+    let askCents = (typeof snapAsk === "number" ? snapAsk : null);
+    let source = "snapshot";
+
+    if (!askCents || askCents >= 99) {
+      try {
+        const ob = await getOrderbook(ticker, 1);
+        const yesAsks = ob?.orderbook?.yes_asks || [];
+        const noAsks  = ob?.orderbook?.no_asks  || [];
+        const bestAsk = desiredSide === "yes"
+          ? (yesAsks[0]?.price ?? null)
+          : (noAsks[0]?.price  ?? null);
+
+        askCents = (typeof bestAsk === "number" ? bestAsk : null);
+        source = "orderbook";
+      } catch (e) {
+        // skip quietly
+        continue;
+      }
+    }
+
+    if (!askCents || askCents >= 99) continue;
+    if (typeof maxEntryPriceCents === "number" && askCents > maxEntryPriceCents) continue;
+
+    return {
+      ticker,
+      status: m.status,
+      volume: m.volume || 0,
+      askCents,
+      source
+    };
+  }
+
   return null;
 }
 
-function predictedCentsFromConfidence(conf) {
-  const tilt = Math.min(Math.max(conf, 0), 1) * 35;
-  return Math.round(50 + tilt);
-}
-
-function topByVolume(markets, n=30) {
-  const ms = Array.isArray(markets) ? markets : [];
-  return ms
-    .slice()
-    .sort((a,b) => Number(b.volume || 0) - Number(a.volume || 0))
-    .slice(0, n);
-}
-
-async function resolveAskForSide(ticker, side) {
-  const m = await getMarket(ticker);
-
-  const snapYesAsk = (m?.market?.yes_ask ?? m?.yes_ask);
-  const snapNoAsk  = (m?.market?.no_ask  ?? m?.no_ask);
-
-  // Snapshot ask must be 1..99 (avoid null=>0 bug)
-  if (side === "yes") {
-    const v = Number(snapYesAsk);
-    if (Number.isFinite(v) && v >= 1 && v <= 99) return { askCents: v, source: "snapshot" };
-  }
-  if (side === "no") {
-    const v = Number(snapNoAsk);
-    if (Number.isFinite(v) && v >= 1 && v <= 99) return { askCents: v, source: "snapshot" };
-  }
-
-  const ob = await getOrderbook(ticker);
-  const book = deriveAsksFromOrderbook(ob);
-  const askCents = side === "yes" ? book.yesAsk : book.noAsk;
-
-  return { askCents: askCents ?? null, source: "orderbook", book };
-}
-
 async function main() {
-  const cfg = loadConfig();
-  console.log("CONFIG:", cfg);
+  const cfg = (await kvGetJson("bot:config")) || {};
+  const enabled = !!cfg.enabled;
+  const mode = (cfg.mode || "paper").toLowerCase();
 
-  const signal = await getSignalStub();
-  console.log("SIGNAL:", signal);
+  const seriesTicker = String(cfg.seriesTicker || "KXBTC15M").toUpperCase();
+  const minConfidence = Number(cfg.minConfidence ?? 0.15);
+  const minEdge = Number(cfg.minEdge ?? 5);
+  const tradeSizeUsd = Number(cfg.tradeSizeUsd ?? 5);
+  const maxContracts = Number(cfg.maxContracts ?? 5);
+  const maxEntryPriceCents = (cfg.maxEntryPriceCents == null) ? 85 : Number(cfg.maxEntryPriceCents);
 
-  if (!cfg.enabled) return console.log("Bot disabled — exiting.");
-  if ((signal.confidence ?? 0) < cfg.minConfidence) {
-    return console.log(`No trade — confidence ${(signal.confidence ?? 0).toFixed(3)} < minConfidence ${cfg.minConfidence}`);
-  }
-
-  const side = sideFromSignal(signal.direction);
-  if (!side) return console.log("No trade — neutral signal.");
-
-  const prefix = cfg.seriesTicker + "-";
-
-  // 1) Try server-side series filter
-  let markets = [];
-  try {
-    const r = await listMarkets({ seriesTicker: cfg.seriesTicker, status: "active", limit: 300 });
-    markets = Array.isArray(r?.markets) ? r.markets : [];
-    console.log(`Markets source: series(${cfg.seriesTicker}) — found: ${markets.length}`);
-  } catch (e) {
-    console.log("listMarkets(series) error:", e.message);
-  }
-
-  // Hard-filter to series by ticker prefix (fixes “sports markets” issue)
-  let filtered = markets.filter(m => String(m?.ticker || "").startsWith(prefix));
-
-  // 2) If series filter didn’t work, fallback to ALL active markets then prefix filter
-  if (filtered.length === 0) {
-    console.log(`Series filter returned 0 tickers starting with ${prefix}. Falling back to ALL active markets...`);
-    const r2 = await listMarkets({ seriesTicker: undefined, status: "active", limit: 500 });
-    const all = Array.isArray(r2?.markets) ? r2.markets : [];
-    console.log(`Markets source: ALL_ACTIVE — found: ${all.length}`);
-    filtered = all.filter(m => String(m?.ticker || "").startsWith(prefix));
-  }
-
-  console.log(`BTC series candidates (${prefix}*): ${filtered.length}`);
-  if (filtered.length === 0) {
-    // print sample tickers to help debug what the API is returning
-    const sample = markets.slice(0, 10).map(m => m?.ticker).filter(Boolean);
-    console.log("Sample tickers returned:", sample);
-    return console.log("No tradable BTC15M markets found after filtering. Check seriesTicker spelling.");
-  }
-
-  // Try the most liquid BTC15M markets first
-  const candidates = topByVolume(filtered, 30);
-
-  let chosen = null;
-  for (const m of candidates) {
-    if (!m?.ticker) continue;
-    try {
-      const r = await resolveAskForSide(m.ticker, side);
-      const ask = r.askCents;
-
-      if (!ask || ask < 1 || ask > 99) {
-        console.log(`Skip ${m.ticker} — no ask (${r.source})`, r.book ? `bestYesBid=${r.book.bestYesBid} bestNoBid=${r.book.bestNoBid}` : "");
-        continue;
-      }
-      if (ask > cfg.maxEntryPriceCents) {
-        console.log(`Skip ${m.ticker} — ask ${ask}¢ > maxEntryPriceCents ${cfg.maxEntryPriceCents}¢`);
-        continue;
-      }
-
-      chosen = { market: m, askCents: ask, askSource: r.source };
-      break;
-    } catch (e) {
-      console.log(`Skip ${m.ticker} — pricing error: ${e.message}`);
-    }
-  }
-
-  if (!chosen) {
-    return console.log("No trade — no candidate BTC15M market had a valid ask in top 30 by volume.");
-  }
-
-  const predicted = predictedCentsFromConfidence(signal.confidence);
-  const edge = predicted - chosen.askCents;
-
-  console.log("Selected market:", {
-    ticker: chosen.market.ticker,
-    status: chosen.market.status,
-    volume: chosen.market.volume,
-    askCents: chosen.askCents,
-    askSource: chosen.askSource,
+  console.log("CONFIG:", {
+    enabled, mode, seriesTicker, tradeSizeUsd, maxContracts, minConfidence, minEdge, maxEntryPriceCents
   });
 
-  console.log(`Edge check: predicted=${predicted}¢ market=${chosen.askCents}¢ edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
-
-  if (edge < cfg.minEdge) return console.log("No trade — edge too small.");
-
-  const count = Math.max(1, Math.min(cfg.maxContracts, Math.floor(cfg.tradeSizeUsd / (chosen.askCents / 100))));
-  const actionLine = `BUY ${side.toUpperCase()} ${count}x ${chosen.market.ticker} @ ${chosen.askCents}¢ (mode=${cfg.mode})`;
-  console.log("Placing order:", actionLine);
-
-  if (cfg.mode !== "live") {
-    console.log("PAPER MODE — would have placed:", actionLine);
+  if (!enabled) {
+    console.log("Bot disabled — exiting.");
     return;
   }
 
-  const result = await createOrder({
-    ticker: chosen.market.ticker,
-    action: "buy",
-    side,
-    count,
-    priceCents: chosen.askCents,
-    postOnly: false,
-    tif: "fill_or_kill",
-  });
+  const sig = await getBTCSignal();
+  console.log("SIGNAL:", sig);
 
-  console.log("ORDER RESULT:", result);
-  console.log("Done.");
+  const direction = String(sig.direction || "none").toLowerCase();
+  const confidence = Number(sig.confidence || 0);
+
+  if (direction !== "up" && direction !== "down") {
+    console.log("No trade — signal direction NONE");
+    return;
+  }
+  if (confidence < minConfidence) {
+    console.log("No trade — confidence too low:", confidence, "<", minConfidence);
+    return;
+  }
+
+  const desiredSide = direction === "up" ? "yes" : "no";
+  const predictedProb = Math.round(probFromSignal(direction, confidence) * 100);
+
+  const picked = await pickTradableMarket(seriesTicker, desiredSide, maxEntryPriceCents);
+  if (!picked) {
+    console.log("No tradable markets found for series:", seriesTicker);
+    return;
+  }
+
+  console.log("Selected market:", picked);
+
+  const ask = picked.askCents;
+  const edge = predictedProb - ask;
+
+  console.log("Edge check: predicted=" + predictedProb + "¢ market=" + ask + "¢ edge=" + edge + "¢ minEdge=" + minEdge + "¢");
+
+  if (edge < minEdge) {
+    console.log("No trade — edge too small.");
+    return;
+  }
+
+  const count = calcContracts({ tradeSizeUsd, maxContracts, askCents: ask });
+
+  const state = (await kvGetJson("bot:last_run")) || {};
+  const out = {
+    ts: Date.now(),
+    action: "consider",
+    signalDir: direction,
+    confidence,
+    predictedProb,
+    marketTicker: picked.ticker,
+    askCents: ask,
+    edgeCents: edge,
+    chosenSide: desiredSide,
+    mode
+  };
+
+  if (mode !== "live") {
+    console.log("PAPER: would buy " + desiredSide.toUpperCase() + " " + count + "x " + picked.ticker + " @ " + ask + "¢");
+    out.action = "paper";
+    out.count = count;
+    await kvSetJson("bot:last_run", out);
+    return;
+  }
+
+  console.log("LIVE: placing order " + desiredSide.toUpperCase() + " " + count + "x " + picked.ticker + " @ " + ask + "¢");
+  const res = await placeOrder({ ticker: picked.ticker, side: desiredSide, count, priceCents: ask });
+
+  console.log("ORDER RESULT:", res);
+
+  out.action = "live";
+  out.count = count;
+  out.order = res?.order || null;
+  await kvSetJson("bot:last_run", out);
 }
 
 main().catch((e) => {

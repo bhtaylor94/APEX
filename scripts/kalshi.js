@@ -1,139 +1,100 @@
-import crypto from "node:crypto";
+import crypto from "crypto";
 
-function envStr(k, d="") {
-  const v = process.env[k];
-  return (v && String(v).trim()) ? String(v) : d;
+const ENV = (process.env.NEXT_PUBLIC_KALSHI_ENV || process.env.KALSHI_ENV || "prod").toLowerCase();
+
+// Per Kalshi docs: demo uses demo-api.kalshi.co ; production uses api.elections.kalshi.com (trade-api/v2)
+const BASE =
+  ENV === "demo" || ENV === "sandbox"
+    ? "https://demo-api.kalshi.co"
+    : "https://api.elections.kalshi.com";
+
+const API_KEY_ID = process.env.KALSHI_API_KEY_ID || process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID || "";
+const PRIVATE_KEY_PEM = process.env.KALSHI_PRIVATE_KEY || "";
+
+function mustEnv(name, v) {
+  if (!v) throw new Error("Missing env: " + name);
+  return v;
 }
 
-function getBaseUrl() {
-  const e = (envStr("KALSHI_ENV", envStr("NEXT_PUBLIC_KALSHI_ENV", "prod")) || "prod").toLowerCase();
-  if (e.includes("demo")) return "https://demo-api.kalshi.co";
-  return "https://api.elections.kalshi.com";
-}
-
-function toPathNoQuery(p) { return String(p).split("?")[0]; }
-
+// RSA-PSS SHA256 signature (per docs)
 function signKalshi({ timestampMs, method, path }) {
-  const keyId = envStr("KALSHI_API_KEY_ID");
-  const privateKeyPem = envStr("KALSHI_PRIVATE_KEY");
-  if (!keyId || !privateKeyPem) throw new Error("missing kalshi keys (KALSHI_API_KEY_ID / KALSHI_PRIVATE_KEY)");
+  const keyId = mustEnv("KALSHI_API_KEY_ID", API_KEY_ID);
+  const pem = mustEnv("KALSHI_PRIVATE_KEY", PRIVATE_KEY_PEM);
 
-  const msg = String(timestampMs) + String(method).toUpperCase() + String(path);
-  const sig = crypto.sign("sha256", Buffer.from(msg, "utf8"), {
-    key: privateKeyPem,
+  // IMPORTANT: sign path without query params
+  const pathNoQuery = path.split("?")[0];
+  const msg = String(timestampMs) + method.toUpperCase() + pathNoQuery;
+
+  const signature = crypto.sign("sha256", Buffer.from(msg, "utf8"), {
+    key: pem,
     padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
-    saltLength: 32,
+    saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST
   });
 
   return {
-    "KALSHI-ACCESS-KEY": keyId,
-    "KALSHI-ACCESS-TIMESTAMP": String(timestampMs),
-    "KALSHI-ACCESS-SIGNATURE": sig.toString("base64"),
+    keyId,
+    signatureB64: signature.toString("base64"),
   };
 }
 
-async function kalshiFetch(method, path, body, { auth=false } = {}) {
-  const base = getBaseUrl();
-  const cleanPath = toPathNoQuery(path);
-  const fullPath = cleanPath.startsWith("/trade-api/") ? cleanPath : ("/trade-api/v2" + (cleanPath.startsWith("/") ? cleanPath : ("/" + cleanPath)));
-  const url = base + fullPath;
-
+export async function kalshiFetch(path, { method = "GET", body = null, auth = true } = {}) {
+  const url = BASE + path;
   const headers = { "Content-Type": "application/json" };
-  if (auth) Object.assign(headers, signKalshi({ timestampMs: Date.now(), method, path: fullPath }));
 
-  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
-  const text = await res.text();
+  if (auth) {
+    const ts = Date.now();
+    const sig = signKalshi({ timestampMs: ts, method, path });
+    headers["KALSHI-ACCESS-KEY"] = sig.keyId;
+    headers["KALSHI-ACCESS-TIMESTAMP"] = String(ts);
+    headers["KALSHI-ACCESS-SIGNATURE"] = sig.signatureB64;
+  }
+
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const txt = await res.text();
   let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
 
   if (!res.ok) {
-    const msg = (typeof data === "object" && data) ? JSON.stringify(data) : String(text || "");
-    throw new Error(`Kalshi ${method} ${fullPath} failed (${res.status}): ${msg}`);
+    throw new Error("Kalshi " + method + " " + path + " failed (" + res.status + "): " + txt);
   }
   return data;
 }
 
-export async function listMarkets({ seriesTicker, status="active", limit=200 } = {}) {
+export async function getMarkets({ series_ticker, status = "open", limit = 200, cursor = null, mve_filter = "exclude" } = {}) {
   const qs = new URLSearchParams();
-  if (seriesTicker) qs.set("series_ticker", seriesTicker);
+  if (series_ticker) qs.set("series_ticker", series_ticker);
   if (status) qs.set("status", status);
-  if (limit) qs.set("limit", String(limit));
-  const path = "/markets" + (qs.toString() ? ("?" + qs.toString()) : "");
-  return kalshiFetch("GET", path, null, { auth: false });
+  if (mve_filter) qs.set("mve_filter", mve_filter);
+  qs.set("limit", String(limit));
+  if (cursor) qs.set("cursor", cursor);
+
+  return kalshiFetch("/trade-api/v2/markets?" + qs.toString(), { method: "GET", auth: true });
 }
 
-export async function getMarket(ticker) {
-  const t = String(ticker || "").trim();
-  if (!t) throw new Error("missing ticker for getMarket");
-  return kalshiFetch("GET", `/markets/${encodeURIComponent(t)}`, null, { auth: false });
+export async function getOrderbook(ticker, depth = 1) {
+  const qs = new URLSearchParams({ ticker, depth: String(depth) });
+  return kalshiFetch("/trade-api/v2/markets/" + encodeURIComponent(ticker) + "/orderbook?" + qs.toString(), { method: "GET", auth: true });
 }
 
-export async function getOrderbook(ticker) {
-  const t = String(ticker || "").trim();
-  if (!t) throw new Error("missing ticker for orderbook");
-  return kalshiFetch("GET", `/markets/${encodeURIComponent(t)}/orderbook`, null, { auth: false });
-}
-
-function levelPrice(lvl) {
-  // Supports [price, qty] or {price:..} style just in case
-  if (Array.isArray(lvl)) return Number(lvl[0]);
-  if (lvl && typeof lvl === "object") return Number(lvl.price ?? lvl.p ?? lvl[0]);
-  return NaN;
-}
-
-export function deriveAsksFromOrderbook(orderbook) {
-  // Orderbook returns bids only; asks implied from opposite bids.  [oai_citation:1‡Kalshi API Documentation](https://docs.kalshi.com/api-reference/market/get-market-orderbook?utm_source=chatgpt.com)
-  const ob = orderbook?.orderbook || orderbook || {};
-  const yesBids = Array.isArray(ob.yes) ? ob.yes : (Array.isArray(ob.yes_bids) ? ob.yes_bids : []);
-  const noBids  = Array.isArray(ob.no)  ? ob.no  : (Array.isArray(ob.no_bids) ? ob.no_bids : []);
-
-  let bestYesBid = null;
-  for (const lvl of yesBids) {
-    const p = levelPrice(lvl);
-    if (Number.isFinite(p)) bestYesBid = bestYesBid === null ? p : Math.max(bestYesBid, p);
-  }
-
-  let bestNoBid = null;
-  for (const lvl of noBids) {
-    const p = levelPrice(lvl);
-    if (Number.isFinite(p)) bestNoBid = bestNoBid === null ? p : Math.max(bestNoBid, p);
-  }
-
-  const yesAsk = (bestNoBid !== null) ? (100 - bestNoBid) : null;
-  const noAsk  = (bestYesBid !== null) ? (100 - bestYesBid) : null;
-
-  return {
-    bestYesBid, bestNoBid,
-    yesAsk: (yesAsk !== null && yesAsk >= 1 && yesAsk <= 99) ? yesAsk : null,
-    noAsk:  (noAsk  !== null && noAsk  >= 1 && noAsk  <= 99) ? noAsk  : null,
-  };
-}
-
-export async function createOrder({ ticker, action="buy", side, count, priceCents, postOnly=false, tif="fill_or_kill" } = {}) {
-  const t = String(ticker || "").trim();
-  const s = String(side || "").toLowerCase();
-  const a = String(action || "").toLowerCase();
-  const c = Number(count);
-  const px = Number(priceCents);
-
-  if (!t) throw new Error("missing order ticker");
-  if (s !== "yes" && s !== "no") throw new Error("missing/invalid side (must be yes/no)");
-  if (a !== "buy" && a !== "sell") throw new Error("invalid action (buy/sell)");
-  if (!Number.isFinite(c) || c < 1) throw new Error("invalid count");
-  if (!Number.isFinite(px) || px < 1 || px > 99) throw new Error("invalid priceCents (1..99)");
+export async function placeOrder({ ticker, side, count, priceCents }) {
+  // side must be "yes" or "no"
+  if (side !== "yes" && side !== "no") throw new Error("Invalid side: " + side);
 
   const body = {
-    ticker: t,
+    ticker,
+    action: "buy",
     type: "limit",
-    action: a,
-    side: s,
-    count: c,
-    time_in_force: tif,
-    post_only: !!postOnly,
+    side,                // REQUIRED
+    count,
+    yes_price: side === "yes" ? priceCents : (100 - priceCents),
+    no_price:  side === "no"  ? priceCents : (100 - priceCents),
+    client_order_id: ""
   };
 
-  if (s === "yes") body.yes_price = px;
-  else body.no_price = px;
-
-  return kalshiFetch("POST", "/portfolio/orders", body, { auth: true });
+  return kalshiFetch("/trade-api/v2/portfolio/orders", { method: "POST", body, auth: true });
 }
