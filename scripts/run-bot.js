@@ -1,160 +1,213 @@
-/**
- * scripts/run-bot.js (ESM)
- * package.json has "type":"module"
- * Node 18+ provides global fetch (no node-fetch)
- */
+import { kvGetJson, kvSetJson } from "./kv.js";
+import { getOrderbookTop, listOpenMarkets, placeOrder } from "./kalshi.js";
+import { getBTCSignal } from "./signal.js";
 
-import * as kv from "./kv.js";
-import * as signal from "./signal.js";
-import * as kalshi from "./kalshi.js";
+function nowMs() { return Date.now(); }
 
-function pickFn(mod, names) {
-  for (const n of names) {
-    if (typeof mod?.[n] === "function") return mod[n];
-  }
-  return null;
+function clampInt(n, a, b) { return Math.max(a, Math.min(b, Math.floor(n))); }
+
+function cfgDefaults(cfg) {
+  const c = cfg || {};
+  return {
+    enabled: !!c.enabled,
+    mode: c.mode || "paper",               // "paper" | "live"
+    seriesTicker: (c.seriesTicker || "KXBTC15M").toUpperCase(),
+    tradeSizeUsd: Number(c.tradeSizeUsd ?? 5),
+    maxContracts: Number(c.maxContracts ?? 5),
+    minConfidence: Number(c.minConfidence ?? 0.15),
+    minEdge: Number(c.minEdge ?? 5),
+
+    // Exit logic:
+    takeProfitPct: Number(c.takeProfitPct ?? 0.20),  // 0.20 = +20% on entry cost
+    stopLossPct: Number(c.stopLossPct ?? 0.12),      // 0.12 = -12% on entry cost
+
+    // Safety rails:
+    cooldownMinutes: Number(c.cooldownMinutes ?? 8),
+    maxTradesPerDay: Number(c.maxTradesPerDay ?? 10),
+    dailyMaxLossUsd: Number(c.dailyMaxLossUsd ?? 25),
+    maxOpenPositions: Number(c.maxOpenPositions ?? 1),
+  };
 }
 
-const kvGetJson = pickFn(kv, ["kvGetJson", "getJson", "get"]);
-const kvSetJson = pickFn(kv, ["kvSetJson", "setJson", "set"]);
-const getBTCSignal = pickFn(signal, ["getBTCSignal", "getSignal", "signal"]);
-const getBTCMarkets = pickFn(kalshi, ["getBTCMarkets", "getMarkets", "listBTCMarkets"]);
-const placeKalshiOrder = pickFn(kalshi, ["placeKalshiOrder", "placeOrder", "order"]);
-const listMarkets = pickFn(kalshi, ["listMarkets", "getMarketsRaw"]);
-
-function must(fn, name) {
-  if (typeof fn !== "function") throw new Error(`Missing function "${name}" in scripts/*.js exports`);
-  return fn;
-}
-
-must(kvGetJson, "kvGetJson");
-must(kvSetJson, "kvSetJson");
-must(getBTCSignal, "getBTCSignal");
-must(getBTCMarkets, "getBTCMarkets");
-must(placeKalshiOrder, "placeKalshiOrder");
-
-async function fallbackOpenMarketFilter() {
-  if (typeof listMarkets !== "function") return [];
-  const all = await listMarkets({ status: "open", limit: 500 });
-  const markets = (all?.markets || []).filter(m => {
-    const t = ((m.title || "") + " " + (m.subtitle || "")).toLowerCase();
-    return (t.includes("btc") || t.includes("bitcoin")) && t.includes("15") && t.includes("up") && t.includes("down");
-  });
-  markets.sort((a,b) => (Number(b.volume||0) - Number(a.volume||0)));
-  return markets;
+// Very small “market picker”:
+// - filters open markets by prefix KXBTC15M-
+// - picks the most liquid near-term market (highest volume)
+function pickMarket(allMarkets, seriesTicker) {
+  const prefix = seriesTicker + "-";
+  const ms = (allMarkets || []).filter(m => (m.ticker || "").startsWith(prefix));
+  ms.sort((a, b) => (Number(b.volume || 0) - Number(a.volume || 0)));
+  return ms[0] || null;
 }
 
 async function main() {
-  if (typeof fetch !== "function") throw new Error("Global fetch not found. Ensure Node 18+.");
-
-  const cfg = (await kvGetJson("bot:config")) || {};
+  const cfg = cfgDefaults(await kvGetJson("bot:config"));
   console.log("CONFIG:", cfg);
 
   if (!cfg.enabled) {
-    console.log("Bot disabled. Exiting.");
+    console.log("Bot disabled (enabled=false).");
     return;
   }
 
-  const seriesTicker = String(cfg.seriesTicker || "kxbtc15m");
+  // Load state
+  const state = (await kvGetJson("bot:state")) || {};
+  const pos = state.position || null;
 
-  const sig = await getBTCSignal(cfg);
+  // Compute signal (your signal.js already returns direction/confidence/price)
+  const sig = await getBTCSignal();
   console.log("SIGNAL:", sig);
 
-  const conf = Number(sig?.confidence || 0);
-  const minConf = Number(cfg.minConfidence || 0);
-  if (conf < minConf) {
-    console.log(`No trade: confidence ${conf.toFixed(4)} < minConfidence ${minConf}`);
+  // Pull open markets (public)
+  const open = await listOpenMarkets(300);
+  const allMarkets = Array.isArray(open?.markets) ? open.markets : [];
+  const market = pickMarket(allMarkets, cfg.seriesTicker);
+
+  if (!market) {
+    console.log("No tradable markets found for series:", cfg.seriesTicker);
     return;
   }
 
-  // Market discovery: prefer kalshi.js's method; fall back to open-market scan
-  let resp = null;
-  try {
-    resp = await getBTCMarkets({ seriesTicker, status: "open" });
-  } catch (e) {
-    console.log("getBTCMarkets error (will fallback):", e?.message || e);
-  }
+  const marketTicker = market.ticker;
+  const ob = await getOrderbookTop(marketTicker);
 
-  let markets = [];
-  if (Array.isArray(resp)) markets = resp;
-  else if (Array.isArray(resp?.markets)) markets = resp.markets;
+  // ---------- A) If we have an open position, manage exits ----------
+  if (pos && pos.marketTicker === marketTicker) {
+    const entry = Number(pos.entryPriceCents);
+    const count = Number(pos.count);
+    const side = pos.side; // "yes" | "no"
 
-  if (!markets.length) {
-    markets = await fallbackOpenMarketFilter();
-    console.log(`Fallback open-market filter found: ${markets.length}`);
-  }
+    // Mark-to-market using mid of derived bid/ask (fallback to bid if ask missing)
+    const bid = side === "yes" ? ob.bestYesBid : ob.bestNoBid;
+    const ask = side === "yes" ? ob.yesAsk : ob.noAsk;
+    const mid = (bid != null && ask != null) ? Math.round((bid + ask) / 2) : (bid != null ? bid : ask);
 
-  if (!markets.length) {
-    console.log(`No tradable markets found for series: ${seriesTicker}`);
+    if (mid == null) {
+      console.log("No orderbook prices to manage exit. Holding.");
+      return;
+    }
+
+    const tp = Math.round(entry * (1 + cfg.takeProfitPct));
+    const sl = Math.round(entry * (1 - cfg.stopLossPct));
+
+    console.log("POSITION:", { marketTicker, side, count, entryPriceCents: entry, markCents: mid, tp, sl });
+
+    const hitTP = mid >= tp;
+    const hitSL = mid <= sl;
+
+    // Optional: exit early if signal flips hard (simple rule)
+    const signalFlipExit =
+      (side === "yes" && sig.direction === "down" && sig.confidence >= cfg.minConfidence) ||
+      (side === "no"  && sig.direction === "up"   && sig.confidence >= cfg.minConfidence);
+
+    if (!hitTP && !hitSL && !signalFlipExit) {
+      console.log("Hold position — no TP/SL/Flip exit.");
+      return;
+    }
+
+    // SELL at best bid to be marketable
+    const exitPrice = bid;
+    if (exitPrice == null) {
+      console.log("No bid to exit at. Holding.");
+      return;
+    }
+
+    const reason = hitTP ? "TAKE_PROFIT" : hitSL ? "STOP_LOSS" : "SIGNAL_FLIP";
+    console.log(`EXIT: ${reason} — Selling ${side.toUpperCase()} ${count}x @ ${exitPrice}¢`);
+
+    if (cfg.mode === "live") {
+      const out = await placeOrder({
+        ticker: marketTicker,
+        side,
+        action: "sell",
+        count,
+        priceCents: exitPrice,
+        time_in_force: "fill_or_kill",
+        reduce_only: true,
+      });
+      console.log("EXIT ORDER RESULT:", out);
+    } else {
+      console.log("(paper) EXIT simulated.");
+    }
+
+    // Clear position
+    state.position = null;
+    await kvSetJson("bot:state", state);
+    await kvSetJson("bot:last_run", { action: "exit", marketTicker, side, count, priceCents: exitPrice, reason, ts: nowMs() });
+    console.log("Done.");
     return;
   }
 
-  const m = markets[0];
-  console.log("Selected market:", {
-    ticker: m.ticker,
-    status: m.status,
-    yes_ask: m.yes_ask,
-    no_ask: m.no_ask,
-    volume: m.volume,
-    close_ts: m.close_ts
-  });
-
-  const dir = String(sig?.dir || sig?.direction || "NONE").toUpperCase();
-  if (dir !== "UP" && dir !== "DOWN") {
-    console.log(`No trade: direction=${dir}`);
+  // ---------- B) If we do NOT have a position, consider entry ----------
+  // Enforce maxOpenPositions using state only (simple)
+  if (state.position) {
+    console.log("State says position exists on another market. Not entering.");
     return;
   }
 
-  const side = dir === "UP" ? "yes" : "no";
-  const price = side === "yes"
-    ? (m.yes_ask || m.last_price || 50)
-    : (m.no_ask || (100 - (m.last_price || 50)));
-
-  const implied = Number(price || 0);
-  const predictedProb = Math.round((0.5 + conf * 0.35) * 100);
-  const edge = predictedProb - implied;
-  const minEdge = Number(cfg.minEdge || 0);
-
-  console.log(`Edge check: predicted=${predictedProb}¢ market=${implied}¢ edge=${edge}¢ minEdge=${minEdge}¢`);
-
-  if (edge < minEdge) {
-    console.log("No trade: edge too small.");
+  // Direction mapping: up => buy YES, down => buy NO
+  const dir = sig.direction;
+  if (dir !== "up" && dir !== "down") {
+    console.log("No trade — direction:", dir);
     return;
   }
 
-  const maxContracts = Number(cfg.maxContracts || 1);
-  const tradeSizeUsd = Number(cfg.tradeSizeUsd || 5);
-  const maxCostCents = Math.max(1, Math.floor(tradeSizeUsd * 100));
-  const contracts = Math.max(1, Math.min(maxContracts, Math.floor(maxCostCents / Math.max(1, implied))));
+  if (sig.confidence < cfg.minConfidence) {
+    console.log("No trade — confidence below min:", sig.confidence, "<", cfg.minConfidence);
+    return;
+  }
 
-  console.log(`Placing order: ${side.toUpperCase()} ${contracts}x ${m.ticker} @ ${implied}¢ (mode=${cfg.mode || "paper"})`);
+  const side = dir === "up" ? "yes" : "no";
+  const ask = side === "yes" ? ob.yesAsk : ob.noAsk;
+  if (ask == null || ask <= 0 || ask >= 99) {
+    console.log("No trade — missing/invalid ask:", ask);
+    return;
+  }
 
-  const orderRes = await placeKalshiOrder({
-    ticker: m.ticker,
+  // Simple “edge”: predictedProb - price (in cents)
+  const predictedProbCents = Math.round(50 + (sig.confidence * 35)); // same idea you used earlier
+  const edge = predictedProbCents - ask;
+
+  console.log(`Edge check: predicted=${predictedProbCents}¢ market=${ask}¢ edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
+  if (edge < cfg.minEdge) {
+    console.log("No trade — edge too small.");
+    return;
+  }
+
+  // Size: fixed maxContracts (simple + safe)
+  const count = clampInt(cfg.maxContracts, 1, 50);
+
+  console.log(`ENTRY: BUY ${side.toUpperCase()} ${count}x ${marketTicker} @ ${ask}¢ (mode=${cfg.mode})`);
+
+  if (cfg.mode === "live") {
+    const out = await placeOrder({
+      ticker: marketTicker,
+      side,
+      action: "buy",
+      count,
+      priceCents: ask,
+      time_in_force: "fill_or_kill",
+      reduce_only: false,
+    });
+    console.log("ENTRY ORDER RESULT:", out);
+  } else {
+    console.log("(paper) ENTRY simulated.");
+  }
+
+  // Save position state so next cron run can manage exits
+  state.position = {
+    marketTicker,
     side,
-    count: contracts,
-    price: implied,
-    mode: cfg.mode || "paper",
-  });
+    count,
+    entryPriceCents: ask,
+    enteredTs: nowMs(),
+  };
 
-  console.log("ORDER RESULT:", orderRes);
-
-  await kvSetJson("bot:last_run", {
-    ts: Date.now(),
-    seriesTicker,
-    marketTicker: m.ticker,
-    side,
-    count: contracts,
-    price: implied,
-    confidence: conf,
-    edge,
-    mode: cfg.mode || "paper",
-  });
+  await kvSetJson("bot:state", state);
+  await kvSetJson("bot:last_run", { action: "enter", marketTicker, side, count, priceCents: ask, edge, ts: nowMs() });
 
   console.log("Done.");
 }
 
-main().catch((e) => {
-  console.error("Bot runner failed:", e && (e.stack || e));
+main().catch(e => {
+  console.error("Bot runner failed:", e);
   process.exit(1);
 });
