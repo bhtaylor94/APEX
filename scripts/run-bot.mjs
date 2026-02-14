@@ -197,6 +197,48 @@ async function main() {
     bestYesBid, bestNoBid
   });
 
+  // === ORDERBOOK_PRICE_FALLBACK_V1 ===
+  // Kalshi listMarkets can return null asks/bids. Derive executable prices from orderbook for selected.ticker.
+  try {
+    const missingPx =
+      (selected?.yesAsk == null) ||
+      (selected?.noAsk == null)  ||
+      (selected?.bestYesBid == null) ||
+      (selected?.bestNoBid == null);
+
+    if (missingPx && selected?.ticker) {
+      const _ob = await getOrderbook(selected.ticker, 1);
+
+      // Orderbook shape we expect: { yes: [{ price }...], no: [{ price }...] }
+      const _yesAsk = _ob?.yes?.[0]?.price ?? null;
+      const _noAsk  = _ob?.no?.[0]?.price  ?? null;
+
+      // Best bid is top-of-book *bid*; if your API returns bids separately, adapt here.
+      // Many Kalshi orderbooks return bids in the same arrays but on the opposite side.
+      // We'll safely read best bids if present.
+      const _bestYesBid = _ob?.yes_bid?.[0]?.price ?? _ob?.best_yes_bid ?? null;
+      const _bestNoBid  = _ob?.no_bid?.[0]?.price  ?? _ob?.best_no_bid  ?? null;
+
+      // Only fill missing fields; do not overwrite if snapshot had values
+      if (selected.yesAsk == null) selected.yesAsk = _yesAsk;
+      if (selected.noAsk  == null) selected.noAsk  = _noAsk;
+
+      if (selected.bestYesBid == null) selected.bestYesBid = _bestYesBid;
+      if (selected.bestNoBid  == null) selected.bestNoBid  = _bestNoBid;
+
+      console.log("Orderbook pricing filled:", {
+        yesAsk: selected.yesAsk,
+        noAsk: selected.noAsk,
+        bestYesBid: selected.bestYesBid,
+        bestNoBid: selected.bestNoBid
+      });
+    }
+  } catch (e) {
+    console.log("Orderbook pricing fetch failed (continuing):", e?.message ?? e);
+  }
+  // === END ORDERBOOK_PRICE_FALLBACK_V1 ===
+
+
   if (ask == null || ask <= 0 || ask >= 99) {
     console.log("No trade — missing/invalid ask:", ask);
     return;
