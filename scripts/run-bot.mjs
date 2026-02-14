@@ -196,51 +196,8 @@ async function main() {
     yesAsk, noAsk,
     bestYesBid, bestNoBid
   });
-  // ---- ORDERBOOK PRICING (overwrite existing vars; no redeclare) ----
-  // Snapshot often has null prices for BTC15M; orderbook is executable source-of-truth.
-  try {
-    const ob_px = await getOrderbook(selected.ticker, 1);
 
-    // Support common shapes: {yes:[], no:[]} OR {orderbook:{yes:[],no:[]}} OR {book:{yes:[],no:[]}}
-    const book = (ob_px && (ob_px.orderbook || ob_px.book || ob_px)) || null;
-    const yesArr = book && Array.isArray(book.yes) ? book.yes : [];
-    const noArr  = book && Array.isArray(book.no)  ? book.no  : [];
-
-    const readPrice = (arr) => {
-      if (!arr || arr.length === 0) return null;
-      const x = arr[0];
-      if (x == null) return null;
-      if (typeof x === "number") return x;
-      if (typeof x.price === "number") return x.price;
-      if (typeof x.price === "string") {
-        const n = Number(x.price);
-        return Number.isFinite(n) ? n : null;
-      }
-      return null;
-    };
-
-    const yesAskOb = readPrice(yesArr);
-    const noAskOb  = readPrice(noArr);
-
-    // Overwrite only if we got something real
-    if (yesAsk == null && yesAskOb != null) yesAsk = yesAskOb;
-    if (noAsk  == null && noAskOb  != null) noAsk  = noAskOb;
-
-    // If bids are missing, infer from complement (Kalshi YES/NO sum to ~100)
-    if (bestYesBid == null && noAsk != null) bestYesBid = Math.max(0, 100 - noAsk);
-    if (bestNoBid  == null && yesAsk != null) bestNoBid  = Math.max(0, 100 - yesAsk);
-
-  } catch (e) {
-    console.log("Orderbook pricing unavailable:", (e && e.message) ? e.message : e);
-  }
-
-  // Recompute executable ask for the chosen side
-  askCents = (side === "yes") ? yesAsk : noAsk;
-
-  console.log("Executable pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid, askCents });
-
-
-  if (askCents == null || ask <= 0 || ask >= 99) {
+  if (ask == null || ask <= 0 || ask >= 99) {
     console.log("No trade — missing/invalid ask:", ask);
     return;
   }
