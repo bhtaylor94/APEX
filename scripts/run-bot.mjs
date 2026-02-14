@@ -1,30 +1,4 @@
 import { kvGetJson, kvSetJson } from "./kv.mjs";
-
-async function getExecutablePricesFromOrderbook(ticker) {
-  const ob = await getOrderbook(ticker, 1);
-
-  // If your file already has a helper, prefer it.
-  if (typeof deriveYesNoFromOrderbook === "function") {
-    const out = deriveYesNoFromOrderbook(ob);
-    return {
-      yesAsk: out?.yesAsk ?? null,
-      noAsk: out?.noAsk ?? null,
-      bestYesBid: out?.bestYesBid ?? null,
-      bestNoBid: out?.bestNoBid ?? null
-    };
-  }
-
-  // Raw fallback: interpret top of book if present
-  const yesAsk = ob?.yes?.[0]?.price ?? null;
-  const noAsk  = ob?.no?.[0]?.price ?? null;
-
-  // Some Kalshi shapes separate bids/asks; if you only have one side array,
-  // we at least return the same top level as "best bid" when bids are not provided.
-  const bestYesBid = ob?.yes_bid?.[0]?.price ?? ob?.yes?.[0]?.price ?? null;
-  const bestNoBid  = ob?.no_bid?.[0]?.price  ?? ob?.no?.[0]?.price  ?? null;
-
-  return { yesAsk, noAsk, bestYesBid, bestNoBid };
-}
 import { getBTCSignal } from "./signal.mjs";
 import { listMarkets, getOrderbook, deriveYesNoFromOrderbook, createOrder } from "./kalshi.mjs";
 
@@ -199,7 +173,7 @@ async function main() {
 
   // 5) Derive tradable ask from orderbook (reliable)
   const ob = await getOrderbook(m.ticker);
-  let { yesAsk, noAsk, bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
+  const { yesAsk, noAsk, bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
 
   const predYes = 50 + Math.round(sig.confidence * 35); // 50..85ish
   const predNo  = 100 - predYes;
@@ -222,18 +196,6 @@ async function main() {
     yesAsk, noAsk,
     bestYesBid, bestNoBid
   });
-  // ---- Always derive executable prices from orderbook (series response often has null asks/bids) ----
-  const px = await getExecutablePricesFromOrderbook(selected.ticker);
-  yesAsk = (selected.yesAsk ?? px.yesAsk ?? null);
-  noAsk = (selected.noAsk ?? px.noAsk ?? null);
-  bestYesBid = (selected.bestYesBid ?? px.bestYesBid ?? null);
-  bestNoBid = (selected.bestNoBid ?? px.bestNoBid ?? null);
-
-  // Use side to pick the executable ask for entry
-  const askCents = (side === "yes") ? yesAsk : noAsk;
-
-  console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid, askCents });
-
 
   if (ask == null || ask <= 0 || ask >= 99) {
     console.log("No trade — missing/invalid ask:", ask);
