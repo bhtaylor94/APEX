@@ -11,13 +11,12 @@ function loadConfig() {
     minEdge: 5,
     maxEntryPriceCents: 85,
   };
-
   if (process.env.BOT_MODE) cfg.mode = String(process.env.BOT_MODE).toLowerCase();
   if (process.env.SERIES_TICKER) cfg.seriesTicker = String(process.env.SERIES_TICKER).toUpperCase();
   return cfg;
 }
 
-// TODO: replace with your real signal engine; leaving stub so runner is always testable end-to-end
+// Replace with your real signal engine when ready.
 async function getSignalStub() {
   const direction = Math.random() > 0.5 ? "up" : "down";
   return { direction, confidence: 0.2, price: 0 };
@@ -29,37 +28,40 @@ function sideFromSignal(direction) {
   return null;
 }
 
-function predictedCentsFromConfidence(side, conf) {
-  const tilt = Math.min(Math.max(conf, 0), 1) * 35; // 0..35
-  // Value estimate in cents for the side we want
+function predictedCentsFromConfidence(conf) {
+  const tilt = Math.min(Math.max(conf, 0), 1) * 35;
   return Math.round(50 + tilt);
 }
 
-function bestCandidates(markets) {
+function topByVolume(markets, n=30) {
   const ms = Array.isArray(markets) ? markets : [];
-  const active = ms.filter(m => String(m?.status || "").toLowerCase() === "active");
-  const ranked = (active.length ? active : ms)
+  return ms
     .slice()
-    .sort((a,b) => Number(b.volume || 0) - Number(a.volume || 0));
-  // Try top N
-  return ranked.slice(0, 20);
+    .sort((a,b) => Number(b.volume || 0) - Number(a.volume || 0))
+    .slice(0, n);
 }
 
 async function resolveAskForSide(ticker, side) {
-  // 1) Try market snapshot
   const m = await getMarket(ticker);
+
   const snapYesAsk = (m?.market?.yes_ask ?? m?.yes_ask);
   const snapNoAsk  = (m?.market?.no_ask  ?? m?.no_ask);
 
-  if (side === "yes" && Number.isFinite(Number(snapYesAsk))) return { askCents: Number(snapYesAsk), source: "snapshot", snapshot: m };
-  if (side === "no"  && Number.isFinite(Number(snapNoAsk)))  return { askCents: Number(snapNoAsk),  source: "snapshot", snapshot: m };
+  // Snapshot ask must be 1..99 (avoid null=>0 bug)
+  if (side === "yes") {
+    const v = Number(snapYesAsk);
+    if (Number.isFinite(v) && v >= 1 && v <= 99) return { askCents: v, source: "snapshot" };
+  }
+  if (side === "no") {
+    const v = Number(snapNoAsk);
+    if (Number.isFinite(v) && v >= 1 && v <= 99) return { askCents: v, source: "snapshot" };
+  }
 
-  // 2) Derive from orderbook bids (asks implied from opposite bids)  [oai_citation:2‡Kalshi API Documentation](https://docs.kalshi.com/api-reference/market/get-market-orderbook?utm_source=chatgpt.com)
   const ob = await getOrderbook(ticker);
   const book = deriveAsksFromOrderbook(ob);
   const askCents = side === "yes" ? book.yesAsk : book.noAsk;
 
-  return { askCents: askCents ?? null, source: "orderbook", book, snapshot: m };
+  return { askCents: askCents ?? null, source: "orderbook", book };
 }
 
 async function main() {
@@ -77,19 +79,44 @@ async function main() {
   const side = sideFromSignal(signal.direction);
   if (!side) return console.log("No trade — neutral signal.");
 
-  const marketsResp = await listMarkets({ seriesTicker: cfg.seriesTicker, status: "active", limit: 100 });
-  const markets = Array.isArray(marketsResp?.markets) ? marketsResp.markets : [];
-  console.log(`Markets source: series(${cfg.seriesTicker}) — found: ${markets.length}`);
+  const prefix = cfg.seriesTicker + "-";
 
-  if (!markets.length) return console.log("No tradable markets found for series:", cfg.seriesTicker);
+  // 1) Try server-side series filter
+  let markets = [];
+  try {
+    const r = await listMarkets({ seriesTicker: cfg.seriesTicker, status: "active", limit: 300 });
+    markets = Array.isArray(r?.markets) ? r.markets : [];
+    console.log(`Markets source: series(${cfg.seriesTicker}) — found: ${markets.length}`);
+  } catch (e) {
+    console.log("listMarkets(series) error:", e.message);
+  }
 
-  const candidates = bestCandidates(markets);
+  // Hard-filter to series by ticker prefix (fixes “sports markets” issue)
+  let filtered = markets.filter(m => String(m?.ticker || "").startsWith(prefix));
+
+  // 2) If series filter didn’t work, fallback to ALL active markets then prefix filter
+  if (filtered.length === 0) {
+    console.log(`Series filter returned 0 tickers starting with ${prefix}. Falling back to ALL active markets...`);
+    const r2 = await listMarkets({ seriesTicker: undefined, status: "active", limit: 500 });
+    const all = Array.isArray(r2?.markets) ? r2.markets : [];
+    console.log(`Markets source: ALL_ACTIVE — found: ${all.length}`);
+    filtered = all.filter(m => String(m?.ticker || "").startsWith(prefix));
+  }
+
+  console.log(`BTC series candidates (${prefix}*): ${filtered.length}`);
+  if (filtered.length === 0) {
+    // print sample tickers to help debug what the API is returning
+    const sample = markets.slice(0, 10).map(m => m?.ticker).filter(Boolean);
+    console.log("Sample tickers returned:", sample);
+    return console.log("No tradable BTC15M markets found after filtering. Check seriesTicker spelling.");
+  }
+
+  // Try the most liquid BTC15M markets first
+  const candidates = topByVolume(filtered, 30);
 
   let chosen = null;
-
   for (const m of candidates) {
     if (!m?.ticker) continue;
-
     try {
       const r = await resolveAskForSide(m.ticker, side);
       const ask = r.askCents;
@@ -103,19 +130,18 @@ async function main() {
         continue;
       }
 
-      chosen = { market: m, askCents: ask, askSource: r.source, book: r.book };
+      chosen = { market: m, askCents: ask, askSource: r.source };
       break;
     } catch (e) {
       console.log(`Skip ${m.ticker} — pricing error: ${e.message}`);
-      continue;
     }
   }
 
   if (!chosen) {
-    return console.log("No trade — no candidate market had a valid ask in top 20 by volume.");
+    return console.log("No trade — no candidate BTC15M market had a valid ask in top 30 by volume.");
   }
 
-  const predicted = predictedCentsFromConfidence(side, signal.confidence);
+  const predicted = predictedCentsFromConfidence(signal.confidence);
   const edge = predicted - chosen.askCents;
 
   console.log("Selected market:", {
@@ -123,7 +149,7 @@ async function main() {
     status: chosen.market.status,
     volume: chosen.market.volume,
     askCents: chosen.askCents,
-    askSource: chosen.askSource
+    askSource: chosen.askSource,
   });
 
   console.log(`Edge check: predicted=${predicted}¢ market=${chosen.askCents}¢ edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
