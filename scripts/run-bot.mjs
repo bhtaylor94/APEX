@@ -2,6 +2,23 @@ import { kvGetJson, kvSetJson } from "./kv.mjs";
 import { getBTCSignal } from "./signal.mjs";
 import { listMarkets, getOrderbook, deriveYesNoFromOrderbook, createOrder } from "./kalshi.mjs";
 
+// Hoisted to avoid TDZ (Cannot access before initialization)
+var tickerForOB = null;
+
+function resolveTicker() {
+  return (
+    ((typeof selectedMarket !== "undefined") && selectedMarket && selectedMarket.ticker) ||
+    ((typeof selected !== "undefined") && selected && selected.ticker) ||
+    ((typeof market !== "undefined") && market && market.ticker) ||
+    ((typeof picked !== "undefined") && picked && picked.ticker) ||
+    ((typeof candidate !== "undefined") && candidate && candidate.ticker) ||
+    ((typeof best !== "undefined") && best && best.ticker) ||
+    null
+  );
+}
+
+
+
 function centsToUsd(c) { return (c/100); }
 
 function nowTs() { return Date.now(); }
@@ -57,6 +74,13 @@ async function tryExit(cfg, pos) {
   if (!pos) return { exited:false };
 
   // Fetch orderbook for the position ticker
+  // Ensure we have a ticker for orderbook pricing
+  if (!tickerForOB) tickerForOB = resolveTicker();
+  if (!tickerForOB) {
+    console.log("No trade — could not determine ticker for orderbook");
+    return;
+  }
+
   const ob = await getOrderbook(pos.ticker);
   const { bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
 
