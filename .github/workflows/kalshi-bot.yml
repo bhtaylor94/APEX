@@ -5,6 +5,24 @@ on:
     - cron: "*/5 * * * *"   # GitHub min: 5 minutes
   workflow_dispatch: {}
 
+      - name: Debug – show runner + grep for patch markers
+        run: |
+          echo "PWD:"; pwd
+          echo "BRANCH:"; git branch --show-current || true
+          echo "LATEST COMMIT:"; git log -1 --oneline
+          echo ""
+          echo "List scripts/:"
+          ls -la scripts || true
+          echo ""
+          echo "Workflow is running this command next:"
+          echo "node scripts/run-bot.js"
+          echo ""
+          echo "Does scripts/run-bot.js contain patch markers?"
+          grep -n "fetchBtc15mUpDownMarkets\|pickKxBtc15mMarket\|Markets source:\|BTC 15m Up/Down markets found" -n scripts/run-bot.js || true
+          echo ""
+          echo "Does scripts/bot_runner.mjs contain patch markers?"
+          grep -n "fetchBtc15mUpDownMarkets\|pickKxBtc15mMarket\|Markets source:\|BTC 15m Up/Down markets found" -n scripts/bot_runner.mjs || true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
