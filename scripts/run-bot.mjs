@@ -27,7 +27,8 @@ async function pickOpenMarkets(kalshi, seriesTicker){
 }
 
 import { kvGetJson, kvSetJson } from "./kv.js";
-import { getBTCSignal } from "./signal.js";
+import signalPkg from "./signal.js";
+const { getBTCSignal } = signalPkg;
 import kalshiPkg from "./kalshi.js";
 const { getBTCMarkets, placeKalshiOrder } = kalshiPkg;
 // Node 18+ has global fetch. (We intentionally avoid node-fetch in Actions.)
