@@ -1,110 +1,233 @@
+import { kvGetJson, kvSetJson } from "./kv.mjs";
+import { getBTCSignal } from "./signal.mjs";
+import { listMarkets, getOrderbook, deriveYesNoFromOrderbook, createOrder } from "./kalshi.mjs";
 
-function isBtc15mUpDown(m){
-  const t = ((m.title||"") + " " + (m.subtitle||"")).toLowerCase();
-  return (t.includes("btc") || t.includes("bitcoin")) &&
-         (t.includes("15") || t.includes("15m") || t.includes("15-minute") || t.includes("15 minutes")) &&
-         (t.includes("up") && t.includes("down"));
+function centsToUsd(c) { return (c/100); }
+
+function nowTs() { return Date.now(); }
+
+function defaultConfig() {
+  return {
+    enabled: true,
+    mode: "paper",             // "paper" or "live"
+    seriesTicker: "KXBTC15M",
+    tradeSizeUsd: 5,
+    maxContracts: 5,
+    minConfidence: 0.15,
+    minEdge: 5,
+    maxEntryPriceCents: 85,
+    takeProfitPct: 0.20,
+    stopLossPct: 0.12,
+    cooldownMinutes: 8,
+    maxTradesPerDay: 10,
+    dailyMaxLossUsd: 25,
+    maxOpenPositions: 1
+  };
 }
 
-async function pickOpenMarkets(kalshi, seriesTicker){
-  const st = (seriesTicker || "").toUpperCase();
-  const candidates = [st, "KXBTC15M", "KXBTC15", "KXBTCUD", "KXBTCUDR"].filter(Boolean);
+function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
 
-  // 1) Try series tickers first
-  for (const c of candidates) {
-    try {
-      const r = await kalshi.listMarkets({ status: "open", series_ticker: c, limit: 100 });
-      const ms = Array.isArray(r?.markets) ? r.markets : [];
-      if (ms.length) return { markets: ms, used: c, method: "series" };
-    } catch {}
-  }
-
-  // 2) Fallback: scan all open markets and filter for BTC 15m Up/Down
-  const rAll = await kalshi.listMarkets({ status: "open", limit: 300 });
-  const all = Array.isArray(rAll?.markets) ? rAll.markets : [];
-  const filtered = all.filter(isBtc15mUpDown);
-  return { markets: filtered, used: "ALL_OPEN", method: "fallback" };
+async function loadConfig() {
+  const cfg = await kvGetJson("bot:config");
+  return { ...defaultConfig(), ...(cfg || {}) };
 }
 
-import { kvGetJson, kvSetJson } from "./kv.js";
-import signalPkg from "./signal.js";
-const { getBTCSignal } = signalPkg;
-import kalshiPkg from "./kalshi.js";
-const { getBTCMarkets, placeKalshiOrder } = kalshiPkg;
-// Node 18+ has global fetch. (We intentionally avoid node-fetch in Actions.)
-if (typeof fetch !== "function") {
-  throw new Error("Global fetch not found. Use Node 18+ in GitHub Actions.");
+async function loadPosition() {
+  return await kvGetJson("bot:position");
 }
 
-
-async function pickKxBtc15mMarket(kalshi, seriesTicker) {
-  const st = String(seriesTicker || "KXBTC15M");
-  // IMPORTANT: don't force status=open; 15m markets are often 'unopened' until right before start.
-  const resp = await kalshi.listMarkets({ series_ticker: st, limit: 200 });
-  const markets = Array.isArray(resp?.markets) ? resp.markets : [];
-
-  const now = Math.floor(Date.now() / 1000);
-
-  const tradable = markets
-    .filter(m => ["open", "unopened", "paused"].includes(String(m.status || "").toLowerCase()))
-    .filter(m => (m.close_ts || 0) > now) // upcoming / current only
-    .sort((a,b) => (a.close_ts || 0) - (b.close_ts || 0)); // soonest close first
-
-  if (!tradable.length) {
-    return { market: null, count: markets.length, method: "series-no-status" };
-  }
-
-  return { market: tradable[0], count: markets.length, method: "series-no-status" };
+async function savePosition(pos) {
+  return await kvSetJson("bot:position", pos);
 }
 
+async function clearPosition() {
+  return await kvSetJson("bot:position", null);
+}
 
-(async () => {
-  const config = await kvGetJson("bot:config");
-  if (!config?.enabled) {
-    console.log("Bot disabled");
-    return;
+function computePnL(pos, bestBidCents) {
+  // Rough mark-to-bid PnL ignoring fees:
+  // If long YES: profit per contract = bestBid - entry
+  // If long NO:  profit per contract = bestBid - entry
+  const per = (bestBidCents - pos.entryPriceCents);
+  const usd = centsToUsd(per * pos.count);
+  return usd;
+}
+
+async function tryExit(cfg, pos) {
+  if (!pos) return { exited:false };
+
+  // Fetch orderbook for the position ticker
+  const ob = await getOrderbook(pos.ticker);
+  const { bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
+
+  const bestBid = (pos.side === "yes") ? bestYesBid : bestNoBid;
+  if (bestBid == null) {
+    console.log("HOLD — no bid to exit on yet.");
+    return { exited:false };
   }
 
-  const signal = await getBTCSignal();
-  console.log("Signal:", signal);
+  const pnlUsd = computePnL(pos, bestBid);
+  const entryUsd = centsToUsd(pos.entryPriceCents * pos.count);
+  const takeUsd = entryUsd * cfg.takeProfitPct;
+  const stopUsd = -entryUsd * cfg.stopLossPct;
 
-  if (signal.direction === "neutral") return;
-  if (signal.confidence < config.minConfidence) return;
+  console.log(`POSITION: ${pos.side.toUpperCase()} ${pos.count}x ${pos.ticker} entry=${pos.entryPriceCents}¢ bestBid=${bestBid}¢ pnl≈$${pnlUsd.toFixed(2)} TP=$${takeUsd.toFixed(2)} SL=$${stopUsd.toFixed(2)}`);
 
-  const markets = await getBTCMarkets();
-  if (!markets.length) {
-    console.log("No BTC markets");
-    return;
-  }
+  if (pnlUsd >= takeUsd || pnlUsd <= stopUsd) {
+    const reason = pnlUsd >= takeUsd ? "TAKE_PROFIT" : "STOP_LOSS";
+    console.log(`EXIT (${reason}): SELL ${pos.side.toUpperCase()} ${pos.count}x ${pos.ticker} @ ${bestBid}¢`);
 
-  for (const m of markets) {
-    const side = signal.direction === "up" ? "yes" : "no";
-    const price = side === "yes" ? m.yes_ask : m.no_ask;
-    if (!price || price >= 99) continue;
-
-    const edge = Math.round(signal.confidence * 100) - price;
-    if (edge < config.minEdge) continue;
-
-    const count = Math.min(config.maxContracts, Math.floor(config.tradeSizeUsd / (price / 100)));
-    if (count < 1) continue;
-
-    console.log("PLACING TRADE:", m.ticker, side, count, price);
-
-    if (config.mode === "live") {
-      await placeKalshiOrder(m.ticker, side, count, price);
+    if (cfg.mode === "live") {
+      const out = await createOrder({
+        ticker: pos.ticker,
+        action: "sell",
+        side: pos.side,
+        count: pos.count,
+        priceCents: bestBid,
+        tif: "fill_or_kill",
+        postOnly: false
+      });
+      console.log("EXIT ORDER RESULT:", JSON.stringify(out, null, 2));
+    } else {
+      console.log("PAPER: exit order skipped (paper mode).");
     }
 
-    await kvSetJson("bot:last_trade", {
-      ticker: m.ticker,
-      side,
-      count,
-      price,
-      confidence: signal.confidence,
-      ts: Date.now()
-    });
-
-    break;
+    await clearPosition();
+    await kvSetJson("bot:last_action", { ts: nowTs(), type:"exit", reason, pnlUsd });
+    return { exited:true };
   }
 
-  await kvSetJson("bot:last_run", { ts: Date.now(), signal });
-})();
+  return { exited:false };
+}
+
+function pickBestMarketCandidate(markets) {
+  // Filter active BTC15M tickers only
+  const btc = markets.filter(m => (m.ticker || "").startsWith("KXBTC15M-") && (m.status === "active" || m.status === "open" || m.status === "trading" || m.status === "live"));
+  // Prefer high volume
+  btc.sort((a,b)=>(b.volume||0)-(a.volume||0));
+  return btc[0] || null;
+}
+
+async function main() {
+  const cfg = await loadConfig();
+  console.log("CONFIG:", cfg);
+
+  if (!cfg.enabled) {
+    console.log("Bot disabled. Set bot:config.enabled=true to run.");
+    return;
+  }
+
+  // 1) Exit logic first (sell-to-close)
+  const pos = await loadPosition();
+  if (pos) {
+    const ex = await tryExit(cfg, pos);
+    if (ex.exited) return; // do not re-enter same minute
+  }
+
+  // 2) Enforce max open positions
+  const pos2 = await loadPosition();
+  if (pos2) {
+    console.log("MaxOpenPositions: position exists, skipping entry.");
+    return;
+  }
+
+  // 3) Signal
+  const sig = await getBTCSignal();
+  console.log("SIGNAL:", sig);
+
+  if (sig.direction === "neutral") {
+    console.log("No trade — neutral signal.");
+    return;
+  }
+  if (sig.confidence < cfg.minConfidence) {
+    console.log(`No trade — confidence ${sig.confidence} < minConfidence ${cfg.minConfidence}`);
+    return;
+  }
+
+  // 4) Markets
+  const mkResp = await listMarkets({ seriesTicker: cfg.seriesTicker, status: "open", limit: 200 });
+  const markets = Array.isArray(mkResp?.markets) ? mkResp.markets : [];
+  console.log(`Markets source: series(${cfg.seriesTicker}) — found: ${markets.length}`);
+
+  const m = pickBestMarketCandidate(markets);
+  if (!m) {
+    console.log("No tradable markets found for series:", cfg.seriesTicker);
+    return;
+  }
+
+  // 5) Derive tradable ask from orderbook (reliable)
+  const ob = await getOrderbook(m.ticker);
+  const { yesAsk, noAsk, bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
+
+  const predYes = 50 + Math.round(sig.confidence * 35); // 50..85ish
+  const predNo  = 100 - predYes;
+
+  // Choose the best edge between YES and NO
+  const edgeYes = (yesAsk != null) ? (predYes - yesAsk) : -999;
+  const edgeNo  = (noAsk  != null) ? (predNo  - noAsk)  : -999;
+
+  let side = null;
+  let ask = null;
+  let edge = null;
+
+  if (edgeYes >= edgeNo) { side="yes"; ask=yesAsk; edge=edgeYes; }
+  else { side="no"; ask=noAsk; edge=edgeNo; }
+
+  console.log("Selected market:", {
+    ticker: m.ticker,
+    status: m.status,
+    volume: m.volume || 0,
+    yesAsk, noAsk,
+    bestYesBid, bestNoBid
+  });
+
+  if (ask == null || ask <= 0 || ask >= 99) {
+    console.log("No trade — missing/invalid ask:", ask);
+    return;
+  }
+  if (ask > cfg.maxEntryPriceCents) {
+    console.log(`No trade — ask ${ask}¢ > maxEntryPriceCents ${cfg.maxEntryPriceCents}¢`);
+    return;
+  }
+  console.log(`Edge check: predYES=${predYes}¢ predNO=${predNo}¢ yesAsk=${yesAsk}¢ noAsk=${noAsk}¢ edgeYES=${edgeYes}¢ edgeNO=${edgeNo}¢ chosen=${side.toUpperCase()} edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
+
+  if (edge < cfg.minEdge) {
+    console.log("No trade — edge too small.");
+    return;
+  }
+
+  const count = clamp(cfg.maxContracts, 1, cfg.maxContracts);
+
+  console.log(`Decision: BUY ${side.toUpperCase()} ${count}x ${m.ticker} @ ${ask}¢ (mode=${cfg.mode})`);
+
+  if (cfg.mode === "live") {
+    const out = await createOrder({
+      ticker: m.ticker,
+      action: "buy",
+      side,
+      count,
+      priceCents: ask,
+      tif: "fill_or_kill",
+      postOnly: false
+    });
+    console.log("ORDER RESULT:", JSON.stringify(out, null, 2));
+  } else {
+    console.log("PAPER: buy skipped (paper mode).");
+  }
+
+  // Save position so we can sell-to-close next minute
+  await savePosition({
+    ticker: m.ticker,
+    side,
+    count,
+    entryPriceCents: ask,
+    openedTs: nowTs()
+  });
+  await kvSetJson("bot:last_action", { ts: nowTs(), type:"entry", ticker:m.ticker, side, count, ask });
+  console.log("Saved bot:position");
+}
+
+main().catch(e => {
+  console.error("Bot runner failed:", e?.message || e);
+  process.exit(1);
+});

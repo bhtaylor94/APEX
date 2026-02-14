@@ -13,11 +13,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 18
-      - run: npm install
-      - run: node scripts/run-bot.js
+      - run: npm ci || npm install
+      - run: node scripts/run-bot.mjs
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
-          NEXT_PUBLIC_KALSHI_ENV: ${{ secrets.NEXT_PUBLIC_KALSHI_ENV }}
