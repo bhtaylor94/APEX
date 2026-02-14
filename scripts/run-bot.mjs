@@ -300,6 +300,42 @@ async function main() {
   const res = await placeOrder({ ticker: best.ticker, side: best.side, count, priceCents: best.askCents, action: "buy" });
   console.log("ORDER RESULT:", res);
 
+  // --- Persist run state (Firebase KV) ---
+  try {
+    const lastRun = {
+      ts: Date.now(),
+      action: "entry",
+      ticker: selected?.ticker || null,
+      side,
+      count,
+      entryPriceCents: askCents,
+      edgeCents: edge,
+      mode: cfg.mode || null
+    };
+    await kvSetJson("bot:last_run", lastRun);
+
+    const posObj = {
+      ticker: selected?.ticker || null,
+      side,
+      entryPriceCents: askCents,
+      count,
+      openedTs: Date.now(),
+      orderId: res?.order?.order_id || null
+    };
+    await kvSetJson("bot:position", posObj);
+
+    const verify = await kvGetJson("bot:position");
+    console.log("✅ bot:position persisted =>", verify);
+    console.log("✅ bot:last_run persisted =>", await kvGetJson("bot:last_run"));
+  } catch (e) {
+    console.log("WARN: KV persist failed:", e?.message || e);
+  }
+
+  // IMPORTANT: stop here so later cleanup logic cannot accidentally clear bot:position
+  return;
+
+
+
   // best effort position write (won’t crash if Upstash token is read-only)
   try {
     await kvSetJson("bot:position", {
