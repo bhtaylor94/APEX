@@ -2,45 +2,6 @@ import { kvGetJson, kvSetJson } from "./kv.mjs";
 import { getBTCSignal } from "./signal.mjs";
 import { listMarkets, getOrderbook, deriveYesNoFromOrderbook, createOrder } from "./kalshi.mjs";
 
-// ---- ORDERBOOK PRICING (source of truth) ----
-function derivePricesFromOrderbook(ob) {
-  // Kalshi orderbook commonly returns arrays like:
-  // { yes: [{price: 25, count: ...}], no: [{price: 75, ...}], ... }
-  // Some variants use best_* fields; we handle both.
-  const yesAsk = ob?.yes?.[0]?.price ?? ob?.yes_asks?.[0]?.price ?? ob?.yesAsk ?? null;
-  const noAsk  = ob?.no?.[0]?.price  ?? ob?.no_asks?.[0]?.price  ?? ob?.noAsk  ?? null;
-
-  const bestYesBid =
-    ob?.yes_bids?.[0]?.price ?? ob?.yesBid ?? ob?.bestYesBid ?? null;
-
-  const bestNoBid =
-    ob?.no_bids?.[0]?.price ?? ob?.noBid ?? ob?.bestNoBid ?? null;
-
-  return { yesAsk, noAsk, bestYesBid, bestNoBid };
-}
-
-
-// Guard: prevent ReferenceError if code references selected outside main()
-let selected = null;
-
-
-// Hoisted to avoid TDZ (Cannot access before initialization)
-
-
-function resolveTicker() {
-  return (
-    ((typeof selectedMarket !== "undefined") && selectedMarket && selectedMarket.ticker) ||
-    ((typeof selected !== "undefined") && selected && selected.ticker) ||
-    ((typeof market !== "undefined") && market && market.ticker) ||
-    ((typeof picked !== "undefined") && picked && picked.ticker) ||
-    ((typeof candidate !== "undefined") && candidate && candidate.ticker) ||
-    ((typeof best !== "undefined") && best && best.ticker) ||
-    null
-  );
-}
-
-
-
 function centsToUsd(c) { return (c/100); }
 
 function nowTs() { return Date.now(); }
@@ -96,59 +57,164 @@ async function tryExit(cfg, pos) {
   if (!pos) return { exited:false };
 
   // Fetch orderbook for the position ticker
-  // Ensure we have a ticker for orderbook pricing
-  if (!tickerForOB) tickerForOB = resolveTicker();
-  // Robust ticker resolution (prevents ReferenceError if a name doesn't exist in this scope)
-  tickerForOB =
-    ((typeof selectedMarket !== "undefined") && selectedMarket && selectedMarket.ticker) ||
-    ((typeof selected !== "undefined") && selected && selected.ticker) ||
-    ((typeof market !== "undefined") && market && market.ticker) ||
-    ((typeof picked !== "undefined") && picked && picked.ticker) ||
-    ((typeof candidate !== "undefined") && candidate && candidate.ticker) ||
-    ((typeof best !== "undefined") && best && best.ticker) ||
-    null;
+  const ob = await getOrderbook(pos.ticker);
+  const { bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
 
-  if (!tickerForOB) { tickerForOB = selected?.ticker || tickerForOB; tickerForOB = selected?.ticker || tickerForOB;
-
-// [PATCH] removed illegal top-level return:     return;
+  const bestBid = (pos.side === "yes") ? bestYesBid : bestNoBid;
+  if (bestBid == null) {
+    console.log("HOLD — no bid to exit on yet.");
+    return { exited:false };
   }
-const ob = await getOrderbook((tickerForOB || selected?.ticker), 1);
 
-// Kalshi orderbook shape: { yes: [{price,count}...], no: [{price,count}...] }
-const yesAsk = ob?.yes?.[0]?.price ?? null;
-const noAsk  = ob?.no?.[0]?.price  ?? null;
-const bestYesBid = (ob?.yes && ob.yes.length) ? ob.yes[ob.yes.length - 1].price : null;
-const bestNoBid  = (ob?.no  && ob.no.length)  ? ob.no[ob.no.length - 1].price  : null;
+  const pnlUsd = computePnL(pos, bestBid);
+  const entryUsd = centsToUsd(pos.entryPriceCents * pos.count);
+  const takeUsd = entryUsd * cfg.takeProfitPct;
+  const stopUsd = -entryUsd * cfg.stopLossPct;
 
-console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid });
+  console.log(`POSITION: ${pos.side.toUpperCase()} ${pos.count}x ${pos.ticker} entry=${pos.entryPriceCents}¢ bestBid=${bestBid}¢ pnl≈$${pnlUsd.toFixed(2)} TP=$${takeUsd.toFixed(2)} SL=$${stopUsd.toFixed(2)}`);
+
+  if (pnlUsd >= takeUsd || pnlUsd <= stopUsd) {
+    const reason = pnlUsd >= takeUsd ? "TAKE_PROFIT" : "STOP_LOSS";
+    console.log(`EXIT (${reason}): SELL ${pos.side.toUpperCase()} ${pos.count}x ${pos.ticker} @ ${bestBid}¢`);
+
+    if (cfg.mode === "live") {
+      const out = await createOrder({
+        ticker: pos.ticker,
+        action: "sell",
+        side: pos.side,
+        count: pos.count,
+        priceCents: bestBid,
+        tif: "fill_or_kill",
+        postOnly: false
+      });
+      console.log("EXIT ORDER RESULT:", JSON.stringify(out, null, 2));
+    } else {
+      console.log("PAPER: exit order skipped (paper mode).");
+    }
+
+    await clearPosition();
+    await kvSetJson("bot:last_action", { ts: nowTs(), type:"exit", reason, pnlUsd });
+    return { exited:true };
+  }
+
+  return { exited:false };
 }
-// ---- FIX: derive executable pricing from orderbook BEFORE askCents guard ----
-let askCents = (typeof askCents !== 'undefined') ? askCents : null;
-const obPricing = await getOrderbook(selected.ticker, 1);
-const yesAskOB = obPricing?.yes?.[0]?.price ?? null;
-const noAskOB  = obPricing?.no?.[0]?.price ?? null;
-askCents = (side === 'yes') ? yesAskOB : noAskOB;
-console.log('Orderbook pricing:', { yesAskOB, noAskOB, askCents });
 
-if (askCents == null || askCents <= 0 || askCents >= 99) {
+function pickBestMarketCandidate(markets) {
+  // Filter active BTC15M tickers only
+  const btc = markets.filter(m => (m.ticker || "").startsWith("KXBTC15M-") && (m.status === "active" || m.status === "open" || m.status === "trading" || m.status === "live"));
+  // Prefer high volume
+  btc.sort((a,b)=>(b.volume||0)-(a.volume||0));
+  return btc[0] || null;
+}
 
-console.log("No trade — missing/invalid askCents:", askCents);
-// [PATCH] removed illegal top-level return:     return;
+async function main() {
+  const cfg = await loadConfig();
+  console.log("CONFIG:", cfg);
+
+  if (!cfg.enabled) {
+    console.log("Bot disabled. Set bot:config.enabled=true to run.");
+    return;
   }
-  if (askCents > cfg.maxEntryPriceCents) {
-    console.log(`No trade — askCents ${askCents}¢ > maxEntryPriceCents ${cfg.maxEntryPriceCents}¢`);
-// [PATCH] removed illegal top-level return:     return;
+
+  // 1) Exit logic first (sell-to-close)
+  const pos = await loadPosition();
+  if (pos) {
+    const ex = await tryExit(cfg, pos);
+    if (ex.exited) return; // do not re-enter same minute
+  }
+
+  // 2) Enforce max open positions
+  const pos2 = await loadPosition();
+  if (pos2) {
+    console.log("MaxOpenPositions: position exists, skipping entry.");
+    return;
+  }
+
+  // 3) Signal
+  const sig = await getBTCSignal();
+  console.log("SIGNAL:", sig);
+
+  if (sig.direction === "neutral") {
+    const allowNeutral = cfg.allowNeutralTrades === true;
+    if (!allowNeutral) {
+      console.log("No trade — neutral signal.");
+      return;
+    }
+
+    // Neutral policy: choose direction using momentum (RSI as tie-breaker)
+    const mom = Number(sig.mom ?? 0);
+    const rsi = Number(sig.rsi ?? 50);
+    const momDeadband = Number(cfg.neutralMomDeadband ?? 0.00010);
+
+    let neutralDir = "neutral";
+    if (mom > momDeadband) neutralDir = "up";
+    else if (mom < -momDeadband) neutralDir = "down";
+    else neutralDir = (rsi >= 50 ? "up" : "down");
+
+    console.log("Neutral override: mom=" + mom + " rsi=" + rsi + " => direction=" + neutralDir.toUpperCase());
+    sig.direction = neutralDir;
+  }
+  if (sig.confidence < cfg.minConfidence) {
+    console.log(`No trade — confidence ${sig.confidence} < minConfidence ${cfg.minConfidence}`);
+    return;
+  }
+
+  // 4) Markets
+  const mkResp = await listMarkets({ seriesTicker: cfg.seriesTicker, status: "open", limit: 200 });
+  const markets = Array.isArray(mkResp?.markets) ? mkResp.markets : [];
+  console.log(`Markets source: series(${cfg.seriesTicker}) — found: ${markets.length}`);
+
+  const m = pickBestMarketCandidate(markets);
+  if (!m) {
+    console.log("No tradable markets found for series:", cfg.seriesTicker);
+    return;
+  }
+
+  // 5) Derive tradable ask from orderbook (reliable)
+  const ob = await getOrderbook(m.ticker);
+  const { yesAsk, noAsk, bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
+
+  const predYes = 50 + Math.round(sig.confidence * 35); // 50..85ish
+  const predNo  = 100 - predYes;
+
+  // Choose the best edge between YES and NO
+  const edgeYes = (yesAsk != null) ? (predYes - yesAsk) : -999;
+  const edgeNo  = (noAsk  != null) ? (predNo  - noAsk)  : -999;
+
+  let side = null;
+  let ask = null;
+  let edge = null;
+
+  if (edgeYes >= edgeNo) { side="yes"; ask=yesAsk; edge=edgeYes; }
+  else { side="no"; ask=noAsk; edge=edgeNo; }
+
+  console.log("Selected market:", {
+    ticker: m.ticker,
+    status: m.status,
+    volume: m.volume || 0,
+    yesAsk, noAsk,
+    bestYesBid, bestNoBid
+  });
+
+  if (ask == null || ask <= 0 || ask >= 99) {
+    console.log("No trade — missing/invalid ask:", ask);
+    return;
+  }
+  if (ask > cfg.maxEntryPriceCents) {
+    console.log(`No trade — ask ${ask}¢ > maxEntryPriceCents ${cfg.maxEntryPriceCents}¢`);
+    return;
   }
   console.log(`Edge check: predYES=${predYes}¢ predNO=${predNo}¢ yesAsk=${yesAsk}¢ noAsk=${noAsk}¢ edgeYES=${edgeYes}¢ edgeNO=${edgeNo}¢ chosen=${side.toUpperCase()} edge=${edge}¢ minEdge=${cfg.minEdge}¢`);
 
   if (edge < cfg.minEdge) {
     console.log("No trade — edge too small.");
-// [PATCH] removed illegal top-level return:     return;
+    return;
   }
 
   const count = clamp(cfg.maxContracts, 1, cfg.maxContracts);
 
-  console.log(`Decision: BUY ${side.toUpperCase()} ${count}x ${m.ticker} @ ${askCents}¢ (mode=${cfg.mode})`);
+  console.log(`Decision: BUY ${side.toUpperCase()} ${count}x ${m.ticker} @ ${ask}¢ (mode=${cfg.mode})`);
 
   if (cfg.mode === "live") {
     const out = await createOrder({
@@ -156,7 +222,7 @@ console.log("No trade — missing/invalid askCents:", askCents);
       action: "buy",
       side,
       count,
-      priceCents: askCents,
+      priceCents: ask,
       tif: "fill_or_kill",
       postOnly: false
     });
@@ -170,12 +236,12 @@ console.log("No trade — missing/invalid askCents:", askCents);
     ticker: m.ticker,
     side,
     count,
-    entryPriceCents: askCents,
+    entryPriceCents: ask,
     openedTs: nowTs()
   });
-  await kvSetJson("bot:last_action", { ts: nowTs(), type:"entry", ticker:m.ticker, side, count, askCents });
+  await kvSetJson("bot:last_action", { ts: nowTs(), type:"entry", ticker:m.ticker, side, count, ask });
   console.log("Saved bot:position");
-// [PATCH] removed stray top-level brace: }
+}
 
 main().catch(e => {
   console.error("Bot runner failed:", e?.message || e);
