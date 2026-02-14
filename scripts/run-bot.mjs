@@ -172,7 +172,7 @@ async function main() {
   }
 
   // 5) Derive tradable ask from orderbook (reliable)
-  const ob2 = await getOrderbook(m.ticker);
+  const ob = await getOrderbook(m.ticker);
   const { yesAsk, noAsk, bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
 
   const predYes = 50 + Math.round(sig.confidence * 35); // 50..85ish
@@ -205,8 +205,8 @@ const ob = await getOrderbook(selected.ticker, 1);
 // Kalshi orderbook shape: { yes: [{price,count}...], no: [{price,count}...] }
 const yesAsk = ob?.yes?.[0]?.price ?? null;
 const noAsk  = ob?.no?.[0]?.price  ?? null;
-const bestYesBid = (ob?.yes && ob2.yes.length) ? ob2.yes[ob2.yes.length - 1].price : null;
-const bestNoBid  = (ob?.no  && ob2.no.length)  ? ob2.no[ob2.no.length - 1].price  : null;
+const bestYesBid = (ob?.yes && ob.yes.length) ? ob.yes[ob.yes.length - 1].price : null;
+const bestNoBid  = (ob?.no  && ob.no.length)  ? ob.no[ob.no.length - 1].price  : null;
 
 console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid });
 }
