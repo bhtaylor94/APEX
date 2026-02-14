@@ -169,6 +169,28 @@ async function getExecutablePrices(ticker) {
   return { yesAsk: null, noAsk: null, yesBid: null, noBid: null, source: "none" };
 }
 
+async function getOpenPositions() {
+  const arr = (await kvGetJson("bot:positions")) || [];
+  return Array.isArray(arr) ? arr : [];
+}
+
+async function setOpenPositions(arr) {
+  await kvSetJson("bot:positions", Array.isArray(arr) ? arr : []);
+}
+
+function isRealPosition(p) {
+  return !!(p && p.ticker && (p.side === "yes" || p.side === "no") && Number(p.entryPriceCents) > 0 && Number(p.count) > 0);
+}
+
+async function appendPosition(pos) {
+  const arr = (await getOpenPositions()).filter(isRealPosition);
+  arr.push(pos);
+  await setOpenPositions(arr);
+
+  // keep bot:position as "last position" for backwards-compat / debugging
+  await kvSetJson("bot:position", pos);
+}
+
 async function main() {
   const cfg = (await kvGetJson("bot:config")) || {};
 
@@ -342,18 +364,20 @@ async function main() {
         if (!Number.isFinite(posCount) || posCount <= 0) {
           console.log("WARN: bot:position not saved (bad posCount)", { posCount, fillCount, initialCount });
         } else {
-          await kvSetJson("bot:position", {
-            ticker: o.ticker,
+          
+        await appendPosition({
+ticker: o.ticker,
             side,
             entryPriceCents,
             count: posCount,
             openedTs: Date.now(),
             orderId: o.order_id || null
-          });
-          // Clear any open_order record for this ticker
-          try { await kvSetJson("bot:open_order", null); } catch {}
-          console.log("Saved bot:position + bot:last_run (filled)");
-        }
+        });
+
+        // Clear any open_order record for this ticker
+        try { await kvSetJson("bot:open_order", null); } catch {}
+        console.log("Saved bot:positions + bot:last_run (filled)");
+}
       } else if (status === "resting") {
         // Unfilled resting order -> track separately
         await kvSetJson("bot:open_order", {
@@ -377,52 +401,6 @@ async function main() {
 
   // --- Persist bot state (Firebase KV) ---
   // IMPORTANT: persist ONLY from executed order response to avoid scope/name issues.
-  try {
-    const o = res?.order || null;
-    if (!o?.ticker || !o?.side) {
-      console.log("WARN: KV persist skipped (missing res.order.ticker/side)");
-    } else {
-      const side = String(o.side);
-      const entryPriceCents =
-        side === "yes"
-          ? Number(o.yes_price ?? o.yes_price_fp ?? null)
-          : Number(o.no_price ?? o.no_price_fp ?? null);
-
-      const count = Number(o.fill_count ?? o.initial_count ?? o.initial_count_fp ?? 0);
-
-      // Only persist if entry/count look valid
-      if (Number.isFinite(entryPriceCents) && entryPriceCents >= 1 && entryPriceCents <= 99 && Number.isFinite(count) && count > 0) {
-        await kvSetJson("bot:position", {
-          ticker: o.ticker,
-          side,
-          entryPriceCents,
-          count,
-          openedTs: Date.now(),
-          orderId: o.order_id || null
-        });
-
-        await kvSetJson("bot:last_run", {
-          ts: Date.now(),
-          action: "entry",
-          ticker: o.ticker,
-          side,
-          entryPriceCents,
-          count,
-          status: o.status || null,
-          orderId: o.order_id || null
-        });
-
-        console.log("Saved bot:position + bot:last_run (from res.order)");
-      } else {
-        console.log("WARN: KV persist skipped (invalid entry/count)", { entryPriceCents, count });
-      }
-    }
-  } catch (e) {
-    console.log("WARN: KV persist failed:", e?.message || e);
-  }
-
-
-
   // --- Persist run state (Firebase KV) ---
   // IMPORTANT: stop here so later cleanup logic cannot accidentally clear bot:position
   return;
