@@ -132,24 +132,27 @@ export async function getBTCMarkets({ seriesTicker = "kxbtc15m", status = "open"
 export async function placeKalshiOrder({ ticker, side, count, price, mode = "paper" } = {}) {
   if (!ticker) throw new Error("placeKalshiOrder: missing ticker");
   if (side !== "yes" && side !== "no") throw new Error("placeKalshiOrder: side must be yes|no");
-  if (!Number.isFinite(Number(count)) || Number(count) <= 0) throw new Error("placeKalshiOrder: bad count");
-  if (!Number.isFinite(Number(price)) || Number(price) <= 0 || Number(price) >= 100) throw new Error("placeKalshiOrder: bad price (1-99)");
+  const nCount = Number(count);
+  const nPrice = Number(price);
+  if (!Number.isFinite(nCount) || nCount <= 0) throw new Error("placeKalshiOrder: bad count");
+  if (!Number.isFinite(nPrice) || nPrice <= 0 || nPrice >= 100) throw new Error("placeKalshiOrder: bad price (1-99)");
 
   if (String(mode).toLowerCase() !== "live") {
     return {
       ok: true,
       paper: true,
-      order: { ticker, side, count: Number(count), price: Number(price), status: "paper_simulated" }
+      order: { ticker, side, count: nCount, price: nPrice, status: "paper_simulated" }
     };
   }
 
+  // Kalshi create-order requires: ticker, side, action, count, type, and yes_price/no_price
   const body = {
     ticker,
+    side,              // <-- REQUIRED (this was missing)
     action: "buy",
-    count: Number(count),
+    count: nCount,
     type: "limit",
-    // Kalshi expects yes_price/no_price in cents
-    ...(side === "yes" ? { yes_price: Number(price) } : { no_price: Number(price) }),
+    ...(side === "yes" ? { yes_price: nPrice } : { no_price: nPrice }),
   };
 
   return kalshiFetch("/trade-api/v2/portfolio/orders", { method: "POST", body });
