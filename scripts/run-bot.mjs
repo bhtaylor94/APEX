@@ -2,6 +2,10 @@ import { kvGetJson, kvSetJson } from "./kv.mjs";
 import { getBTCSignal } from "./signal.mjs";
 import { listMarkets, getOrderbook, deriveYesNoFromOrderbook, createOrder } from "./kalshi.mjs";
 
+// Guard: prevent ReferenceError if code references selected outside main()
+let selected = null;
+
+
 // Hoisted to avoid TDZ (Cannot access before initialization)
 var tickerForOB = null;
 
