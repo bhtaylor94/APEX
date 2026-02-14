@@ -211,7 +211,6 @@ const bestNoBid  = (ob?.no  && ob2.no.length)  ? ob2.no[ob2.no.length - 1].price
 console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid });
 }
 if (ask == null || ask <= 0 || ask >= 99) {
-    console.log("const askCents = side === "yes" ? yesAsk : noAsk;
 
 No trade — missing/invalid ask:", ask);
     return;
