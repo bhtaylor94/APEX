@@ -84,8 +84,10 @@ export async function getOrderbookTop(marketTicker) {
   return { bestYesBid, bestNoBid, yesAsk, noAsk, raw: ob };
 }
 
-export async function listOpenMarkets(limit = 200) {
-  return kalshiFetch("/markets?status=open&limit=" + limit, { auth: false });
+export async function listOpenMarkets(limit = 500) {
+  // IMPORTANT: do NOT pass status=open; Kalshi response statuses include "active" etc.
+  // Leaving status empty returns markets of any status. (Docs: Get Markets)
+  return kalshiFetch("/markets?limit=" + limit, { auth: false });
 }
 
 export async function placeOrder({

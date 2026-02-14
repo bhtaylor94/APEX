@@ -33,8 +33,20 @@ function cfgDefaults(cfg) {
 // - filters open markets by prefix KXBTC15M-
 // - picks the most liquid near-term market (highest volume)
 function pickMarket(allMarkets, seriesTicker) {
-  const prefix = seriesTicker + "-";
-  const ms = (allMarkets || []).filter(m => (m.ticker || "").startsWith(prefix));
+  const prefix = (seriesTicker + "-").toLowerCase();
+
+  // Kalshi responses may show status like: active/closed/etc. We only want tradable ones.
+  const TRADABLE = new Set(["open", "active"]); // treat "active" as tradable
+
+  const ms = (allMarkets || []).filter(m => {
+    const t = String(m.ticker || "").toLowerCase();
+    const st = String(m.status || "").toLowerCase();
+    if (!t.startsWith(prefix)) return false;
+    if (st && !TRADABLE.has(st)) return false; // exclude closed/settled/etc
+    return true;
+  });
+
+  // Pick most liquid
   ms.sort((a, b) => (Number(b.volume || 0) - Number(a.volume || 0)));
   return ms[0] || null;
 }
