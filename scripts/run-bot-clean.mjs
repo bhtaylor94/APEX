@@ -1,6 +1,20 @@
 import { kalshiFetch } from "./kalshi.js";
 import { kvGetJson, kvSetJson } from "./kv.mjs";
-import { getMarkets, getMarket, getOrderbook, placeOrder } from "./kalshi_client.mjs";
+import { getMarkets, getMarket, getOrderbook, placeOrder} from "./kalshi_client.mjs";
+function obTopPrice(ob, side) {
+  // Observed shape:
+  // ob.orderbook.yes = [[priceCents, size], ...]
+  // ob.orderbook.no  = [[priceCents, size], ...]
+  const book = ob && ob.orderbook ? ob.orderbook : null;
+  const arr = side === "yes"
+    ? (book && Array.isArray(book.yes) ? book.yes : [])
+    : (book && Array.isArray(book.no)  ? book.no  : []);
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  const p = Number(arr[0] && arr[0][0]);
+  return Number.isFinite(p) ? p : null;
+}
+
+
 function obBestBid(ob, side) {
   // Orderbook shape in your logs:
   // ob.orderbook.yes = [[priceCents, size], ...]
@@ -93,7 +107,25 @@ if (!pos) return { exited:false, holding:false };
   const takeProfitPct = Number(cfg.takeProfitPct ?? 0.20);
   const stopLossPct   = Number(cfg.stopLossPct   ?? 0.12);
 
-  const bid = await getBestBid(ticker, side);
+    // Prefer orderbook for bids (snapshot bids can be 0/100 on these markets)
+  let bidCents = null;
+  let bidSource = "none";
+  try {
+    const ob = await getOrderbook(ticker, 5);
+    const p = obTopPrice(ob, side);
+    if (p && p >= 1 && p <= 99) { bidCents = p; bidSource = "orderbook"; }
+  } catch {}
+
+  // Fallback to snapshot bid only if orderbook is empty
+  if (!bidCents) {
+    const snap = side === "yes"
+      ? (marketSnapshot?.yes_bid ?? marketSnapshot?.market?.yes_bid)
+      : (marketSnapshot?.no_bid  ?? marketSnapshot?.market?.no_bid);
+    const v = Number(snap);
+    if (Number.isFinite(v) && v >= 1 && v <= 99) { bidCents = v; bidSource = "snapshot"; }
+  }
+
+  const bid = { bidCents, source: bidSource }
   if (!bid.bidCents) {
     console.log("HOLD — no bid to exit on yet.");
     return { exited:false, holding:true };
