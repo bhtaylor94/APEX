@@ -1,11 +1,25 @@
 import crypto from "crypto";
 
 function readKalshiPrivateKey() {
-  const raw = (readKalshiPrivateKey() || "").trim();
-  // If key came through as a single line with literal \n, convert to real newlines.
-  const normalized = raw.includes("\\n") ? raw.replace(/\\n/g, "\n") : raw;
-  return normalized.trim();
+  // Source of truth: env var KALSHI_PRIVATE_KEY (often stored with \n in GitHub secrets)
+  const rawEnv = String(process.env.KALSHI_PRIVATE_KEY || "").trim();
+
+  // Optional: allow pointing to a PEM file via KALSHI_PRIVATE_KEY_PATH
+  const p = String(process.env.KALSHI_PRIVATE_KEY_PATH || "").trim();
+
+  let raw = rawEnv;
+  if (!raw && p) {
+    try {
+      raw = fs.readFileSync(p, "utf8").trim();
+    } catch {
+      raw = "";
+    }
+  }
+
+  // Normalize GitHub-style escaped newlines
+  return raw.replace(/\\n/g, "\n").trim();
 }
+
 
 const ENV = (process.env.NEXT_PUBLIC_KALSHI_ENV || process.env.KALSHI_ENV || "prod").toLowerCase();
 
@@ -86,6 +100,12 @@ export async function getMarkets({ series_ticker, status = "open", limit = 200, 
 export async function getOrderbook(ticker, depth = 1) {
   const qs = new URLSearchParams({ ticker, depth: String(depth) });
   return kalshiFetch("/trade-api/v2/markets/" + encodeURIComponent(ticker) + "/orderbook?" + qs.toString(), { method: "GET", auth: true });
+}
+
+export async function getMarket(ticker) {
+  if (!ticker) throw new Error("getMarket: missing ticker");
+  const enc = encodeURIComponent(ticker);
+  return kalshiFetch("/trade-api/v2/markets/" + enc, { method: "GET", auth: true });
 }
 
 export async function placeOrder({ ticker, side, count, priceCents }) {
