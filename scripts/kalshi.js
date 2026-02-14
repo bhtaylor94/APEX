@@ -115,3 +115,30 @@ export async function placeOrder({
 
   return kalshiFetch("/portfolio/orders", { method: "POST", body, auth: true });
 }
+
+export async function listMarkets({ limit = 200, status = null, series_ticker = null } = {}) {
+  const q = new URLSearchParams();
+  if (limit) q.set("limit", String(limit));
+  if (status) q.set("status", String(status));
+  if (series_ticker) q.set("series_ticker", String(series_ticker));
+  return kalshiFetch("/markets?" + q.toString(), { auth: false });
+}
+
+export async function getSeriesMarkets(seriesTicker, { limit = 200 } = {}) {
+  const st = String(seriesTicker || "");
+  const variants = [st, st.toLowerCase(), st.toUpperCase()]
+    .filter(Boolean)
+    .filter((v, i, a) => a.indexOf(v) === i);
+
+  for (const v of variants) {
+    try {
+      const resp = await listMarkets({ limit, series_ticker: v });
+      const markets = Array.isArray(resp?.markets) ? resp.markets : [];
+      if (markets.length) return { method: "series", used: v, markets };
+    } catch (e) {
+      // try next
+    }
+  }
+
+  return { method: "series", used: variants[0] || st, markets: [] };
+}

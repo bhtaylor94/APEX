@@ -1,5 +1,5 @@
 import { kvGetJson, kvSetJson } from "./kv.js";
-import { getOrderbookTop, listOpenMarkets, placeOrder } from "./kalshi.js";
+import { getOrderbookTop, getSeriesMarkets, placeOrder } from "./kalshi.js";
 import { getBTCSignal } from "./signal.js";
 
 function nowMs() { return Date.now(); }
@@ -68,12 +68,12 @@ async function main() {
   const sig = await getBTCSignal();
   console.log("SIGNAL:", sig);
 
-  // Pull open markets (public)
-  const open = await listOpenMarkets(300);
-  const allMarkets = Array.isArray(open?.markets) ? open.markets : [];
+  // Pull markets by series_ticker (public, reliable)
+  const seriesResp = await getSeriesMarkets(cfg.seriesTicker, { limit: 200 });
+  const allMarkets = Array.isArray(seriesResp?.markets) ? seriesResp.markets : [];
+  console.log(`Markets source: ${seriesResp.method}(${seriesResp.used}) — found: ${allMarkets.length}`);
   const market = pickMarket(allMarkets, cfg.seriesTicker);
-
-  if (!market) {
+if (!market) {
     console.log("No tradable markets found for series:", cfg.seriesTicker);
     return;
   }
