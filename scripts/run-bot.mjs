@@ -1,6 +1,58 @@
 import { kvGetJson, kvSetJson } from "./kv.mjs";
 import { getBTCSignal } from "./signal.mjs";
 import { listMarkets, getOrderbook, deriveYesNoFromOrderbook, createOrder } from "./kalshi.mjs";
+/**
+ * Kalshi markets list often does NOT include executable ask/bid prices.
+ * Orderbook is the source of truth for YES/NO asks/bids.
+ * Returns cents (integers) or null when unavailable.
+ */
+async function getExecutablePricesFromOrderbook(ticker) {
+  try {
+    const ob = await getOrderbook(ticker, 1);
+
+    // Support a few common shapes defensively:
+    // - { yes: [{price}], no: [{price}] }
+    // - { yes_asks: [{price}], no_asks: [{price}] }
+    // - { yes_bids: [{price}], no_bids: [{price}] }
+    const yesAsk =
+      ob?.yes?.[0]?.price ??
+      ob?.yes_asks?.[0]?.price ??
+      ob?.yesAsk ??
+      null;
+
+    const noAsk =
+      ob?.no?.[0]?.price ??
+      ob?.no_asks?.[0]?.price ??
+      ob?.noAsk ??
+      null;
+
+    const bestYesBid =
+      ob?.yes_bids?.[0]?.price ??
+      ob?.yesBid ??
+      ob?.bestYesBid ??
+      null;
+
+    const bestNoBid =
+      ob?.no_bids?.[0]?.price ??
+      ob?.noBid ??
+      ob?.bestNoBid ??
+      null;
+
+    // Force integer cents when possible
+    const toInt = (v) => (typeof v === "number" && Number.isFinite(v)) ? Math.trunc(v) : null;
+
+    return {
+      yesAsk: toInt(yesAsk),
+      noAsk: toInt(noAsk),
+      bestYesBid: toInt(bestYesBid),
+      bestNoBid: toInt(bestNoBid),
+    };
+  } catch (e) {
+    console.log("Orderbook pricing unavailable:", String(e?.message || e));
+    return { yesAsk: null, noAsk: null, bestYesBid: null, bestNoBid: null };
+  }
+}
+
 
 function centsToUsd(c) { return (c/100); }
 
@@ -196,50 +248,15 @@ async function main() {
     yesAsk, noAsk,
     bestYesBid, bestNoBid
   });
+  // --- Orderbook pricing (SOURCE OF TRUTH) ---
+  const px = await getExecutablePricesFromOrderbook(selected.ticker);
 
-  // === ORDERBOOK_PRICE_FALLBACK_V1 ===
-  // Kalshi listMarkets can return null asks/bids. Derive executable prices from orderbook for selected.ticker.
-  try {
-    const missingPx =
-      (selected?.yesAsk == null) ||
-      (selected?.noAsk == null)  ||
-      (selected?.bestYesBid == null) ||
-      (selected?.bestNoBid == null);
-
-    if (missingPx && selected?.ticker) {
-      const _ob = await getOrderbook(selected.ticker, 1);
-
-      // Orderbook shape we expect: { yes: [{ price }...], no: [{ price }...] }
-      const _yesAsk = _ob?.yes?.[0]?.price ?? null;
-      const _noAsk  = _ob?.no?.[0]?.price  ?? null;
-
-      // Best bid is top-of-book *bid*; if your API returns bids separately, adapt here.
-      // Many Kalshi orderbooks return bids in the same arrays but on the opposite side.
-      // We'll safely read best bids if present.
-      const _bestYesBid = _ob?.yes_bid?.[0]?.price ?? _ob?.best_yes_bid ?? null;
-      const _bestNoBid  = _ob?.no_bid?.[0]?.price  ?? _ob?.best_no_bid  ?? null;
-
-      // Only fill missing fields; do not overwrite if snapshot had values
-      if (selected.yesAsk == null) selected.yesAsk = _yesAsk;
-      if (selected.noAsk  == null) selected.noAsk  = _noAsk;
-
-      if (selected.bestYesBid == null) selected.bestYesBid = _bestYesBid;
-      if (selected.bestNoBid  == null) selected.bestNoBid  = _bestNoBid;
-
-      console.log("Orderbook pricing filled:", {
-        yesAsk: selected.yesAsk,
-        noAsk: selected.noAsk,
-        bestYesBid: selected.bestYesBid,
-        bestNoBid: selected.bestNoBid
-      });
-    }
-  } catch (e) {
-    console.log("Orderbook pricing fetch failed (continuing):", e?.message ?? e);
-  }
-  // === END ORDERBOOK_PRICE_FALLBACK_V1 ===
+  // Use orderbook-derived executable prices (ignore listMarkets pricing fields)
+// askCents used for entry pricing
+console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid, askCents });
 
 
-  if (ask == null || ask <= 0 || ask >= 99) {
+  if (askCents == null || askCents <= 0 || askCents >= 99) {
     console.log("No trade — missing/invalid ask:", ask);
     return;
   }
