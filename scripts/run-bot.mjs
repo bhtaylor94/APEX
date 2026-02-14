@@ -122,6 +122,14 @@ const bestNoBid  = (ob?.no  && ob.no.length)  ? ob.no[ob.no.length - 1].price  :
 
 console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid });
 }
+// ---- FIX: derive executable pricing from orderbook BEFORE askCents guard ----
+let askCents = (typeof askCents !== 'undefined') ? askCents : null;
+const obPricing = await getOrderbook(selected.ticker, 1);
+const yesAskOB = obPricing?.yes?.[0]?.price ?? null;
+const noAskOB  = obPricing?.no?.[0]?.price ?? null;
+askCents = (side === 'yes') ? yesAskOB : noAskOB;
+console.log('Orderbook pricing:', { yesAskOB, noAskOB, askCents });
+
 if (askCents == null || askCents <= 0 || askCents >= 99) {
 
 console.log("No trade — missing/invalid askCents:", askCents);
