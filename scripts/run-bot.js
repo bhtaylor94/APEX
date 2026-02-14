@@ -99,10 +99,11 @@ if (!market) {
 
     // Mark-to-market using mid of derived bid/ask (fallback to bid if ask missing)
     const bid = side === "yes" ? ob.bestYesBid : ob.bestNoBid;
-    // Prefer Market snapshot ask. Note: Kalshi removed cent fields in Jan 2026; use *_dollars when present.  [oai_citation:1‡Kalshi API Documentation](https://docs.kalshi.com/changelog?utm_source=chatgpt.com)
+    // Prefer Market snapshot ask. Note: Kalshi removed cent fields in Jan 2026; use *_dollars when present.
+  const derivedAsk = side === "yes" ? ob.yesAsk : ob.noAsk;
+
   const snapCents = (() => {
     if (side === "yes") {
-      // prefer dollars field
       const d = market?.yes_ask_dollars;
       const c = market?.yes_ask;
       if (d != null) return dollarsToCents(d);
@@ -117,7 +118,6 @@ if (!market) {
     }
   })();
 
-  const derivedAsk = side === "yes" ? ob.yesAsk : ob.noAsk;
   const ask = (snapCents != null) ? snapCents : derivedAsk;
     const mid = (bid != null && ask != null) ? Math.round((bid + ask) / 2) : (bid != null ? bid : ask);
 
@@ -199,7 +199,7 @@ if (!market) {
   const side = dir === "up" ? "yes" : "no";
   const ask = side === "yes" ? ob.yesAsk : ob.noAsk;
   if (ask == null || ask <= 0 || ask >= 99) {
-    console.log("No trade — missing/invalid ask:", ask, "snapCents=", (typeof snapCents!=="undefined"?snapCents:null), "derivedAsk=", derivedAsk);
+    console.log("No trade — missing/invalid ask:", ask, "snapCents=", (typeof snapCents !== "undefined" ? snapCents : null), "derivedAsk=", (typeof derivedAsk !== "undefined" ? derivedAsk : null));
     return;
   }
 
