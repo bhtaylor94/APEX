@@ -80,6 +80,13 @@ async function tryExit(cfg, pos) {
     console.log("No trade — could not determine ticker for orderbook");
     return;
   }
+  // Ensure we have a ticker for orderbook pricing
+  if (!tickerForOB) tickerForOB = resolveTicker();
+  if (!tickerForOB) {
+    console.log("No trade — could not determine ticker for orderbook");
+    return;
+  }
+
 
   const ob = await getOrderbook(pos.ticker);
   const { bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
