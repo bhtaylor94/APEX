@@ -1,4 +1,3 @@
-import fetch from "node-fetch";
 
 export async function getBTCMarkets() {
   const res = await fetch(

@@ -1,4 +1,9 @@
-import fetch from "node-fetch";
+
+// Node 18+ has global fetch. We avoid node-fetch in Actions.
+if (typeof fetch !== "function") {
+  throw new Error("Global fetch not found. Ensure Node 18+.");
+}
+
 
 const URL = process.env.UPSTASH_REDIS_REST_URL;
 const TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;

@@ -44,7 +44,6 @@ jobs:
       - name: Run bot
         run: node scripts/run-bot.js
         env:
-          NODE_OPTIONS: --openssl-legacy-provider
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}

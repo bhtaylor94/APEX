@@ -1,4 +1,3 @@
-import fetch from "node-fetch";
 
 export async function getBTCSignal() {
   const r = await fetch("https://api.coinbase.com/v2/prices/BTC-USD/spot");
