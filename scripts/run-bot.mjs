@@ -300,6 +300,82 @@ async function main() {
   console.log("ORDER RESULT:", res);
 
   // --- Persist bot state (Firebase KV) ---
+  // Handles both executed fills and resting limit orders.
+  // --- Persist bot state (Firebase KV) --- END
+  try {
+    const o = res?.order || null;
+    if (!o?.ticker || !o?.side) {
+      console.log("WARN: KV persist skipped (missing res.order.ticker/side)");
+    } else {
+      const side = String(o.side);
+      const entryPriceCents =
+        side === "yes"
+          ? Number(o.yes_price ?? o.yes_price_fp ?? null)
+          : Number(o.no_price ?? o.no_price_fp ?? null);
+
+      const fillCount = Number(o.fill_count ?? o.fill_count_fp ?? 0);
+      const initialCount = Number(o.initial_count ?? o.initial_count_fp ?? 0);
+      const remainingCount = Number(o.remaining_count ?? o.remaining_count_fp ?? 0);
+      const status = String(o.status || "");
+
+      const priceOk = Number.isFinite(entryPriceCents) && entryPriceCents >= 1 && entryPriceCents <= 99;
+
+      // Always persist last_run (even if resting/unfilled)
+      await kvSetJson("bot:last_run", {
+        ts: Date.now(),
+        action: "order",
+        ticker: o.ticker,
+        side,
+        priceCents: entryPriceCents,
+        status,
+        fillCount,
+        initialCount,
+        remainingCount,
+        orderId: o.order_id || null
+      });
+
+      if (!priceOk) {
+        console.log("WARN: KV persist: bad price", { entryPriceCents, status });
+      } else if (status === "executed" || fillCount > 0) {
+        // Filled -> this is a real open position
+        const posCount = fillCount > 0 ? fillCount : initialCount;
+        if (!Number.isFinite(posCount) || posCount <= 0) {
+          console.log("WARN: bot:position not saved (bad posCount)", { posCount, fillCount, initialCount });
+        } else {
+          await kvSetJson("bot:position", {
+            ticker: o.ticker,
+            side,
+            entryPriceCents,
+            count: posCount,
+            openedTs: Date.now(),
+            orderId: o.order_id || null
+          });
+          // Clear any open_order record for this ticker
+          try { await kvSetJson("bot:open_order", null); } catch {}
+          console.log("Saved bot:position + bot:last_run (filled)");
+        }
+      } else if (status === "resting") {
+        // Unfilled resting order -> track separately
+        await kvSetJson("bot:open_order", {
+          ticker: o.ticker,
+          side,
+          priceCents: entryPriceCents,
+          initialCount,
+          remainingCount,
+          placedTs: Date.now(),
+          orderId: o.order_id || null
+        });
+        console.log("Saved bot:open_order + bot:last_run (resting)");
+      } else {
+        console.log("KV persisted bot:last_run only (status=", status + ")");
+      }
+    }
+  } catch (e) {
+    console.log("WARN: KV persist failed:", e?.message || e);
+  }
+
+
+  // --- Persist bot state (Firebase KV) ---
   // IMPORTANT: persist ONLY from executed order response to avoid scope/name issues.
   try {
     const o = res?.order || null;
@@ -348,36 +424,6 @@ async function main() {
 
 
   // --- Persist run state (Firebase KV) ---
-  try {
-    const lastRun = {
-      ts: Date.now(),
-      action: "entry",
-      ticker: selected?.ticker || null,
-      side,
-      count,
-      entryPriceCents: askCents,
-      edgeCents: edge,
-      mode: cfg.mode || null
-    };
-    await kvSetJson("bot:last_run", lastRun);
-
-    const posObj = {
-      ticker: selected?.ticker || null,
-      side,
-      entryPriceCents: askCents,
-      count,
-      openedTs: Date.now(),
-      orderId: res?.order?.order_id || null
-    };
-    await kvSetJson("bot:position", posObj);
-
-    const verify = await kvGetJson("bot:position");
-    console.log("✅ bot:position persisted =>", verify);
-    console.log("✅ bot:last_run persisted =>", await kvGetJson("bot:last_run"));
-  } catch (e) {
-    console.log("WARN: KV persist failed:", e?.message || e);
-  }
-
   // IMPORTANT: stop here so later cleanup logic cannot accidentally clear bot:position
   return;
 
