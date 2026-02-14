@@ -197,8 +197,21 @@ async function main() {
     bestYesBid, bestNoBid
   });
 
-  if (ask == null || ask <= 0 || ask >= 99) {
-    console.log("No trade — missing/invalid ask:", ask);
+  
+// ALWAYS derive executable prices from orderbook (Kalshi listMarkets often has null asks/bids)
+const ob = await getOrderbook(selected.ticker, 1);
+
+// Kalshi orderbook shape: { yes: [{price,count}...], no: [{price,count}...] }
+const yesAsk = ob?.yes?.[0]?.price ?? null;
+const noAsk  = ob?.no?.[0]?.price  ?? null;
+const bestYesBid = (ob?.yes && ob.yes.length) ? ob.yes[ob.yes.length - 1].price : null;
+const bestNoBid  = (ob?.no  && ob.no.length)  ? ob.no[ob.no.length - 1].price  : null;
+
+console.log("Orderbook pricing:", { yesAsk, noAsk, bestYesBid, bestNoBid });
+if (ask == null || ask <= 0 || ask >= 99) {
+    console.log("const askCents = side === "yes" ? yesAsk : noAsk;
+
+No trade — missing/invalid ask:", ask);
     return;
   }
   if (ask > cfg.maxEntryPriceCents) {
