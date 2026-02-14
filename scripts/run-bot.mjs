@@ -26,10 +26,16 @@ async function pickOpenMarkets(kalshi, seriesTicker){
   return { markets: filtered, used: "ALL_OPEN", method: "fallback" };
 }
 
-import fetch from "node-fetch";
 import { kvGetJson, kvSetJson } from "./kv.js";
 import { getBTCSignal } from "./signal.js";
 import { getBTCMarkets, placeKalshiOrder } from "./kalshi.js";
+
+
+
+// Node 18+ has global fetch. (We intentionally avoid node-fetch in Actions.)
+if (typeof fetch !== "function") {
+  throw new Error("Global fetch not found. Use Node 18+ in GitHub Actions.");
+}
 
 
 async function pickKxBtc15mMarket(kalshi, seriesTicker) {
