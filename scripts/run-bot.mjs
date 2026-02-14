@@ -1,6 +1,6 @@
 import { kvGetJson, kvSetJson } from "./kv.mjs";
 import { getBTCSignal } from "./signal.mjs";
-import { listMarkets, getOrderbook, deriveYesNoFromOrderbook, createOrder } from "./kalshi.mjs";
+import { listMarkets, getOrderbook, createOrder } from "./kalshi.mjs";
 
 function centsToUsd(c) { return (c/100); }
 
@@ -26,6 +26,37 @@ function defaultConfig() {
 }
 
 function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
+
+function deriveYesNoFromOrderbookLocal(ob) {
+  // Kalshi orderbook shapes vary; we handle common forms:
+  // ob.yes / ob.no arrays of { price, count } OR { price_cents } OR nested levels
+  const pickPrice = (lvl) => {
+    if (!lvl) return null;
+    if (typeof lvl.price === "number") return lvl.price;
+    if (typeof lvl.price_cents === "number") return lvl.price_cents;
+    if (typeof lvl[0] === "number") return lvl[0];
+    return null;
+  };
+
+  const yesSide = ob?.yes ?? ob?.orderbook?.yes ?? null;
+  const noSide  = ob?.no  ?? ob?.orderbook?.no  ?? null;
+
+  const yesAsk = pickPrice(yesSide?.[0]) ?? null;
+  const noAsk  = pickPrice(noSide?.[0])  ?? null;
+
+  // Some APIs expose bids separately; if not, leave null
+  const yesBids = ob?.yes_bids ?? ob?.bids_yes ?? ob?.orderbook?.yes_bids ?? null;
+  const noBids  = ob?.no_bids  ?? ob?.bids_no  ?? ob?.orderbook?.no_bids  ?? null;
+
+  const bestYesBid = pickPrice(yesBids?.[0]) ?? null;
+  const bestNoBid  = pickPrice(noBids?.[0])  ?? null;
+
+  return { yesAsk, noAsk, bestYesBid, bestNoBid };
+}
+
+
+
+
 
 async function loadConfig() {
   const cfg = await kvGetJson("bot:config");
@@ -58,7 +89,7 @@ async function tryExit(cfg, pos) {
 
   // Fetch orderbook for the position ticker
   const ob = await getOrderbook(pos.ticker);
-  const { bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
+  const { bestYesBid, bestNoBid } = deriveYesNoFromOrderbookLocal(ob);
 
   const bestBid = (pos.side === "yes") ? bestYesBid : bestNoBid;
   if (bestBid == null) {
@@ -173,7 +204,7 @@ async function main() {
 
   // 5) Derive tradable ask from orderbook (reliable)
   const ob = await getOrderbook(m.ticker);
-  const { yesAsk, noAsk, bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
+  const { yesAsk, noAsk, bestYesBid, bestNoBid } = deriveYesNoFromOrderbookLocal(ob);
 
   const predYes = 50 + Math.round(sig.confidence * 35); // 50..85ish
   const predNo  = 100 - predYes;
@@ -190,9 +221,8 @@ async function main() {
   else { side="no"; ask=noAsk; edge=edgeNo; }
 
   console.log("Selected market:", {
-    ticker: m.ticker,
-    status: m.status,
-    volume: m.volume || 0,
+
+  // --- SNAPSHOT normalized pricing (do NOT rely on orderbook; it can be null) ---
     yesAsk, noAsk,
     bestYesBid, bestNoBid
   });
