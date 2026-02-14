@@ -1,6 +1,7 @@
 import { kvGetJson, kvSetJson } from "./kv.js";
 import { getBTCSignal } from "./signal.js";
 import { getMarkets, getOrderbook, placeOrder } from "./kalshi.js";
+import { getOrderbookDepth } from "./kalshi.js";
 
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
@@ -134,6 +135,133 @@ async function pickBestCandidate({ seriesTicker, pYes, maxEntryPriceCents }) {
   return best;
 }
 
+async function getOpenPosition() {
+  return (await kvGetJson("bot:position")) || null;
+}
+
+async function setOpenPosition(pos) {
+  await kvSetJson("bot:position", pos);
+}
+
+async function clearOpenPosition() {
+  await kvSetJson("bot:position", null);
+}
+
+function pct(n) {
+  return Math.round(n * 1000) / 10; // 1 decimal percent
+}
+
+function validBid(v) {
+  const n = (typeof v === "number") ? v : null;
+  if (!n) return null;
+  if (n < 1 || n >= 99) return null;
+  return n;
+}
+
+async function getBestBidForSide(ticker, side, marketSnapshot) {
+  // Prefer snapshot bid if available
+  const snapBid = side === "yes" ? validBid(marketSnapshot?.yes_bid) : validBid(marketSnapshot?.no_bid);
+  if (snapBid) return { bidCents: snapBid, source: "snapshot" };
+
+  // Fallback: orderbook top bid
+  const ob = await getOrderbookDepth(ticker, 1);
+  const book = ob?.orderbook || ob?.order_book || null;
+
+  const yesBids = book?.yes_bids || [];
+  const noBids  = book?.no_bids  || [];
+
+  const obBid = side === "yes"
+    ? validBid(yesBids?.[0]?.price ?? null)
+    : validBid(noBids?.[0]?.price ?? null);
+
+  return { bidCents: obBid || null, source: obBid ? "orderbook" : "none" };
+}
+
+async function maybeExitPosition({ cfg, kalshiMarketSnapshot }) {
+  const pos = await getOpenPosition();
+  if (!pos) return { exited: false };
+
+  const side = pos.side;
+  const ticker = pos.ticker;
+  const entry = Number(pos.entryPriceCents || 0);
+  const count = Number(pos.count || 0);
+
+  if (!ticker || !entry || !count) {
+    console.log("Position invalid — clearing.");
+    await clearOpenPosition();
+    return { exited: false };
+  }
+
+  const takeProfitPct = Number(cfg.takeProfitPct ?? 0.20);
+  const stopLossPct   = Number(cfg.stopLossPct   ?? 0.12);
+
+  const bid = await getBestBidForSide(ticker, side, kalshiMarketSnapshot);
+  if (!bid.bidCents) {
+    console.log("Exit check — no valid bid yet (" + bid.source + "). Holding position.");
+    return { exited: false };
+  }
+
+  const pnlCentsPer = bid.bidCents - entry;
+  const pnlPct = pnlCentsPer / entry;
+
+  console.log(
+    "OPEN POSITION:",
+    side.toUpperCase(),
+    count + "x",
+    ticker,
+    "entry=" + entry + "¢",
+    "bestBid=" + bid.bidCents + "¢ (" + bid.source + ")",
+    "PnL=" + (pnlCentsPer >= 0 ? "+" : "") + pnlCentsPer + "¢/ct",
+    "(" + (pnlPct >= 0 ? "+" : "") + pct(pnlPct) + "%)"
+  );
+
+  const hitTP = pnlPct >= takeProfitPct;
+  const hitSL = pnlPct <= -stopLossPct;
+
+  if (!hitTP && !hitSL) {
+    console.log("No exit — TP/SL not hit. TP=" + pct(takeProfitPct) + "% SL=-" + pct(stopLossPct) + "%");
+    return { exited: false };
+  }
+
+  const reason = hitTP ? "TAKE_PROFIT" : "STOP_LOSS";
+  const actionLine = "SELL " + side.toUpperCase() + " " + count + "x " + ticker + " @ " + bid.bidCents + "¢ (reason=" + reason + ", mode=" + cfg.mode + ")";
+  console.log("EXIT:", actionLine);
+
+  if (String(cfg.mode || "paper").toLowerCase() !== "live") {
+    console.log("PAPER MODE — would exit:", actionLine);
+    await kvSetJson("bot:last_run", {
+      ts: Date.now(),
+      action: "paper_exit",
+      reason,
+      marketTicker: ticker,
+      side,
+      count,
+      entryPriceCents: entry,
+      exitPriceCents: bid.bidCents
+    });
+    await clearOpenPosition();
+    return { exited: true };
+  }
+
+  const res = await placeOrder({ ticker, side, count, priceCents: bid.bidCents, action: "sell" });
+  console.log("EXIT ORDER RESULT:", res);
+
+  await kvSetJson("bot:last_run", {
+    ts: Date.now(),
+    action: "live_exit",
+    reason,
+    marketTicker: ticker,
+    side,
+    count,
+    entryPriceCents: entry,
+    exitPriceCents: bid.bidCents,
+    order: res?.order || null
+  });
+
+  await clearOpenPosition();
+  return { exited: true };
+}
+
 async function main() {
   const cfg = (await kvGetJson("bot:config")) || {};
   const enabled = !!cfg.enabled;
@@ -157,6 +285,23 @@ async function main() {
 
   const sig = await getBTCSignal();
   console.log("SIGNAL:", sig);
+// --- Exit management (sell-to-close) ---
+  // If we already have an open position, manage it first.
+  try {
+    // best effort snapshot for the position ticker (optional; may not exist)
+    const exitAttempt = await maybeExitPosition({ cfg: { ...cfg, mode }, kalshiMarketSnapshot: null });
+    if (exitAttempt.exited) {
+      console.log("Exited position — skipping new entry this run.");
+      return;
+    }
+    const existing = await getOpenPosition();
+    if (existing) {
+      console.log("Holding open position — skipping new entry this run.");
+      return;
+    }
+  } catch (e) {
+    console.log("Exit manager error (non-fatal):", e?.message || e);
+  }
 
   const direction = String(sig.direction || "none").toLowerCase();
   const confidence = Number(sig.confidence || 0);
@@ -242,7 +387,24 @@ async function main() {
   const res = await placeOrder({ ticker: best.ticker, side: best.side, count, priceCents: best.askCents });
   console.log("ORDER RESULT:", res);
 
-  out.action = "live";
+  
+  // Persist open position for autonomous sell-to-close
+  try {
+    if (String(mode).toLowerCase() === "live") {
+      await setOpenPosition({
+        ticker: best.ticker,
+        side: best.side,
+        entryPriceCents: best.askCents,
+        count,
+        openedTs: Date.now(),
+        orderId: res?.order?.order_id || null
+      });
+      console.log("Saved bot:position");
+    }
+  } catch (e) {
+    console.log("Failed saving bot:position (non-fatal):", e?.message || e);
+  }
+out.action = "live";
   out.count = count;
   out.order = res?.order || null;
   await kvSetJson("bot:last_run", out);

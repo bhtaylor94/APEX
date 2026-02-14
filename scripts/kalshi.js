@@ -81,18 +81,20 @@ export async function getOrderbook(ticker, depth = 1) {
   return kalshiFetch("/trade-api/v2/markets/" + encodeURIComponent(ticker) + "/orderbook?" + qs.toString(), { method: "GET", auth: true });
 }
 
-export async function placeOrder({ ticker, side, count, priceCents }) {
-  // side must be "yes" or "no"
+export async function placeOrder({ ticker, side, count, priceCents, action = "buy" }) {
+  // side: "yes" | "no"
+  // action: "buy" | "sell"
   if (side !== "yes" && side !== "no") throw new Error("Invalid side: " + side);
+  if (action !== "buy" && action !== "sell") throw new Error("Invalid action: " + action);
   if (!Number.isFinite(count) || count <= 0) throw new Error("Invalid count: " + count);
   if (!Number.isFinite(priceCents) || priceCents <= 0 || priceCents >= 99) {
     throw new Error("Invalid priceCents: " + priceCents);
   }
 
-  // IMPORTANT: Kalshi requires EXACTLY ONE of yes_price/no_price
+  // IMPORTANT: Kalshi requires EXACTLY ONE of yes_price/no_price per order.
   const body = {
     ticker,
-    action: "buy",
+    action,
     type: "limit",
     side,
     count,
@@ -106,3 +108,13 @@ export async function placeOrder({ ticker, side, count, priceCents }) {
 }
 
 
+
+
+export async function getOrderbookDepth(ticker, depth = 1) {
+  // Kalshi orderbook endpoint. We keep this thin and use existing kalshiFetch.
+  // Some repos already have getOrderbook(ticker, depth). This provides a stable name.
+  return kalshiFetch("/trade-api/v2/markets/" + encodeURIComponent(ticker) + "/orderbook?depth=" + String(depth), {
+    method: "GET",
+    auth: true
+  });
+}
