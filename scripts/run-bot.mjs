@@ -88,7 +88,22 @@ async function tryExit(cfg, pos) {
   }
 
 
-  const ob = await getOrderbook(pos.ticker);
+  const ob = await 
+  // ensure orderbook ticker is always available (no TDZ)
+  if (!tickerForOB) {
+    tickerForOB = (
+      ((typeof selectedMarket !== 'undefined') && selectedMarket && selectedMarket.ticker) ||
+      ((typeof selected !== 'undefined') && selected && selected.ticker) ||
+      ((typeof market !== 'undefined') && market && market.ticker) ||
+      null
+    );
+  }
+  if (!tickerForOB) {
+    console.log('No trade — could not determine ticker for orderbook');
+    return;
+  }
+
+getOrderbook(pos.ticker);
   const { bestYesBid, bestNoBid } = deriveYesNoFromOrderbook(ob);
 
   const bestBid = (pos.side === "yes") ? bestYesBid : bestNoBid;
@@ -234,8 +249,7 @@ async function main() {
   if (!tickerForOB) { console.log("No trade — could not determine ticker for orderbook."); return; }
 
   // Robust ticker resolution (prevents ReferenceError if a name doesn't exist in this scope)
-  const tickerForOB =
-    ((typeof selectedMarket !== "undefined") && selectedMarket && selectedMarket.ticker) ||
+tickerForOB = ((typeof selectedMarket !== "undefined") && selectedMarket && selectedMarket.ticker) ||
     ((typeof selected !== "undefined") && selected && selected.ticker) ||
     ((typeof market !== "undefined") && market && market.ticker) ||
     ((typeof picked !== "undefined") && picked && picked.ticker) ||
