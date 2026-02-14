@@ -1,5 +1,18 @@
+import { kalshiFetch } from "./kalshi.js";
 import { kvGetJson, kvSetJson } from "./kv.mjs";
 import { getMarkets, getMarket, getOrderbook, placeOrder } from "./kalshi_client.mjs";
+function obBestBid(ob, side) {
+  // Orderbook shape in your logs:
+  // ob.orderbook.yes = [[priceCents, size], ...]
+  // ob.orderbook.no  = [[priceCents, size], ...]
+  const book = ob && ob.orderbook ? ob.orderbook : null;
+  const arr = side === "yes" ? (book && Array.isArray(book.yes) ? book.yes : []) : (book && Array.isArray(book.no) ? book.no : []);
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  const p = Number(arr[0] && arr[0][0]);
+  return Number.isFinite(p) ? p : null;
+}
+
+
 
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
@@ -123,7 +136,31 @@ if (!pos) return { exited:false, holding:false };
 placeOrder({ ticker, side, count, priceCents: bid.bidCents, action: "sell", tif: "immediate_or_cancel", postOnly: false });
   console.log("EXIT ORDER RESULT:", res);
 
-  try { await kvSetJson("bot:position", null); } catch {}
+// Re-check exit order status (response may show resting even if it fills a moment later)
+try {
+  const oid = res && res.order ? (res.order.order_id || res.order.orderId) : null;
+  if (oid) {
+    const chk = await kalshiFetch("/trade-api/v2/portfolio/orders/" + oid, { method: "GET", auth: true });
+    const st = chk && chk.order ? chk.order.status : null;
+    console.log("Re-check exit order status:", st);
+
+    // If not executed yet, keep position so we manage it next run
+    if (st && st !== "executed") {
+      console.log("Exit not filled yet — keeping position for next run.");
+      try {
+        const cur = await kvGetJson("bot:position");
+        if (cur && typeof cur === "object") {
+          cur.exitOrderId = oid;
+          await kvSetJson("bot:position", cur);
+        }
+      } catch {}
+      return { exited: false };
+    }
+  }
+} catch (e) {
+  console.log("Exit re-check failed (non-fatal):", e && e.message ? e.message : e);
+}
+try { await kvSetJson("bot:position", null); } catch {}
   return { exited:true, holding:false };
 }
 
