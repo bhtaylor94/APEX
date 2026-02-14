@@ -3,6 +3,22 @@ import { kvGetJson, kvSetJson } from "./upstash_kv.mjs";
 import { KalshiClient } from "./kalshi_client.mjs";
 import { fetchCoinbaseCandles, computeSignal } from "./btc_signal.mjs";
 
+
+async function fetchBtc15mUpDownMarkets(kalshi) {
+  const all = await kalshi.listMarkets({ status: "open", limit: 500 });
+  const markets = (all?.markets || []).filter(m => {
+    const t = ((m.title || "") + " " + (m.subtitle || "")).toLowerCase();
+    // Match "BTC Up or Down - 15 minutes"
+    return (t.includes("btc") || t.includes("bitcoin")) && t.includes("15") && t.includes("up") && t.includes("down");
+  });
+
+  // Sort by volume if present (best liquidity first)
+  markets.sort((a,b) => (Number(b.volume || 0) - Number(a.volume || 0)));
+
+  return markets;
+}
+
+
 function nowMs() { return Date.now(); }
 function dayKey() { return new Date().toISOString().slice(0,10); }
 function clamp(n,a,b){ return Math.max(a, Math.min(b, n)); }
