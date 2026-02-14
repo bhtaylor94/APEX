@@ -1,6 +1,5 @@
-import { kvGetJson, kvSetJson } from "./kv.mjs";
 import { getMarkets, getMarket, getOrderbook, placeOrder } from "./kalshi_client.mjs";
-
+import { kvGetJson, kvSetJson } from "./kv.js";
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
 function validPx(v) {
@@ -313,7 +312,9 @@ async function main() {
     });
     console.log("Saved bot:position");
   } catch (e) {
-    console.log("WARN: bot:position not saved (Upstash token likely read-only):", e?.message || e);
+    console.log("WARN: bot:position not saved (KV write failed):", e?.message || e);
+
+
   }
 }
 
