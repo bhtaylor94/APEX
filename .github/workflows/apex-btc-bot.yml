@@ -1,8 +1,8 @@
-name: Apex BTC Bot
+name: Apex BTC Bot (Clean)
 
 on:
   schedule:
-    - cron: "*/1 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -13,13 +13,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 18
-      - run: npm install
-      - run: node scripts/run-bot.js
+      - run: node scripts/run-bot-clean.mjs
         env:
-          KALSHI_API_BASE_URL: https://api.elections.kalshi.com/trade-api/v2
-
-          NODE_OPTIONS: --openssl-legacy-provider
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+          KALSHI_ENV: ${{ secrets.KALSHI_ENV }}

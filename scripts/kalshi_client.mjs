@@ -1,105 +1,107 @@
-function loadPemKey(raw) {
-  if (!raw) return "";
-  // If user stored key with literal \n, fix it
-  let k = String(raw).trim().replace(/\\n/g, "\n");
-
-  // If it's base64 (no PEM header), decode
-  if (!k.includes("BEGIN") && /^[A-Za-z0-9+/=\r\n]+$/.test(k) && k.length > 200) {
-    try {
-      const buf = Buffer.from(k.replace(/\s+/g, ""), "base64");
-      const decoded = buf.toString("utf8");
-      if (decoded.includes("BEGIN")) k = decoded.trim();
-    } catch {}
-  }
-
-  // Ensure it looks like PEM
-  return k;
-}
-
 import crypto from "crypto";
 
-function normalizePem(pem) {
-  if (!pem) return "";
-  const trimmed = pem.trim();
+const ENV = String(process.env.KALSHI_ENV || process.env.NEXT_PUBLIC_KALSHI_ENV || "prod").toLowerCase();
 
-  if (trimmed.includes("\\n")) return trimmed.replace(/\\n/g, "\n");
+// Kalshi docs: demo uses demo-api.kalshi.co.
+// Production host in Kalshi docs varies by product; APEX has been using trade-api/v2 under api.elections.kalshi.com.
+// We’ll keep that to match what you were successfully trading against.
+const BASE =
+  (ENV === "demo" || ENV === "sandbox")
+    ? "https://demo-api.kalshi.co"
+    : "https://api.elections.kalshi.com";
 
-  if (trimmed.includes("BEGIN") && trimmed.includes("END") && !trimmed.includes("\n")) {
-    const m = trimmed.match(/(-----BEGIN [^-]+-----)(.+)(-----END [^-]+-----)/);
-    if (!m) return trimmed;
-    const head = m[1];
-    const body = m[2].replace(/\s+/g, "");
-    const tail = m[3];
-    const wrapped = body.match(/.{1,64}/g)?.join("\n") || body;
-    return [head, wrapped, tail].join("\n");
-  }
+const API_KEY_ID = process.env.KALSHI_API_KEY_ID || "";
+const PRIVATE_KEY_PEM = process.env.KALSHI_PRIVATE_KEY || "";
 
-  return trimmed;
+function mustEnv(name, v) {
+  if (!v) throw new Error("Missing env: " + name);
+  return v;
 }
 
-export class KalshiClient {
-  constructor() {
-    this.keyId = process.env.KALSHI_API_KEY_ID || "";
-    this.env = (process.env.KALSHI_ENV || "prod").toLowerCase();
-    this.baseUrl =
-      this.env === "demo"
-        ? "https://demo-api.kalshi.co/trade-api/v2"
-        : "https://api.elections.kalshi.com/trade-api/v2";
+function signKalshi({ timestampMs, method, path }) {
+  const keyId = mustEnv("KALSHI_API_KEY_ID", API_KEY_ID);
+  const pem = mustEnv("KALSHI_PRIVATE_KEY", PRIVATE_KEY_PEM);
 
-    const pem = normalizePem(process.env.KALSHI_PRIVATE_KEY || "");
-    if (!this.keyId || !pem) throw new Error("Missing Kalshi credentials (KALSHI_API_KEY_ID/KALSHI_PRIVATE_KEY)");
-    this.privateKey = crypto.createPrivateKey(loadPemKey(process.env.KALSHI_PRIVATE_KEY));
+  const pathNoQuery = path.split("?")[0];
+  const msg = String(timestampMs) + method.toUpperCase() + pathNoQuery;
+
+  const signature = crypto.sign("sha256", Buffer.from(msg, "utf8"), {
+    key: pem,
+    padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+    saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST
+  });
+
+  return { keyId, sigB64: signature.toString("base64") };
+}
+
+export async function kalshiFetch(path, { method = "GET", body = null, auth = true } = {}) {
+  const url = BASE + path;
+
+  const headers = {
+    "Content-Type": "application/json",
+    "User-Agent": "apex-bot/1.0"
+  };
+
+  if (auth) {
+    const ts = Date.now();
+    const sig = signKalshi({ timestampMs: ts, method, path });
+    headers["KALSHI-ACCESS-KEY"] = sig.keyId;
+    headers["KALSHI-ACCESS-TIMESTAMP"] = String(ts);
+    headers["KALSHI-ACCESS-SIGNATURE"] = sig.sigB64;
   }
 
-  sign(method, pathNoQuery, tsMs) {
-    const payload = [tsMs, method.toUpperCase(), pathNoQuery].join("");
-    const signer = crypto.createSign("RSA-SHA256");
-    signer.update(payload);
-    signer.end();
-    return signer.sign(this.privateKey, "base64");
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined
+  });
+
+  const txt = await res.text();
+  let data = null;
+  try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+
+  if (!res.ok) {
+    throw new Error("Kalshi " + method + " " + path + " failed (" + res.status + "): " + txt);
   }
+  return data;
+}
 
-  async request(method, path, bodyObj) {
-    const tsMs = Date.now().toString();
-    const pathNoQuery = path.split("?")[0];
-    const sig = this.sign(method, pathNoQuery, tsMs);
+export async function getMarkets({ series_ticker, status = "open", limit = 200, cursor = null, mve_filter = "exclude" } = {}) {
+  const qs = new URLSearchParams();
+  if (series_ticker) qs.set("series_ticker", series_ticker);
+  if (status) qs.set("status", status);
+  if (mve_filter) qs.set("mve_filter", mve_filter);
+  qs.set("limit", String(limit));
+  if (cursor) qs.set("cursor", cursor);
+  return kalshiFetch("/trade-api/v2/markets?" + qs.toString(), { method: "GET", auth: true });
+}
 
-    const headers = {
-      "Content-Type": "application/json",
-      "KALSHI-ACCESS-KEY": this.keyId,
-      "KALSHI-ACCESS-TIMESTAMP": tsMs,
-      "KALSHI-ACCESS-SIGNATURE": sig
-    };
+export async function getMarket(ticker) {
+  return kalshiFetch("/trade-api/v2/markets/" + encodeURIComponent(ticker), { method: "GET", auth: true });
+}
 
-    const res = await fetch(this.baseUrl + path, {
-      method,
-      headers,
-      body: bodyObj ? JSON.stringify(bodyObj) : undefined
-    });
+export async function getOrderbook(ticker, depth = 1) {
+  const qs = new URLSearchParams({ depth: String(depth) });
+  return kalshiFetch("/trade-api/v2/markets/" + encodeURIComponent(ticker) + "/orderbook?" + qs.toString(), { method: "GET", auth: true });
+}
 
-    const text = await res.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
+export async function placeOrder({ ticker, side, count, priceCents, action = "buy" }) {
+  if (side !== "yes" && side !== "no") throw new Error("Invalid side: " + side);
+  if (action !== "buy" && action !== "sell") throw new Error("Invalid action: " + action);
+  if (!Number.isFinite(count) || count <= 0) throw new Error("Invalid count: " + count);
+  if (!Number.isFinite(priceCents) || priceCents < 1 || priceCents > 99) throw new Error("Invalid priceCents: " + priceCents);
 
-    if (!res.ok) {
-      const msg = data?.error || data?.message || JSON.stringify(data);
-      throw new Error([method, path, res.status, msg].join(" "));
-    }
-    return data;
-  }
+  // ✅ EXACTLY ONE of yes_price / no_price
+  const body = {
+    ticker,
+    action,
+    type: "limit",
+    side,
+    count,
+    client_order_id: ""
+  };
+  if (side === "yes") body.yes_price = priceCents;
+  if (side === "no")  body.no_price  = priceCents;
 
-  getMarkets({ series_ticker, status="open", limit=50 } = {}) {
-    const qs = new URLSearchParams();
-    if (series_ticker) qs.set("series_ticker", series_ticker);
-    if (status) qs.set("status", status);
-    qs.set("limit", String(limit));
-    return this.request("GET", "/markets?" + qs.toString());
-  }
-
-  createOrder({ ticker, type="market", action="buy", side="yes", count, priceCents }) {
-    const payload = { ticker, type, action, side, count };
-    if (side === "yes") payload.yes_price = priceCents;
-    if (side === "no") payload.no_price = priceCents;
-    return this.request("POST", "/portfolio/orders", payload);
-  }
+  return kalshiFetch("/trade-api/v2/portfolio/orders", { method: "POST", body, auth: true });
 }
