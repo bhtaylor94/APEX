@@ -7,13 +7,17 @@ export function defaultConfig() {
     seriesTicker: "kxbtc15m",
 
     tradeSizeUsd: 5,
+    maxContracts: 5,
     maxOpenPositions: 1,
 
     minConfidence: 0.55,
+    minEdge: 5,
 
-    // No TP/SL — contracts settle at $1 or $0. Risk controlled by position sizing.
+    // Exit strategy: take profit at +15c, stop loss at -20c
+    takeProfitCents: 15,
+    stopLossCents: 20,
 
-    // Price band: only trade contracts priced 35¢–80¢
+    // Price band: only trade contracts priced 35c-80c
     minEntryPriceCents: 35,
     maxEntryPriceCents: 80,
 

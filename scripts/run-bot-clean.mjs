@@ -1,5 +1,5 @@
 import { kvGetJson, kvSetJson } from "./kv.js";
-import { getMarkets, getMarket, getOrderbook, placeOrder } from "./kalshi_client.mjs";
+import { getMarkets, getMarket, getOrderbook, placeOrder, kalshiFetch } from "./kalshi_client.mjs";
 
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
@@ -161,10 +161,10 @@ async function getSignal() {
   const downVotes = Object.values(indicators).filter(v => v === -1).length;
 
   console.log("INDICATORS:", {
-    rsi: rsiVal.toFixed(1) + " → " + indicators.rsi,
-    macd: macdVal.histogram.toFixed(2) + " → " + indicators.macd,
-    bb: (bb ? bb.percentB.toFixed(3) : "n/a") + " → " + indicators.bb,
-    obImbalance: obImbalance.ratio.toFixed(3) + " → " + indicators.obImbalance,
+    rsi: rsiVal.toFixed(1) + " -> " + indicators.rsi,
+    macd: macdVal.histogram.toFixed(2) + " -> " + indicators.macd,
+    bb: (bb ? bb.percentB.toFixed(3) : "n/a") + " -> " + indicators.bb,
+    obImbalance: obImbalance.ratio.toFixed(3) + " -> " + indicators.obImbalance,
     upVotes, downVotes,
   });
 
@@ -178,13 +178,10 @@ async function getSignal() {
     return { direction: "down", confidence: Math.min(confidence, 0.85), price, indicators };
   }
 
-  console.log("No trade — indicators disagree (UP=" + upVotes + " DOWN=" + downVotes + ")");
+  console.log("No trade -- indicators disagree (UP=" + upVotes + " DOWN=" + downVotes + ")");
   return { direction: "neutral", confidence: 0, price, indicators };
 }
 
-
-// Exit logic removed — contracts settle at $1 or $0 in 15 minutes.
-// Risk is controlled purely through position sizing (tradeSizeUsd / maxContracts).
 
 function probYesFromSignal(direction, confidence) {
   const c = clamp(Number(confidence || 0), 0, 1);
@@ -231,6 +228,180 @@ async function getExecutablePrices(ticker) {
   return { yesAsk: null, noAsk: null, yesBid: null, noBid: null, source: "none" };
 }
 
+// ── Kalshi position checker (source of truth) ──
+
+async function getKalshiPositions() {
+  try {
+    const data = await kalshiFetch("/trade-api/v2/portfolio/positions?limit=100&settlement_status=unsettled", { method: "GET" });
+    return data?.market_positions || data?.positions || [];
+  } catch (e) {
+    console.log("Failed to fetch Kalshi positions:", e?.message || e);
+    return [];
+  }
+}
+
+// ── Exit strategy ──
+
+async function maybeExitPosition(pos, cfg) {
+  const ticker = pos.ticker;
+  const side = pos.side;
+  const entryPrice = pos.entryPriceCents;
+  const count = pos.count;
+
+  // Check if market is still open
+  let market;
+  try {
+    const m = await getMarket(ticker);
+    market = m?.market || m;
+  } catch (e) {
+    console.log("Cannot fetch market for exit check:", e?.message || e);
+    return false; // can't check, hold
+  }
+
+  const status = market?.status || market?.result;
+  if (status === "settled" || status === "closed") {
+    console.log("Market already settled/closed. Clearing position.");
+    await kvSetJson("bot:position", null);
+    return true; // position cleared
+  }
+
+  // Get current prices
+  const px = await getExecutablePrices(ticker);
+  const currentBid = side === "yes" ? px.yesBid : px.noBid;
+
+  if (!currentBid) {
+    console.log("No bid available for exit. Holding position.");
+    return false;
+  }
+
+  // Calculate time remaining
+  const closeTs = market.close_time ? new Date(market.close_time).getTime()
+    : market.expiration_time ? new Date(market.expiration_time).getTime() : 0;
+  const minsLeft = closeTs > 0 ? (closeTs - Date.now()) / 60000 : 999;
+
+  const profitCents = currentBid - entryPrice;
+  const profitPct = (profitCents / entryPrice) * 100;
+
+  console.log("EXIT CHECK:", {
+    ticker,
+    side: side.toUpperCase(),
+    entry: entryPrice + "c",
+    currentBid: currentBid + "c",
+    profitCents: (profitCents >= 0 ? "+" : "") + profitCents + "c",
+    profitPct: profitPct.toFixed(1) + "%",
+    minsLeft: minsLeft.toFixed(1),
+    count,
+  });
+
+  // Exit rules:
+  // 1. TAKE PROFIT: sell if bid >= entry + 15c (lock in meaningful profit)
+  const takeProfitThreshold = Number(cfg.takeProfitCents ?? 15);
+  if (profitCents >= takeProfitThreshold) {
+    console.log("TAKE PROFIT: +" + profitCents + "c >= +" + takeProfitThreshold + "c threshold");
+    return await executeSell(ticker, side, count, currentBid, cfg.mode);
+  }
+
+  // 2. STOP LOSS: sell if bid <= entry - 20c (cut losses before total wipeout)
+  const stopLossThreshold = Number(cfg.stopLossCents ?? 20);
+  if (profitCents <= -stopLossThreshold) {
+    console.log("STOP LOSS: " + profitCents + "c <= -" + stopLossThreshold + "c threshold");
+    return await executeSell(ticker, side, count, currentBid, cfg.mode);
+  }
+
+  // 3. TIME EXIT: if < 3 minutes left and losing, sell to salvage capital
+  if (minsLeft < 3 && profitCents < -5) {
+    console.log("TIME EXIT: <3 min left and losing " + profitCents + "c. Selling to salvage.");
+    return await executeSell(ticker, side, count, currentBid, cfg.mode);
+  }
+
+  console.log("HOLDING position. No exit trigger met.");
+  return false;
+}
+
+async function executeSell(ticker, side, count, priceCents, mode) {
+  const line = "SELL " + side.toUpperCase() + " " + count + "x " + ticker + " @ " + priceCents + "c";
+
+  if (mode !== "live") {
+    console.log("PAPER SELL:", line);
+    await kvSetJson("bot:position", null);
+    return true;
+  }
+
+  try {
+    const res = await placeOrder({
+      ticker,
+      side,
+      count,
+      priceCents,
+      action: "sell",
+    });
+    console.log("SELL ORDER:", line);
+    console.log("SELL RESULT:", res);
+    await kvSetJson("bot:position", null);
+    return true;
+  } catch (e) {
+    console.log("SELL FAILED:", e?.message || e);
+    return false;
+  }
+}
+
+// ── Daily P&L tracking ──
+
+async function checkDailyLimits(cfg) {
+  const state = (await kvGetJson("bot:dailyState")) || {};
+  const today = new Date().toISOString().slice(0, 10);
+
+  if (state.date !== today) {
+    // New day, reset counters
+    await kvSetJson("bot:dailyState", { date: today, trades: 0, pnlCents: 0 });
+    return { ok: true, trades: 0, pnlCents: 0 };
+  }
+
+  const trades = state.trades || 0;
+  const pnlCents = state.pnlCents || 0;
+  const maxTrades = Number(cfg.maxTradesPerDay ?? 10);
+  const maxLossCents = Math.round((Number(cfg.dailyMaxLossUsd ?? 25)) * 100);
+
+  if (trades >= maxTrades) {
+    console.log("DAILY LIMIT: " + trades + "/" + maxTrades + " trades. Stopping.");
+    return { ok: false, trades, pnlCents };
+  }
+
+  if (pnlCents <= -maxLossCents) {
+    console.log("DAILY LOSS LIMIT: $" + (pnlCents / 100).toFixed(2) + " (max -$" + (maxLossCents / 100).toFixed(2) + "). Stopping.");
+    return { ok: false, trades, pnlCents };
+  }
+
+  return { ok: true, trades, pnlCents };
+}
+
+async function recordTrade(costCents) {
+  const state = (await kvGetJson("bot:dailyState")) || {};
+  const today = new Date().toISOString().slice(0, 10);
+  if (state.date !== today) {
+    await kvSetJson("bot:dailyState", { date: today, trades: 1, pnlCents: -costCents });
+  } else {
+    state.trades = (state.trades || 0) + 1;
+    state.pnlCents = (state.pnlCents || 0) - costCents;
+    await kvSetJson("bot:dailyState", state);
+  }
+}
+
+// ── Cooldown check ──
+
+async function checkCooldown(cfg) {
+  const cooldownMs = (Number(cfg.cooldownMinutes ?? 8)) * 60 * 1000;
+  const lastTrade = await kvGetJson("bot:lastTradeTs");
+  if (lastTrade && (Date.now() - lastTrade) < cooldownMs) {
+    const secsLeft = Math.round((cooldownMs - (Date.now() - lastTrade)) / 1000);
+    console.log("COOLDOWN: " + secsLeft + "s remaining. Skipping.");
+    return false;
+  }
+  return true;
+}
+
+// ── Main ──
+
 async function main() {
   const cfg = (await kvGetJson("bot:config")) || {};
 
@@ -250,29 +421,79 @@ async function main() {
     enabled, mode, seriesTicker,
     tradeSizeUsd, maxContracts,
     minConfidence, minEdge,
-    priceband: minEntryPriceCents + "¢–" + maxEntryPriceCents + "¢",
+    priceband: minEntryPriceCents + "c-" + maxEntryPriceCents + "c",
     minMinutesToCloseToEnter,
   });
 
-  if (!enabled) return console.log("Bot disabled — exiting.");
+  if (!enabled) return console.log("Bot disabled -- exiting.");
 
-  // Check if we already have an open position — skip entry if so (let it settle)
-  try {
-    const pos = await kvGetJson("bot:position");
-    if (pos && pos.ticker) {
-      console.log("HOLDING position — letting it settle:", pos.side?.toUpperCase(), pos.count + "x", pos.ticker, "entry=" + pos.entryPriceCents + "¢");
-      return;
+  // ── Step 1: Check for existing position & handle exits ──
+
+  let pos = await kvGetJson("bot:position");
+
+  // Cross-check with Kalshi's actual positions (source of truth)
+  const kalshiPositions = await getKalshiPositions();
+  const seriesPrefix = seriesTicker + "-";
+  const relevantPositions = kalshiPositions.filter(p =>
+    p.ticker?.startsWith(seriesPrefix) && (p.total_traded > 0 || p.quantity > 0)
+  );
+
+  if (pos && pos.ticker) {
+    // We think we have a position — verify it still exists on Kalshi
+    const stillOnKalshi = relevantPositions.some(p => p.ticker === pos.ticker);
+
+    if (!stillOnKalshi) {
+      // Position settled or was sold. Clear it.
+      console.log("Position " + pos.ticker + " no longer on Kalshi (settled). Clearing.");
+      await kvSetJson("bot:position", null);
+      pos = null;
+    } else {
+      // Position still open — check exit strategy
+      console.log("HOLDING:", pos.side?.toUpperCase(), pos.count + "x", pos.ticker, "entry=" + pos.entryPriceCents + "c");
+      const exited = await maybeExitPosition(pos, { ...cfg, mode });
+      if (exited) {
+        console.log("Exited position. Will look for new entries next run.");
+      }
+      return; // Don't enter new trades while holding
     }
-  } catch (e) {
-    console.log("Position check error (non-fatal):", e?.message || e);
+  } else if (relevantPositions.length > 0) {
+    // We don't have a recorded position but Kalshi says we do — sync it
+    const kp = relevantPositions[0];
+    const side = (kp.market_position || kp.position || "yes").toLowerCase();
+    console.log("ORPHAN POSITION detected on Kalshi:", side.toUpperCase(), (kp.total_traded || kp.quantity) + "x", kp.ticker);
+    pos = {
+      ticker: kp.ticker,
+      side,
+      entryPriceCents: 50, // unknown entry price, estimate middle
+      count: kp.total_traded || kp.quantity || 1,
+      openedTs: Date.now(),
+      orderId: null,
+    };
+    await kvSetJson("bot:position", pos);
+    // Check exit on this orphan
+    const exited = await maybeExitPosition(pos, { ...cfg, mode });
+    if (!exited) console.log("Holding orphan position. Will check exit next run.");
+    return;
   }
+
+  // ── Step 2: Pre-entry checks ──
+
+  const dailyCheck = await checkDailyLimits(cfg);
+  if (!dailyCheck.ok) return;
+
+  const cooldownOk = await checkCooldown(cfg);
+  if (!cooldownOk) return;
+
+  // ── Step 3: Generate signal ──
 
   const sig = await getSignal();
   console.log("SIGNAL:", sig);
 
   const confidence = Number(sig.confidence || 0);
   if (confidence < minConfidence) {
-    console.log("No trade — confidence too low:", confidence, "<", minConfidence);
+    console.log("No trade -- confidence too low:", confidence, "<", minConfidence);
+    // Save signal state for dashboard
+    await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });
     return;
   }
 
@@ -280,9 +501,11 @@ async function main() {
   const predYes = clamp(Math.round(pYes * 100), 1, 99);
   const predNo = 100 - predYes;
 
+  // ── Step 4: Find best market ──
+
   const resp = await getMarkets({ series_ticker: seriesTicker, status: "open", limit: 200, mve_filter: "exclude" });
   const markets = Array.isArray(resp?.markets) ? resp.markets : [];
-  console.log("Markets source: series(" + seriesTicker + ") — found:", markets.length);
+  console.log("Markets source: series(" + seriesTicker + ") -- found:", markets.length);
 
   const prefix = seriesTicker + "-";
   const now = Date.now();
@@ -305,6 +528,7 @@ async function main() {
 
   if (!candidates.length) {
     console.log("No tradable markets found (after prefix + time gate filter):", prefix);
+    await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });
     return;
   }
 
@@ -317,7 +541,7 @@ async function main() {
     const yesAsk = validPx(px.yesAsk ?? m.yes_ask ?? m.yesAsk ?? null);
     const noAsk  = validPx(px.noAsk  ?? m.no_ask  ?? m.noAsk  ?? null);
 
-    // Price band filter: only trade contracts priced 35¢–80¢
+    // Price band filter: only trade contracts priced within our band
     const yesOk = yesAsk && yesAsk >= minEntryPriceCents && yesAsk <= maxEntryPriceCents;
     const noOk  = noAsk  && noAsk  >= minEntryPriceCents && noAsk  <= maxEntryPriceCents;
 
@@ -343,53 +567,61 @@ async function main() {
   }
 
   if (!best) {
-    console.log("No trade — no candidate had a valid ask (snapshot+orderbook both missing).");
+    console.log("No trade -- no candidate had a valid ask in price band.");
+    await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });
     return;
   }
 
   console.log("Selected market:", best);
   console.log(
     "Edge check:",
-    "predYES=" + predYes + "¢",
-    "predNO=" + predNo + "¢",
+    "predYES=" + predYes + "c",
+    "predNO=" + predNo + "c",
     "chosen=" + best.side.toUpperCase(),
-    "ask=" + best.askCents + "¢",
-    "edge=" + best.edge + "¢",
-    "minEdge=" + minEdge + "¢",
+    "ask=" + best.askCents + "c",
+    "edge=" + best.edge + "c",
+    "minEdge=" + minEdge + "c",
     "pxSource=" + best.pxSource
   );
 
   if (best.edge < minEdge) {
-    console.log("No trade — edge too small.");
+    console.log("No trade -- edge too small.");
+    await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });
     return;
   }
 
+  // ── Step 5: Execute trade ──
+
   const count = calcContracts({ tradeSizeUsd, maxContracts, askCents: best.askCents });
-  const line = "BUY " + best.side.toUpperCase() + " " + count + "x " + best.ticker + " @ " + best.askCents + "¢ (mode=" + mode + ")";
+  const line = "BUY " + best.side.toUpperCase() + " " + count + "x " + best.ticker + " @ " + best.askCents + "c (mode=" + mode + ")";
   console.log("Decision:", line);
 
   if (mode !== "live") {
-    console.log("PAPER MODE — would place:", line);
+    console.log("PAPER MODE -- would place:", line);
+    await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now(), lastAction: "paper_buy" });
     return;
   }
 
   const res = await placeOrder({ ticker: best.ticker, side: best.side, count, priceCents: best.askCents, action: "buy" });
   console.log("ORDER RESULT:", res);
 
-  // best effort position write (won’t crash if Upstash token is read-only)
-  try {
-    await kvSetJson("bot:position", {
-      ticker: best.ticker,
-      side: best.side,
-      entryPriceCents: best.askCents,
-      count,
-      openedTs: Date.now(),
-      orderId: res?.order?.order_id || null
-    });
-    console.log("Saved bot:position");
-  } catch (e) {
-    console.log("WARN: bot:position not saved (Upstash token likely read-only):", e?.message || e);
-  }
+  // Save position
+  await kvSetJson("bot:position", {
+    ticker: best.ticker,
+    side: best.side,
+    entryPriceCents: best.askCents,
+    count,
+    openedTs: Date.now(),
+    orderId: res?.order?.order_id || null
+  });
+  console.log("Saved bot:position");
+
+  // Record trade for daily limits & cooldown
+  await recordTrade(best.askCents * count);
+  await kvSetJson("bot:lastTradeTs", Date.now());
+
+  // Save signal state for dashboard
+  await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now(), lastAction: "buy" });
 }
 
 main().catch((e) => {
