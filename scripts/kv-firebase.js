@@ -1,66 +1,63 @@
 import admin from "firebase-admin";
 
+let _inited = false;
+
+function normalizeServiceAccount(sa) {
+  // Fix private_key line breaks when stored in env (common in GH secrets)
+  if (sa && typeof sa.private_key === "string") {
+    sa.private_key = sa.private_key.replace(/\\n/g, "\n");
+  }
+  return sa;
+}
+
 function loadServiceAccount() {
-  // Preferred: FIREBASE_SERVICE_ACCOUNT_JSON as a JSON string (GitHub Secret friendly)
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
-  if (raw) {
-    const sa = JSON.parse(raw);
-    // normalize private_key newlines if needed
-    if (sa.private_key && typeof sa.private_key === "string") {
-      sa.private_key = sa.private_key.replace(/\\n/g, "\n");
-    }
-    return sa;
+  const raw = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+  if (!raw) {
+    throw new Error("Missing Firebase creds. Set FIREBASE_SERVICE_ACCOUNT_JSON (raw JSON or base64 JSON).");
   }
 
-  // Alternate: individual env vars
-  const projectId = process.env.FIREBASE_PROJECT_ID;
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
-  let privateKey = process.env.FIREBASE_PRIVATE_KEY;
+  const jsonText = raw.startsWith("{")
+    ? raw
+    : Buffer.from(raw, "base64").toString("utf8").trim();
 
-  if (privateKey) privateKey = privateKey.replace(/\\n/g, "\n");
-
-  if (projectId && clientEmail && privateKey) {
-    return { project_id: projectId, client_email: clientEmail, private_key: privateKey };
+  let sa;
+  try {
+    sa = JSON.parse(jsonText);
+  } catch (e) {
+    throw new Error("FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON (raw or base64). Parse error: " + (e?.message || e));
   }
 
-  throw new Error("Missing Firebase creds. Set FIREBASE_SERVICE_ACCOUNT_JSON (recommended) or FIREBASE_PROJECT_ID/CLIENT_EMAIL/PRIVATE_KEY.");
+  return normalizeServiceAccount(sa);
 }
 
 function init() {
-  if (admin.apps.length) return admin.firestore();
+  if (_inited) return;
 
   const sa = loadServiceAccount();
-  admin.initializeApp({
-    credential: admin.credential.cert(sa),
-    projectId: sa.project_id,
-  });
 
-  return admin.firestore();
+  if (!admin.apps.length) {
+    admin.initializeApp({
+      credential: admin.credential.cert(sa),
+    });
+  }
+
+  _inited = true;
 }
 
-function docForKey(key) {
-  // store keys as documents under collection "kv"
-  // bot:position => doc id "bot__position" (Firestore doc ids can't contain '/')
-  const safeId = String(key).replace(/[^a-zA-Z0-9_-]/g, "__");
-  return { col: "kv", id: safeId, key };
+function col() {
+  init();
+  // Firestore collection used for KV
+  return admin.firestore().collection("kv");
 }
 
 export async function kvGetJson(key) {
-  const db = init();
-  const ref = docForKey(key);
-  const snap = await db.collection(ref.col).doc(ref.id).get();
-  if (!snap.exists) return null;
-  const data = snap.data() || {};
-  return (data.value === undefined) ? null : data.value;
+  const doc = await col().doc(String(key)).get();
+  if (!doc.exists) return null;
+  const data = doc.data() || {};
+  return (data && Object.prototype.hasOwnProperty.call(data, "value")) ? data.value : null;
 }
 
 export async function kvSetJson(key, value) {
-  const db = init();
-  const ref = docForKey(key);
-  await db.collection(ref.col).doc(ref.id).set({
-    key: ref.key,
-    value,
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  }, { merge: true });
-  return { ok: true };
+  await col().doc(String(key)).set({ value }, { merge: false });
+  return true;
 }
