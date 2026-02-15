@@ -1,24 +1,12 @@
-name: Apex BTC Bot
+name: Apex BTC Bot (Legacy - Disabled)
 
+# Disabled — replaced by apex-btc-bot.yml running run-bot-clean.mjs
 on:
-  schedule:
-    - cron: "*/1 * * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    if: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 18
-      - run: npm ci || npm install
-      - run: node scripts/run-bot.mjs
-        env:
-          KALSHI_API_BASE_URL: https://api.elections.kalshi.com/trade-api/v2
-
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
-          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
+      - run: echo "Disabled"
