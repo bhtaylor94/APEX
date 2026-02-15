@@ -181,14 +181,26 @@ async function getKalshiPositions() {
   } catch { return []; }
 }
 
-async function getBestBid(ticker, side) {
-  try {
-    const ob = await kalshiFetch("/trade-api/v2/markets/" + encodeURIComponent(ticker) + "/orderbook?depth=10", { method: "GET" });
-    const book = ob?.orderbook || ob;
-    const bids = book?.[side] || [];
-    if (bids.length === 0) return null;
-    return validPx(bids[bids.length - 1][0]);
-  } catch { return null; }
+async function getBestBid(ticker, side, log) {
+  // Try up to 2 times — sell decisions depend on this
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const ob = await kalshiFetch("/trade-api/v2/markets/" + encodeURIComponent(ticker) + "/orderbook?depth=10", { method: "GET" });
+      const book = ob?.orderbook || ob;
+      const bids = book?.[side] || [];
+      if (bids.length === 0) {
+        if (log) log("ORDERBOOK: " + side + " bids empty for " + ticker + " (attempt " + attempt + ")");
+        continue;
+      }
+      const price = validPx(bids[bids.length - 1][0]);
+      if (log) log("ORDERBOOK: " + side + " best bid = " + price + "c for " + ticker);
+      return price;
+    } catch (e) {
+      if (log) log("ORDERBOOK ERROR (attempt " + attempt + "): " + (e?.message || e));
+      if (attempt < 2) await new Promise(r => setTimeout(r, 500));
+    }
+  }
+  return null;
 }
 
 async function getMarketPrices(ticker) {
@@ -342,7 +354,7 @@ async function runBotCycle() {
       pos = null;
     } else {
       // Take profit check
-      const bestBid = await getBestBid(pos.ticker, pos.side);
+      const bestBid = await getBestBid(pos.ticker, pos.side, L);
       const entry = pos.entryPriceCents || 50;
       const cnt = pos.count || 1;
       const totalCost = entry * cnt;
@@ -370,6 +382,7 @@ async function runBotCycle() {
 
         const sellBody = {
           ticker: pos.ticker, action: "sell", type: "limit", side: pos.side, count: cnt,
+          time_in_force: "fill_or_kill",
           ...(pos.side === "yes" ? { yes_price: bestBid } : { no_price: bestBid }),
         };
         try {

@@ -194,21 +194,26 @@ async function getKalshiPositions() {
 }
 
 // Get best bid from LIVE orderbook — not the stale getMarket() snapshot
+// Retries once on failure since sell decisions depend on this
 async function getBestBidFromOrderbook(ticker, side) {
-  try {
-    const ob = await getOrderbook(ticker, 10);
-    const book = ob?.orderbook || ob?.order_book || ob;
-    // Kalshi orderbook format: { yes: [[price, qty], ...], no: [[price, qty], ...] }
-    // Sorted ascending — last element is the highest (best) bid
-    const bids = book?.[side] || [];
-    if (bids.length === 0) return null;
-    const bestBidEntry = bids[bids.length - 1];
-    const price = bestBidEntry[0];
-    return validPx(price);
-  } catch (e) {
-    console.log("Orderbook fetch failed for " + ticker + ":", e?.message || e);
-    return null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const ob = await getOrderbook(ticker, 10);
+      const book = ob?.orderbook || ob?.order_book || ob;
+      const bids = book?.[side] || [];
+      if (bids.length === 0) {
+        console.log("ORDERBOOK: " + side + " bids empty for " + ticker + " (attempt " + attempt + ")");
+        continue;
+      }
+      const price = validPx(bids[bids.length - 1][0]);
+      console.log("ORDERBOOK: " + side + " best bid = " + price + "c for " + ticker);
+      return price;
+    } catch (e) {
+      console.log("ORDERBOOK ERROR (attempt " + attempt + "): " + (e?.message || e));
+      if (attempt < 2) await new Promise(r => setTimeout(r, 500));
+    }
   }
+  return null;
 }
 
 // Get asks from orderbook for entry pricing
@@ -512,13 +517,14 @@ export async function runBotCycle() {
           return { action: "take_profit", pnlCents, log };
         }
 
-        // LIVE MODE: sell at best bid for instant execution
+        // LIVE MODE: sell at best bid for instant execution (fill_or_kill = fills or fails, no resting)
         const sellBody = {
           ticker: pos.ticker,
           action: "sell",
           type: "limit",
           side: pos.side,
           count,
+          time_in_force: "fill_or_kill",
           ...(pos.side === "yes" ? { yes_price: bestBid } : { no_price: bestBid }),
         };
 
