@@ -22,9 +22,13 @@ export function defaultConfig() {
     // Time gate: only enter with 10+ min until settlement
     minMinutesToCloseToEnter: 10,
 
-    // Risk management: daily limits (no per-trade TP/SL)
+    // Take profit: sell when total unrealized profit >= this (in cents)
+    // e.g., 75 = sell when up $0.75 across all contracts
+    takeProfitCents: 75,
+
+    // Risk management: daily limits
     cooldownMinutes: 5,
     maxTradesPerDay: 10,
-    dailyMaxLossUsd: 25,
+    dailyMaxLossUsd: 50,
   };
 }

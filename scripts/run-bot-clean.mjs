@@ -23,24 +23,14 @@ function calcContracts({ tradeSizeUsd, maxContracts, askCents }) {
 const COINBASE_BASE = "https://api.exchange.coinbase.com";
 
 async function fetchCoinbaseCandles(limit = 100) {
-  // granularity=60 = 1-minute candles. Coinbase returns newest first.
   const url = `${COINBASE_BASE}/products/BTC-USD/candles?granularity=60`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Coinbase candles ${res.status}`);
   const data = await res.json();
-  // Coinbase format: [ [time, low, high, open, close, volume], ... ] newest first
-  // Reverse to oldest-first, take last `limit`
   const candles = data
     .slice(0, limit)
     .reverse()
-    .map(c => ({
-      time: c[0],
-      low: c[1],
-      high: c[2],
-      open: c[3],
-      close: c[4],
-      volume: c[5],
-    }));
+    .map(c => ({ time: c[0], low: c[1], high: c[2], open: c[3], close: c[4], volume: c[5] }));
   return candles;
 }
 
@@ -49,7 +39,6 @@ async function fetchCoinbaseOrderBook() {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Coinbase book ${res.status}`);
   const data = await res.json();
-  // Sum top 10 levels of bids and asks
   let bidDepth = 0, askDepth = 0;
   const bids = (data.bids || []).slice(0, 10);
   const asks = (data.asks || []).slice(0, 10);
@@ -116,13 +105,7 @@ function computeBollingerBands(closes, period = 20, mult = 2) {
   const slice = closes.slice(-period);
   const std = Math.sqrt(slice.reduce((s, v) => s + (v - avg) ** 2, 0) / period);
   const price = closes[closes.length - 1];
-  return {
-    upper: avg + mult * std,
-    middle: avg,
-    lower: avg - mult * std,
-    price,
-    std,
-  };
+  return { upper: avg + mult * std, middle: avg, lower: avg - mult * std, price, std };
 }
 
 // ── Signal generator: weighted scoring, 5 indicators ──
@@ -146,55 +129,36 @@ async function getSignal() {
   const closes = candles.map(c => c.close);
   const price = closes[closes.length - 1];
 
-  // 1. RSI (14-period)
   const rsiVal = computeRSI(closes, 14);
-
-  // 2. MACD (12, 26, 9)
   const macdVal = computeMACD(closes);
-
-  // 3. Bollinger Bands (20, 2)
   const bb = computeBollingerBands(closes, 20, 2);
-
-  // 4. EMA 9 vs EMA 21 crossover
   const ema9 = ema(closes, 9);
   const ema21 = ema(closes, 21);
-
-  // 5. Order book imbalance
   const obRatio = orderBook.ratio;
 
-  // ── Scoring (max possible: +7 / -7) ──
   let score = 0;
   const breakdown = {};
 
-  // RSI: oversold/overbought gets double weight
   if (rsiVal < 30) { score += 2; breakdown.rsi = "+2 (oversold " + rsiVal.toFixed(1) + ")"; }
   else if (rsiVal > 70) { score -= 2; breakdown.rsi = "-2 (overbought " + rsiVal.toFixed(1) + ")"; }
   else { breakdown.rsi = "0 (neutral " + rsiVal.toFixed(1) + ")"; }
 
-  // MACD
   if (macdVal.macd > macdVal.signal) { score += 1; breakdown.macd = "+1 (bullish)"; }
   else if (macdVal.macd < macdVal.signal) { score -= 1; breakdown.macd = "-1 (bearish)"; }
   else { breakdown.macd = "0 (neutral)"; }
 
-  // Bollinger Bands
   if (bb) {
     if (price < bb.lower) { score += 1; breakdown.bb = "+1 (below lower)"; }
     else if (price > bb.upper) { score -= 1; breakdown.bb = "-1 (above upper)"; }
     else { breakdown.bb = "0 (within bands)"; }
-  } else {
-    breakdown.bb = "0 (n/a)";
-  }
+  } else { breakdown.bb = "0 (n/a)"; }
 
-  // EMA crossover
   if (ema9 != null && ema21 != null) {
     if (ema9 > ema21) { score += 1; breakdown.ema = "+1 (9>21 bullish)"; }
     else if (ema9 < ema21) { score -= 1; breakdown.ema = "-1 (9<21 bearish)"; }
     else { breakdown.ema = "0 (equal)"; }
-  } else {
-    breakdown.ema = "0 (n/a)";
-  }
+  } else { breakdown.ema = "0 (n/a)"; }
 
-  // Order book imbalance
   if (obRatio > 0.60) { score += 1; breakdown.ob = "+1 (bid heavy " + obRatio.toFixed(3) + ")"; }
   else if (obRatio < 0.40) { score -= 1; breakdown.ob = "-1 (ask heavy " + obRatio.toFixed(3) + ")"; }
   else { breakdown.ob = "0 (balanced " + obRatio.toFixed(3) + ")"; }
@@ -204,7 +168,6 @@ async function getSignal() {
 
   const absScore = Math.abs(score);
 
-  // Only trade when |score| >= 3
   if (absScore < 3) {
     console.log("No trade -- score " + score + " (need |3|+ for edge)");
     return { direction: "neutral", score, confidence: 0, price, breakdown };
@@ -212,11 +175,9 @@ async function getSignal() {
 
   const confidence = absScore / 7;
   const direction = score > 0 ? "up" : "down";
-  // Predicted probability: 50% + confidence * 30%
   const predProb = 50 + confidence * 30;
 
   console.log("SIGNAL:", direction.toUpperCase(), "confidence=" + (confidence * 100).toFixed(0) + "%", "predProb=" + predProb.toFixed(1) + "%");
-
   return { direction, score, confidence, predProb, price, breakdown };
 }
 
@@ -232,7 +193,46 @@ async function getKalshiPositions() {
   }
 }
 
+// Get best bid from LIVE orderbook — not the stale getMarket() snapshot
+async function getBestBidFromOrderbook(ticker, side) {
+  try {
+    const ob = await getOrderbook(ticker, 10);
+    const book = ob?.orderbook || ob?.order_book || ob;
+    // Kalshi orderbook format: { yes: [[price, qty], ...], no: [[price, qty], ...] }
+    // Sorted ascending — last element is the highest (best) bid
+    const bids = book?.[side] || [];
+    if (bids.length === 0) return null;
+    const bestBidEntry = bids[bids.length - 1];
+    const price = bestBidEntry[0];
+    return validPx(price);
+  } catch (e) {
+    console.log("Orderbook fetch failed for " + ticker + ":", e?.message || e);
+    return null;
+  }
+}
+
+// Get asks from orderbook for entry pricing
+async function getOrderbookPrices(ticker) {
+  try {
+    const ob = await getOrderbook(ticker, 10);
+    const book = ob?.orderbook || ob?.order_book || ob;
+    const yesBids = book?.yes || [];
+    const noBids = book?.no || [];
+    // Best ask = lowest ask = first element; but Kalshi returns bids not asks in this format
+    // For asks: yes_ask = 100 - best_no_bid, no_ask = 100 - best_yes_bid
+    const bestYesBid = yesBids.length > 0 ? validPx(yesBids[yesBids.length - 1][0]) : null;
+    const bestNoBid = noBids.length > 0 ? validPx(noBids[noBids.length - 1][0]) : null;
+    const yesAsk = bestNoBid ? (100 - bestNoBid) : null;
+    const noAsk = bestYesBid ? (100 - bestYesBid) : null;
+    return { yesAsk: validPx(yesAsk), noAsk: validPx(noAsk), yesBid: bestYesBid, noBid: bestNoBid };
+  } catch (e) {
+    console.log("Orderbook prices fetch failed for " + ticker + ":", e?.message || e);
+    return { yesAsk: null, noAsk: null, yesBid: null, noBid: null };
+  }
+}
+
 async function getExecutablePrices(ticker) {
+  // Try market snapshot first (has explicit ask prices)
   try {
     const m = await getMarket(ticker);
     const mm = m?.market || m;
@@ -240,22 +240,14 @@ async function getExecutablePrices(ticker) {
     const noAsk  = validPx(mm?.no_ask  ?? mm?.noAsk  ?? null);
     const yesBid = validPx(mm?.yes_bid ?? mm?.yesBid ?? null);
     const noBid  = validPx(mm?.no_bid  ?? mm?.noBid  ?? null);
-    if (yesAsk || noAsk || yesBid || noBid) {
+    if (yesAsk || noAsk) {
       return { yesAsk, noAsk, yesBid, noBid, source: "snapshot" };
     }
   } catch (_) {}
 
-  try {
-    const ob = await getOrderbook(ticker, 1);
-    const book = ob?.orderbook || ob?.order_book || ob;
-    const yesAsk = validPx((book?.yes_asks || [])?.[0]?.price ?? null);
-    const noAsk  = validPx((book?.no_asks  || [])?.[0]?.price ?? null);
-    const yesBid = validPx((book?.yes_bids || [])?.[0]?.price ?? null);
-    const noBid  = validPx((book?.no_bids  || [])?.[0]?.price ?? null);
-    return { yesAsk, noAsk, yesBid, noBid, source: "orderbook" };
-  } catch (_) {}
-
-  return { yesAsk: null, noAsk: null, yesBid: null, noBid: null, source: "none" };
+  // Fallback to orderbook
+  const obPx = await getOrderbookPrices(ticker);
+  return { ...obPx, source: "orderbook" };
 }
 
 // ── Cancel unfilled maker orders after timeout ──
@@ -268,12 +260,19 @@ async function checkPendingOrder(cfg) {
   const timeoutMs = (Number(cfg.makerTimeoutMinutes ?? 2.5)) * 60 * 1000;
 
   if (ageMs < timeoutMs) {
-    // Check if it filled in the meantime
     try {
       const orderData = await kalshiFetch("/trade-api/v2/portfolio/orders/" + pending.orderId, { method: "GET" });
       const order = orderData?.order || orderData;
       if (order.status === "executed" || (order.fill_count && order.fill_count > 0)) {
         console.log("PENDING ORDER FILLED:", pending.orderId);
+        // Get the market close time for position tracking
+        let marketCloseTs = null;
+        try {
+          const mkt = await getMarket(pending.ticker);
+          const mm = mkt?.market || mkt;
+          marketCloseTs = mm?.close_time ? new Date(mm.close_time).getTime()
+            : mm?.expiration_time ? new Date(mm.expiration_time).getTime() : null;
+        } catch (_) {}
         await kvSetJson("bot:position", {
           ticker: pending.ticker,
           side: pending.side,
@@ -282,7 +281,11 @@ async function checkPendingOrder(cfg) {
           openedTs: pending.placedTs,
           orderId: pending.orderId,
           signal: pending.signal,
+          marketCloseTs,
         });
+        // Verify write
+        const verify = await kvGetJson("bot:position");
+        console.log("POSITION SAVED:", verify?.ticker || "WRITE FAILED");
         await kvSetJson("bot:pendingOrder", null);
         return;
       }
@@ -291,7 +294,6 @@ async function checkPendingOrder(cfg) {
     return;
   }
 
-  // Timeout — cancel the order
   console.log("PENDING ORDER TIMEOUT after " + Math.round(ageMs / 1000) + "s. Canceling:", pending.orderId);
   try {
     await kalshiFetch("/trade-api/v2/portfolio/orders/" + pending.orderId, { method: "DELETE" });
@@ -307,59 +309,50 @@ async function checkPendingOrder(cfg) {
 async function logTradeResult(entry) {
   const history = (await kvGetJson("bot:trade_history")) || [];
   history.push(entry);
-  // Keep last 100 trades
   if (history.length > 100) history.splice(0, history.length - 100);
   await kvSetJson("bot:trade_history", history);
 }
 
-// ── Daily limits ──
+// ── Daily stats ──
+
+async function getDailyStats() {
+  const state = (await kvGetJson("bot:daily_stats")) || {};
+  const today = new Date().toISOString().slice(0, 10);
+  if (state.date !== today) {
+    const fresh = { date: today, totalTrades: 0, wins: 0, losses: 0, takeProfits: 0, totalPnlCents: 0 };
+    await kvSetJson("bot:daily_stats", fresh);
+    return fresh;
+  }
+  return state;
+}
+
+async function recordDailyTrade(type, pnlCents) {
+  const stats = await getDailyStats();
+  stats.totalTrades = (stats.totalTrades || 0) + 1;
+  stats.totalPnlCents = (stats.totalPnlCents || 0) + pnlCents;
+  if (type === "win") stats.wins = (stats.wins || 0) + 1;
+  else if (type === "loss") stats.losses = (stats.losses || 0) + 1;
+  else if (type === "tp_exit") stats.takeProfits = (stats.takeProfits || 0) + 1;
+  await kvSetJson("bot:daily_stats", stats);
+  return stats;
+}
 
 async function checkDailyLimits(cfg) {
-  const state = (await kvGetJson("bot:dailyState")) || {};
-  const today = new Date().toISOString().slice(0, 10);
-
-  if (state.date !== today) {
-    await kvSetJson("bot:dailyState", { date: today, trades: 0, pnlCents: 0 });
-    return { ok: true, trades: 0, pnlCents: 0 };
-  }
-
-  const trades = state.trades || 0;
-  const pnlCents = state.pnlCents || 0;
+  const stats = await getDailyStats();
   const maxTrades = Number(cfg.maxTradesPerDay ?? 10);
-  const maxLossCents = Math.round((Number(cfg.dailyMaxLossUsd ?? 25)) * 100);
+  const maxLossCents = Math.round((Number(cfg.dailyMaxLossUsd ?? 50)) * 100);
 
-  if (trades >= maxTrades) {
-    console.log("DAILY LIMIT: " + trades + "/" + maxTrades + " trades. Stopping.");
-    return { ok: false, trades, pnlCents };
+  if (stats.totalPnlCents <= -maxLossCents) {
+    console.log("DAILY LOSS LIMIT: $" + (stats.totalPnlCents / 100).toFixed(2) + " (max -$" + (maxLossCents / 100).toFixed(2) + "). Stopping.");
+    return { ok: false, stats };
   }
 
-  if (pnlCents <= -maxLossCents) {
-    console.log("DAILY LOSS LIMIT: $" + (pnlCents / 100).toFixed(2) + " (max -$" + (maxLossCents / 100).toFixed(2) + "). Stopping.");
-    return { ok: false, trades, pnlCents };
+  if (stats.totalTrades >= maxTrades) {
+    console.log("DAILY TRADE LIMIT: " + stats.totalTrades + "/" + maxTrades + " trades. Stopping.");
+    return { ok: false, stats };
   }
 
-  return { ok: true, trades, pnlCents };
-}
-
-async function recordTradeEntry(costCents) {
-  const state = (await kvGetJson("bot:dailyState")) || {};
-  const today = new Date().toISOString().slice(0, 10);
-  if (state.date !== today) {
-    await kvSetJson("bot:dailyState", { date: today, trades: 1, pnlCents: -costCents });
-  } else {
-    state.trades = (state.trades || 0) + 1;
-    state.pnlCents = (state.pnlCents || 0) - costCents;
-    await kvSetJson("bot:dailyState", state);
-  }
-}
-
-async function recordSettlementResult(revenueCents) {
-  const state = (await kvGetJson("bot:dailyState")) || {};
-  const today = new Date().toISOString().slice(0, 10);
-  if (state.date === today) {
-    state.pnlCents = (state.pnlCents || 0) + revenueCents;
-    await kvSetJson("bot:dailyState", state);
-  }
+  return { ok: true, stats };
 }
 
 // ── Cooldown ──
@@ -375,9 +368,12 @@ async function checkCooldown(cfg) {
   return true;
 }
 
-// ── Main ──
+// ── Main bot cycle (exported for server.mjs) ──
 
-async function main() {
+export async function runBotCycle() {
+  const log = [];
+  const _log = (msg) => { console.log(msg); log.push(msg); };
+
   const cfg = (await kvGetJson("bot:config")) || {};
 
   const enabled = !!cfg.enabled;
@@ -391,25 +387,27 @@ async function main() {
   const maxEntryPriceCents = Number(cfg.maxEntryPriceCents ?? 80);
   const minMinutesToCloseToEnter = Number(cfg.minMinutesToCloseToEnter ?? 10);
   const makerOffset = Number(cfg.makerOffsetCents ?? 2);
+  const takeProfitCents = Number(cfg.takeProfitCents ?? 75);
 
-  console.log("CONFIG:", {
-    enabled, mode, seriesTicker,
-    tradeSizeUsd, maxContracts, minEdge,
-    priceband: minEntryPriceCents + "c-" + maxEntryPriceCents + "c",
-    minMinutesToCloseToEnter, makerOffset,
-  });
+  _log("CONFIG: enabled=" + enabled + " mode=" + mode + " series=" + seriesTicker +
+    " tp=$" + (takeProfitCents / 100).toFixed(2) + " priceband=" + minEntryPriceCents + "-" + maxEntryPriceCents + "c");
 
-  if (!enabled) return console.log("Bot disabled -- exiting.");
+  if (!enabled) { _log("Bot disabled -- exiting."); return { action: "disabled", log }; }
 
-  // ── Step 1: Handle pending maker orders ──
+  // ── Step 1: Check daily limits FIRST ──
+
+  const dailyCheck = await checkDailyLimits(cfg);
+  if (!dailyCheck.ok) { return { action: "daily_limit", stats: dailyCheck.stats, log }; }
+
+  // ── Step 2: Handle pending maker orders ──
 
   await checkPendingOrder(cfg);
   if (await kvGetJson("bot:pendingOrder")) {
-    console.log("Pending order still active. Skipping new entries.");
-    return;
+    _log("Pending order still active. Skipping.");
+    return { action: "pending_order", log };
   }
 
-  // ── Step 2: Check for existing position ──
+  // ── Step 3: CHECK FOR OPEN POSITION — TAKE PROFIT LOGIC ──
 
   let pos = await kvGetJson("bot:position");
 
@@ -420,101 +418,173 @@ async function main() {
     p.ticker?.startsWith(seriesPrefix) && (p.total_traded > 0 || p.quantity > 0)
   );
 
+  // Position recovery: if bot:position is null but Kalshi has a position, recover it
+  if ((!pos || !pos.ticker) && relevantPositions.length > 0) {
+    const kp = relevantPositions[0];
+    const side = (kp.market_position || kp.position || "yes").toLowerCase();
+    const count = kp.total_traded || kp.quantity || 1;
+    _log("RECOVERING orphan position: " + side.toUpperCase() + " " + count + "x " + kp.ticker);
+    let marketCloseTs = null;
+    try {
+      const mkt = await getMarket(kp.ticker);
+      const mm = mkt?.market || mkt;
+      marketCloseTs = mm?.close_time ? new Date(mm.close_time).getTime()
+        : mm?.expiration_time ? new Date(mm.expiration_time).getTime() : null;
+    } catch (_) {}
+    pos = {
+      ticker: kp.ticker, side, entryPriceCents: 50, count,
+      openedTs: Date.now(), orderId: null, marketCloseTs,
+    };
+    await kvSetJson("bot:position", pos);
+    const verify = await kvGetJson("bot:position");
+    _log("POSITION RECOVERED: " + (verify?.ticker || "WRITE FAILED"));
+  }
+
   if (pos && pos.ticker) {
     const stillOnKalshi = relevantPositions.some(p => p.ticker === pos.ticker);
 
     if (!stillOnKalshi) {
       // Position settled. Log the result.
-      console.log("Position " + pos.ticker + " settled. Logging result.");
+      _log("Position " + pos.ticker + " settled. Logging result.");
 
-      // Determine if we won: check settlements
       let won = false;
       let revenueCents = 0;
       try {
-        const settleData = await kalshiFetch("/trade-api/v2/portfolio/settlements?limit=5", { method: "GET" });
+        const settleData = await kalshiFetch("/trade-api/v2/portfolio/settlements?limit=10", { method: "GET" });
         const settlements = settleData?.settlements || [];
         const match = settlements.find(s => s.ticker === pos.ticker);
         if (match) {
-          const result = match.market_result; // "yes" or "no"
+          const result = match.market_result;
           won = (result === pos.side);
           revenueCents = won ? (pos.count * 100) : 0;
-          console.log("SETTLEMENT:", pos.ticker, "result=" + result, "side=" + pos.side, won ? "WIN +$" + (revenueCents / 100).toFixed(2) : "LOSS");
+          _log("SETTLEMENT: " + pos.ticker + " result=" + result + " side=" + pos.side + " " +
+            (won ? "WIN +$" + (revenueCents / 100).toFixed(2) : "LOSS"));
         }
       } catch (e) {
-        console.log("Settlement lookup failed:", e?.message || e);
+        _log("Settlement lookup failed: " + (e?.message || e));
       }
 
-      // Log to trade history
       const costCents = (pos.entryPriceCents || 50) * (pos.count || 1);
       const pnlCents = revenueCents - costCents;
       await logTradeResult({
-        ticker: pos.ticker,
-        side: pos.side,
-        entryPriceCents: pos.entryPriceCents,
-        count: pos.count,
-        result: won ? "win" : "loss",
-        revenueCents,
-        costCents,
-        pnlCents,
-        signal: pos.signal || null,
-        openedTs: pos.openedTs,
-        settledTs: Date.now(),
+        ticker: pos.ticker, side: pos.side, entryPriceCents: pos.entryPriceCents,
+        count: pos.count, result: won ? "win" : "loss", exitReason: "SETTLEMENT",
+        revenueCents, costCents, pnlCents,
+        signal: pos.signal || null, openedTs: pos.openedTs, settledTs: Date.now(),
       });
-
-      // Update daily P&L
-      await recordSettlementResult(revenueCents);
-
+      await recordDailyTrade(won ? "win" : "loss", pnlCents);
       await kvSetJson("bot:position", null);
       pos = null;
     } else {
-      // Position still open — HOLD. No exit. Let it settle.
-      console.log("HOLDING:", pos.side?.toUpperCase(), pos.count + "x", pos.ticker, "entry=" + pos.entryPriceCents + "c. Waiting for settlement.");
+      // ── TAKE PROFIT CHECK ──
+      // Fetch LIVE orderbook — getMarket() returns stale/zero bids
+      const bestBid = await getBestBidFromOrderbook(pos.ticker, pos.side);
+      const entryPx = pos.entryPriceCents || 50;
+      const count = pos.count || 1;
+      const totalCost = entryPx * count;
+      const currentValue = bestBid ? (bestBid * count) : 0;
+      const totalProfit = currentValue - totalCost;
+
+      _log("POSITION CHECK: " + pos.side.toUpperCase() + " " + count + "x " + pos.ticker +
+        " | entry=" + entryPx + "c bid=" + (bestBid || "?") + "c" +
+        " | cost=$" + (totalCost / 100).toFixed(2) + " value=$" + (currentValue / 100).toFixed(2) +
+        " | P&L=" + (totalProfit >= 0 ? "+$" : "-$") + (Math.abs(totalProfit) / 100).toFixed(2));
+
+      if (bestBid && totalProfit >= takeProfitCents) {
+        _log("TAKE PROFIT: unrealized profit $" + (totalProfit / 100).toFixed(2) +
+          " >= $" + (takeProfitCents / 100).toFixed(2) + " threshold. SELLING NOW.");
+
+        if (mode !== "live") {
+          _log("PAPER SELL: " + count + "x @ " + bestBid + "c");
+          const revenueCents = bestBid * count;
+          const pnlCents = revenueCents - totalCost;
+          await logTradeResult({
+            ticker: pos.ticker, side: pos.side, entryPriceCents: entryPx,
+            exitPriceCents: bestBid, count, result: "tp_exit", exitReason: "TAKE_PROFIT",
+            revenueCents, costCents: totalCost, pnlCents,
+            signal: pos.signal || null, openedTs: pos.openedTs, closedTs: Date.now(),
+          });
+          await recordDailyTrade("tp_exit", pnlCents);
+          await kvSetJson("bot:position", null);
+          _log("TAKE PROFIT: Sold " + count + " " + pos.side + " contracts at " + bestBid +
+            "c, entry was " + entryPx + "c, profit: $" + (pnlCents / 100).toFixed(2));
+          await kvSetJson("bot:state", { lastCheck: Date.now(), lastAction: "take_profit" });
+          return { action: "take_profit", pnlCents, log };
+        }
+
+        // LIVE MODE: sell at best bid for instant execution
+        const sellBody = {
+          ticker: pos.ticker,
+          action: "sell",
+          type: "limit",
+          side: pos.side,
+          count,
+          ...(pos.side === "yes" ? { yes_price: bestBid } : { no_price: bestBid }),
+        };
+
+        try {
+          const sellRes = await kalshiFetch("/trade-api/v2/portfolio/orders", { method: "POST", body: sellBody });
+          const sellOrder = sellRes?.order || {};
+          _log("SELL ORDER: status=" + sellOrder.status + " fill=" + (sellOrder.fill_count || 0));
+
+          if (sellOrder.status === "executed" || (sellOrder.fill_count && sellOrder.fill_count > 0)) {
+            const fillCount = sellOrder.fill_count || count;
+            const revenueCents = bestBid * fillCount;
+            const pnlCents = revenueCents - (entryPx * fillCount);
+            await logTradeResult({
+              ticker: pos.ticker, side: pos.side, entryPriceCents: entryPx,
+              exitPriceCents: bestBid, count: fillCount, result: "tp_exit", exitReason: "TAKE_PROFIT",
+              revenueCents, costCents: entryPx * fillCount, pnlCents,
+              signal: pos.signal || null, openedTs: pos.openedTs, closedTs: Date.now(),
+            });
+            await recordDailyTrade("tp_exit", pnlCents);
+            await kvSetJson("bot:position", null);
+            _log("TAKE PROFIT: Sold " + fillCount + " " + pos.side + " contracts at " + bestBid +
+              "c, entry was " + entryPx + "c, profit: $" + (pnlCents / 100).toFixed(2));
+            await kvSetJson("bot:state", { lastCheck: Date.now(), lastAction: "take_profit" });
+            return { action: "take_profit", pnlCents, log };
+          } else {
+            _log("Sell order did not fill immediately (status=" + sellOrder.status + "). Will retry next run.");
+          }
+        } catch (e) {
+          _log("Sell order failed: " + (e?.message || e) + " — will retry next run.");
+        }
+      } else if (bestBid && totalProfit > 0) {
+        _log("HOLDING: Position has $" + (totalProfit / 100).toFixed(2) + " unrealized profit, waiting for $" +
+          (takeProfitCents / 100).toFixed(2) + " target");
+      } else if (bestBid) {
+        _log("UNDERWATER: Position is -$" + (Math.abs(totalProfit) / 100).toFixed(2) + ", holding to settlement");
+      } else {
+        _log("NO BIDS on orderbook for " + pos.ticker + " — holding to settlement");
+      }
+
       await kvSetJson("bot:state", { lastCheck: Date.now(), holding: pos.ticker });
-      return;
+      return { action: "holding", totalProfit, log };
     }
-  } else if (relevantPositions.length > 0) {
-    // Orphan position on Kalshi we don't know about — sync and hold
-    const kp = relevantPositions[0];
-    const side = (kp.market_position || kp.position || "yes").toLowerCase();
-    console.log("ORPHAN POSITION on Kalshi:", side.toUpperCase(), (kp.total_traded || kp.quantity) + "x", kp.ticker);
-    await kvSetJson("bot:position", {
-      ticker: kp.ticker,
-      side,
-      entryPriceCents: 50,
-      count: kp.total_traded || kp.quantity || 1,
-      openedTs: Date.now(),
-      orderId: null,
-    });
-    console.log("Synced orphan. Holding to settlement.");
-    return;
   }
 
-  // ── Step 3: Pre-entry checks ──
-
-  const dailyCheck = await checkDailyLimits(cfg);
-  if (!dailyCheck.ok) return;
+  // ── Step 4: Pre-entry checks ──
 
   const cooldownOk = await checkCooldown(cfg);
-  if (!cooldownOk) return;
+  if (!cooldownOk) return { action: "cooldown", log };
 
-  // ── Step 4: Generate signal ──
+  // ── Step 5: Generate signal ──
 
   const sig = await getSignal();
 
   if (sig.direction === "neutral" || !sig.predProb) {
-    console.log("No trade -- signal is neutral.");
+    _log("No trade -- signal is neutral.");
     await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });
-    return;
+    return { action: "no_signal", signal: sig, log };
   }
 
-  // predProb is the probability in the signal direction (e.g., 65% YES or 65% NO)
   const predProb = sig.predProb;
 
-  // ── Step 5: Find best market ──
+  // ── Step 6: Find best market ──
 
   const resp = await getMarkets({ series_ticker: seriesTicker, status: "open", limit: 200, mve_filter: "exclude" });
   const markets = Array.isArray(resp?.markets) ? resp.markets : [];
-  console.log("Markets found:", markets.length);
+  _log("Markets found: " + markets.length);
 
   const now = Date.now();
   const candidates = markets.filter(m => {
@@ -529,9 +599,9 @@ async function main() {
   });
 
   if (!candidates.length) {
-    console.log("No markets with " + minMinutesToCloseToEnter + "+ min remaining.");
+    _log("No markets with " + minMinutesToCloseToEnter + "+ min remaining.");
     await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });
-    return;
+    return { action: "no_markets", log };
   }
 
   let best = null;
@@ -542,113 +612,113 @@ async function main() {
     const yesAsk = validPx(px.yesAsk ?? m.yes_ask ?? null);
     const noAsk  = validPx(px.noAsk  ?? m.no_ask  ?? null);
 
-    // Determine which side to trade based on signal direction
-    // UP signal -> buy YES, DOWN signal -> buy NO
     let targetAsk, side;
-    if (sig.direction === "up") {
-      side = "yes";
-      targetAsk = yesAsk;
-    } else {
-      side = "no";
-      targetAsk = noAsk;
-    }
+    if (sig.direction === "up") { side = "yes"; targetAsk = yesAsk; }
+    else { side = "no"; targetAsk = noAsk; }
 
     if (!targetAsk) continue;
-
-    // Price band filter: 35c-80c only
     if (targetAsk < minEntryPriceCents || targetAsk > maxEntryPriceCents) continue;
 
-    // Maker order: place limit at ask - makerOffset
     const limitPrice = targetAsk - makerOffset;
     if (limitPrice < minEntryPriceCents) continue;
 
-    // Edge calculation: predicted probability - limit price
     const edge = predProb - limitPrice;
 
+    // Store market close time for position tracking
+    const closeTs = m.close_time ? new Date(m.close_time).getTime()
+      : m.expiration_time ? new Date(m.expiration_time).getTime() : null;
+
     if (!best || edge > best.edge) {
-      best = { ticker, side, targetAsk, limitPrice, edge, source: px.source, volume: Number(m.volume || 0) };
+      best = { ticker, side, targetAsk, limitPrice, edge, source: px.source, volume: Number(m.volume || 0), marketCloseTs: closeTs };
     }
   }
 
   if (!best) {
-    console.log("No trade -- no market in price band " + minEntryPriceCents + "-" + maxEntryPriceCents + "c.");
+    _log("No trade -- no market in price band " + minEntryPriceCents + "-" + maxEntryPriceCents + "c.");
     await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });
-    return;
+    return { action: "no_edge", log };
   }
 
-  console.log("BEST MARKET:", best);
-  console.log("Edge:", "pred=" + predProb.toFixed(1) + "c", "limit=" + best.limitPrice + "c", "edge=" + best.edge.toFixed(1) + "c", "(min " + minEdge + "c)");
+  _log("BEST MARKET: " + best.ticker + " " + best.side + " ask=" + best.targetAsk + "c limit=" + best.limitPrice + "c edge=" + best.edge.toFixed(1) + "c");
 
   if (best.edge < minEdge) {
-    console.log("No trade -- edge " + best.edge.toFixed(1) + "c < min " + minEdge + "c.");
+    _log("No trade -- edge " + best.edge.toFixed(1) + "c < min " + minEdge + "c.");
     await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });
-    return;
+    return { action: "insufficient_edge", log };
   }
 
-  // ── Step 6: Place maker order ──
+  // ── Step 7: Place maker order ──
 
   const count = calcContracts({ tradeSizeUsd, maxContracts, askCents: best.limitPrice });
   const line = "BUY " + best.side.toUpperCase() + " " + count + "x " + best.ticker + " @ " + best.limitPrice + "c (maker, mode=" + mode + ")";
-  console.log("ORDER:", line);
+  _log("ORDER: " + line);
 
   if (mode !== "live") {
-    console.log("PAPER MODE:", line);
-    await kvSetJson("bot:position", {
+    _log("PAPER MODE: " + line);
+    const posData = {
       ticker: best.ticker, side: best.side, entryPriceCents: best.limitPrice,
       count, openedTs: Date.now(), orderId: "paper-" + Date.now(),
       signal: { direction: sig.direction, score: sig.score, predProb },
-    });
+      marketCloseTs: best.marketCloseTs,
+    };
+    await kvSetJson("bot:position", posData);
+    const verify = await kvGetJson("bot:position");
+    _log("POSITION SAVED: " + (verify?.ticker || "WRITE FAILED"));
     await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now(), lastAction: "paper_buy" });
-    return;
+    return { action: "paper_buy", position: posData, log };
   }
 
-  // Place limit order with post_only to ensure maker (zero fees)
   const orderBody = {
-    ticker: best.ticker,
-    action: "buy",
-    type: "limit",
-    side: best.side,
-    count,
+    ticker: best.ticker, action: "buy", type: "limit", side: best.side, count,
     ...(best.side === "yes" ? { yes_price: best.limitPrice } : { no_price: best.limitPrice }),
   };
 
   const res = await kalshiFetch("/trade-api/v2/portfolio/orders", { method: "POST", body: orderBody });
-  console.log("ORDER RESULT:", res);
+  _log("ORDER RESULT: " + JSON.stringify(res));
 
   const order = res?.order || {};
   const status = order.status || "";
 
   if (status === "executed" || (order.fill_count && order.fill_count > 0)) {
-    // Filled immediately (might happen even with maker offset)
     const fillCount = order.fill_count || count;
-    console.log("ORDER FILLED immediately:", fillCount + "x @ " + best.limitPrice + "c");
-    await kvSetJson("bot:position", {
+    _log("ORDER FILLED immediately: " + fillCount + "x @ " + best.limitPrice + "c");
+    const posData = {
       ticker: best.ticker, side: best.side, entryPriceCents: best.limitPrice,
       count: fillCount, openedTs: Date.now(), orderId: order.order_id || null,
       signal: { direction: sig.direction, score: sig.score, predProb },
-    });
-    await recordTradeEntry(best.limitPrice * fillCount);
+      marketCloseTs: best.marketCloseTs,
+    };
+    await kvSetJson("bot:position", posData);
+    const verify = await kvGetJson("bot:position");
+    _log("POSITION SAVED: " + (verify?.ticker || "WRITE FAILED"));
     await kvSetJson("bot:lastTradeTs", Date.now());
   } else if (status === "resting") {
-    // Maker order resting on the book — will check for fill next run
-    console.log("ORDER RESTING on book. Will check for fill next run.");
+    _log("ORDER RESTING on book. Will check for fill next run.");
     await kvSetJson("bot:pendingOrder", {
-      orderId: order.order_id,
-      ticker: best.ticker,
-      side: best.side,
-      limitPrice: best.limitPrice,
-      count,
-      placedTs: Date.now(),
+      orderId: order.order_id, ticker: best.ticker, side: best.side,
+      limitPrice: best.limitPrice, count, placedTs: Date.now(),
       signal: { direction: sig.direction, score: sig.score, predProb },
     });
   } else {
-    console.log("ORDER STATUS unexpected:", status);
+    _log("ORDER STATUS unexpected: " + status);
   }
 
   await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now(), lastAction: "buy" });
+  return { action: "order_placed", status, log };
 }
 
-main().catch((e) => {
-  console.error("Bot runner failed:", e?.message || e);
-  process.exit(1);
-});
+// ── CLI entry point ──
+
+const isMainModule = process.argv[1] && (
+  process.argv[1].endsWith("run-bot-clean.mjs") ||
+  process.argv[1].endsWith("run-bot-clean")
+);
+
+if (isMainModule) {
+  runBotCycle().then(result => {
+    console.log("RESULT:", result?.action || "unknown");
+  }).catch((e) => {
+    console.error("Bot runner failed:", e?.message || e);
+    process.exit(1);
+  });
+}

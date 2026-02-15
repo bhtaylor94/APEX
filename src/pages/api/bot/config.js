@@ -14,6 +14,7 @@ function pickConfig(input, current) {
     "makerOffsetCents",
     "makerTimeoutMinutes",
     "minMinutesToCloseToEnter",
+    "takeProfitCents",
     "cooldownMinutes",
     "maxTradesPerDay",
     "dailyMaxLossUsd"
@@ -33,8 +34,8 @@ function pickConfig(input, current) {
     "tradeSizeUsd","maxContracts","minEdge",
     "minEntryPriceCents","maxEntryPriceCents",
     "makerOffsetCents","makerTimeoutMinutes",
-    "minMinutesToCloseToEnter","cooldownMinutes",
-    "maxTradesPerDay","dailyMaxLossUsd"
+    "minMinutesToCloseToEnter","takeProfitCents",
+    "cooldownMinutes","maxTradesPerDay","dailyMaxLossUsd"
   ];
   for (const k of numFields) {
     if (out[k] !== undefined && out[k] !== null) out[k] = Number(out[k]);
