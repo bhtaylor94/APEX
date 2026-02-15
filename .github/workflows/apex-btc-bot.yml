@@ -1,8 +1,7 @@
-name: Apex BTC Bot (Clean)
+name: Apex BTC Bot (Manual Only)
 
+# Cron disabled — bot is now triggered by cron-job.org via Vercel API route /api/bot/run
 on:
-  schedule:
-    - cron: "*/1 * * * *"
   workflow_dispatch:
 
 concurrency:
