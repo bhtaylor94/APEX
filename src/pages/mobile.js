@@ -11,12 +11,13 @@ export default function MobileDashboard() {
   const [connected, setConnected] = useState(false);
   const [toggling, setToggling] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
+  const [error, setError] = useState(null);
   const intervalRef = useRef(null);
 
-  // Read token from URL on mount
+  // Read token from URL on mount — also allow no-token access
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const t = params.get("token") || "";
+    const t = params.get("token") || "none";
     setToken(t);
   }, []);
 
@@ -70,6 +71,7 @@ export default function MobileDashboard() {
   const toggleBot = async () => {
     if (!config || toggling) return;
     setToggling(true);
+    setError(null);
     try {
       const res = await fetch("/api/bot/config", {
         method: "POST",
@@ -77,8 +79,14 @@ export default function MobileDashboard() {
         body: JSON.stringify({ enabled: !config.enabled }),
       });
       const data = await res.json();
-      if (data.ok) setConfig(data.config);
-    } catch {}
+      if (data.ok) {
+        setConfig(data.config);
+      } else {
+        setError(data.error || "Toggle failed");
+      }
+    } catch (e) {
+      setError("Network error: " + (e.message || "unknown"));
+    }
     setToggling(false);
   };
 
@@ -95,20 +103,6 @@ export default function MobileDashboard() {
     if (n == null) return "--";
     return "$" + Number(n).toFixed(2);
   };
-
-  // No token prompt
-  if (!token) {
-    return (
-      <>
-        <Head><title>APEX Mobile</title><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" /></Head>
-        <div style={S.page}>
-          <div style={S.card}>
-            <p style={{ color: "#aaa", margin: 0 }}>Add <code style={{ color: "#4fc3f7" }}>?token=YOUR_TOKEN</code> to the URL</p>
-          </div>
-        </div>
-      </>
-    );
-  }
 
   return (
     <>
@@ -164,6 +158,13 @@ export default function MobileDashboard() {
             {toggling ? "..." : enabled ? "RUNNING" : "OFF"}
           </div>
         </div>
+
+        {/* Error banner */}
+        {error && (
+          <div style={{ background: "rgba(244,67,54,0.15)", border: "1px solid #f4433633", borderRadius: 10, padding: "10px 14px", marginBottom: 12, color: "#f44336", fontSize: 13 }}>
+            {error}
+          </div>
+        )}
 
         {/* Balance */}
         <div style={S.card}>
