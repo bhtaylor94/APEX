@@ -1,32 +1,5 @@
-import { kalshiFetch } from "./kalshi.js";
 import { kvGetJson, kvSetJson } from "./kv.mjs";
-import { getMarkets, getMarket, getOrderbook, placeOrder} from "./kalshi_client.mjs";
-function obTopPrice(ob, side) {
-  // Observed shape:
-  // ob.orderbook.yes = [[priceCents, size], ...]
-  // ob.orderbook.no  = [[priceCents, size], ...]
-  const book = ob && ob.orderbook ? ob.orderbook : null;
-  const arr = side === "yes"
-    ? (book && Array.isArray(book.yes) ? book.yes : [])
-    : (book && Array.isArray(book.no)  ? book.no  : []);
-  if (!Array.isArray(arr) || arr.length === 0) return null;
-  const p = Number(arr[0] && arr[0][0]);
-  return Number.isFinite(p) ? p : null;
-}
-
-
-function obBestBid(ob, side) {
-  // Orderbook shape in your logs:
-  // ob.orderbook.yes = [[priceCents, size], ...]
-  // ob.orderbook.no  = [[priceCents, size], ...]
-  const book = ob && ob.orderbook ? ob.orderbook : null;
-  const arr = side === "yes" ? (book && Array.isArray(book.yes) ? book.yes : []) : (book && Array.isArray(book.no) ? book.no : []);
-  if (!Array.isArray(arr) || arr.length === 0) return null;
-  const p = Number(arr[0] && arr[0][0]);
-  return Number.isFinite(p) ? p : null;
-}
-
-
+import { getMarkets, getMarket, getOrderbook, placeOrder } from "./kalshi_client.mjs";
 
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
 
@@ -43,158 +16,174 @@ function calcContracts({ tradeSizeUsd, maxContracts, askCents }) {
   return clamp(Math.max(1, byBudget), 1, maxContracts || 5);
 }
 
-// Minimal: you already have a signal engine; this just reads what your bot:config expects.
-// If you store your real signal elsewhere, wire it here.
+// ── Binance data fetchers (public, no auth) ──
+
+const BINANCE_BASE = "https://api.binance.com";
+
+async function fetchBinanceKlines(limit = 100) {
+  const url = `${BINANCE_BASE}/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Binance klines ${res.status}`);
+  const data = await res.json();
+  return data.map(k => ({
+    openTime: k[0],
+    open: parseFloat(k[1]),
+    high: parseFloat(k[2]),
+    low: parseFloat(k[3]),
+    close: parseFloat(k[4]),
+    volume: parseFloat(k[5]),
+    closeTime: k[6],
+  }));
+}
+
+async function fetchBinanceOrderBookImbalance() {
+  const url = `${BINANCE_BASE}/api/v3/depth?symbol=BTCUSDT&limit=10`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Binance depth ${res.status}`);
+  const data = await res.json();
+  let bidDepth = 0, askDepth = 0;
+  for (const [, qty] of data.bids) bidDepth += parseFloat(qty);
+  for (const [, qty] of data.asks) askDepth += parseFloat(qty);
+  const total = bidDepth + askDepth;
+  const ratio = total > 0 ? bidDepth / total : 0.5;
+  // >0.60 = UP pressure, <0.40 = DOWN pressure, else neutral
+  const signal = ratio > 0.60 ? 1 : ratio < 0.40 ? -1 : 0;
+  return { ratio, signal, bidDepth, askDepth };
+}
+
+// ── Technical indicators (computed on the fly) ──
+
+function sma(data, period) {
+  if (data.length < period) return null;
+  return data.slice(-period).reduce((s, v) => s + v, 0) / period;
+}
+
+function ema(data, period) {
+  if (data.length < period) return null;
+  const k = 2 / (period + 1);
+  let e = data.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (let i = period; i < data.length; i++) e = data[i] * k + e * (1 - k);
+  return e;
+}
+
+function computeRSI(closes, period = 14) {
+  if (closes.length < period + 1) return 50;
+  const changes = [];
+  for (let i = 1; i < closes.length; i++) changes.push(closes[i] - closes[i - 1]);
+  const recent = changes.slice(-period);
+  let gains = 0, losses = 0;
+  for (const c of recent) {
+    if (c > 0) gains += c;
+    else losses += Math.abs(c);
+  }
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  return 100 - 100 / (1 + avgGain / avgLoss);
+}
+
+function computeMACD(closes) {
+  const ema12 = ema(closes, 12);
+  const ema26 = ema(closes, 26);
+  if (!ema12 || !ema26) return { macd: 0, signal: 0, histogram: 0 };
+  const macdLine = ema12 - ema26;
+  const mH = [];
+  const k12 = 2 / 13, k26 = 2 / 27;
+  let e12 = closes.slice(0, 12).reduce((s, v) => s + v, 0) / 12;
+  let e26 = closes.slice(0, 26).reduce((s, v) => s + v, 0) / 26;
+  for (let i = 26; i < closes.length; i++) {
+    e12 = closes[i] * k12 + e12 * (1 - k12);
+    e26 = closes[i] * k26 + e26 * (1 - k26);
+    mH.push(e12 - e26);
+  }
+  const sig = mH.length >= 9 ? ema(mH, 9) : macdLine;
+  return { macd: macdLine, signal: sig || 0, histogram: macdLine - (sig || 0) };
+}
+
+function computeBollingerBands(closes, period = 20, mult = 2) {
+  if (closes.length < period) return null;
+  const avg = sma(closes, period);
+  const slice = closes.slice(-period);
+  const std = Math.sqrt(slice.reduce((s, v) => s + (v - avg) ** 2, 0) / period);
+  return {
+    upper: avg + mult * std,
+    middle: avg,
+    lower: avg - mult * std,
+    percentB: std > 0 ? (closes[closes.length - 1] - (avg - mult * std)) / (mult * 2 * std) : 0.5,
+  };
+}
+
+// ── Signal generator: requires 3+ of 4 indicators to agree ──
+
 async function getSignal() {
-  // If you have a key like bot:signal, we’ll use it; otherwise we default to neutral-ish behavior.
-  const s = await kvGetJson("bot:signal");
-  if (s && typeof s === "object" && s.direction && s.confidence != null) return s;
-  // fallback (keeps bot alive even if signal store is missing)
-  return { direction: "up", confidence: 0.20, price: 0 };
-}
-
-function pct(n){ return Math.round(n*1000)/10; }
-
-function validBid(v){
-  const n = (typeof v === "number") ? v : Number(v);
-  if (!Number.isFinite(n)) return null;
-  if (n < 1 || n > 99) return null;
-  return n;
-}
-
-async function getBestBid(ticker, side){
-  // snapshot bid first
+  let klines, obImbalance;
   try {
-    const m = await getMarket(ticker);
-    const mm = m?.market || m;
-    const y = validBid(mm?.yes_bid ?? mm?.yesBid ?? null);
-    const n = validBid(mm?.no_bid  ?? mm?.noBid  ?? null);
-    const bid = side === "yes" ? y : n;
-    if (bid) return { bidCents: bid, source: "snapshot" };
-  } catch (_) {}
+    [klines, obImbalance] = await Promise.all([
+      fetchBinanceKlines(100),
+      fetchBinanceOrderBookImbalance(),
+    ]);
+  } catch (e) {
+    console.log("Binance data fetch failed:", e?.message || e);
+    return { direction: "neutral", confidence: 0, details: "binance_error" };
+  }
 
-  // orderbook fallback
-  try {
-    const ob = await getOrderbook(ticker, 1);
-    const book = ob?.orderbook || ob?.order_book || ob;
-    const yesBids = book?.yes_bids || book?.yesBids || [];
-    const noBids  = book?.no_bids  || book?.noBids  || [];
-    const bid = side === "yes"
-      ? validBid(yesBids?.[0]?.price ?? null)
-      : validBid(noBids?.[0]?.price  ?? null);
-    if (bid) return { bidCents: bid, source: "orderbook" };
-  } catch (_) {}
+  if (!klines || klines.length < 30) {
+    return { direction: "neutral", confidence: 0, details: "insufficient_data" };
+  }
 
-  return { bidCents: null, source: "none" };
+  const closes = klines.map(k => k.close);
+  const price = closes[closes.length - 1];
+
+  // Compute indicators
+  const rsiVal = computeRSI(closes, 14);
+  const macdVal = computeMACD(closes);
+  const bb = computeBollingerBands(closes, 20, 2);
+
+  // Score each indicator: +1 = UP, -1 = DOWN, 0 = neutral
+  const indicators = {};
+
+  // RSI: < 30 = oversold (UP), > 70 = overbought (DOWN)
+  indicators.rsi = rsiVal < 30 ? 1 : rsiVal > 70 ? -1 : 0;
+
+  // MACD: histogram crossing up = UP, crossing down = DOWN
+  indicators.macd = (macdVal.histogram > 0 && macdVal.macd > macdVal.signal) ? 1
+    : (macdVal.histogram < 0 && macdVal.macd < macdVal.signal) ? -1 : 0;
+
+  // Bollinger Bands: price at lower band = UP, upper band = DOWN
+  indicators.bb = bb ? (bb.percentB < 0.1 ? 1 : bb.percentB > 0.9 ? -1 : 0) : 0;
+
+  // Binance order book imbalance
+  indicators.obImbalance = obImbalance.signal;
+
+  // Count agreements
+  const upVotes = Object.values(indicators).filter(v => v === 1).length;
+  const downVotes = Object.values(indicators).filter(v => v === -1).length;
+
+  console.log("INDICATORS:", {
+    rsi: rsiVal.toFixed(1) + " → " + indicators.rsi,
+    macd: macdVal.histogram.toFixed(2) + " → " + indicators.macd,
+    bb: (bb ? bb.percentB.toFixed(3) : "n/a") + " → " + indicators.bb,
+    obImbalance: obImbalance.ratio.toFixed(3) + " → " + indicators.obImbalance,
+    upVotes, downVotes,
+  });
+
+  // Require 3+ indicators to agree for a signal
+  if (upVotes >= 3) {
+    const confidence = 0.55 + (upVotes - 3) * 0.15; // 3 agree = 0.55, 4 agree = 0.70
+    return { direction: "up", confidence: Math.min(confidence, 0.85), price, indicators };
+  }
+  if (downVotes >= 3) {
+    const confidence = 0.55 + (downVotes - 3) * 0.15;
+    return { direction: "down", confidence: Math.min(confidence, 0.85), price, indicators };
+  }
+
+  console.log("No trade — indicators disagree (UP=" + upVotes + " DOWN=" + downVotes + ")");
+  return { direction: "neutral", confidence: 0, price, indicators };
 }
 
-async function maybeExitPosition(cfg){
-  const pos = await kvGetJson("bot:position");
-  console.log("DEBUG bot:position loaded =>", pos, "type:", typeof pos);
-if (!pos) return { exited:false, holding:false };
 
-  const ticker = pos.ticker;
-  const side = pos.side;
-  const entry = Number(pos.entryPriceCents || 0);
-  const count = Number(pos.count || 0);
-
-  if (!ticker || (side !== "yes" && side !== "no") || !entry || !count) {
-    console.log("Position invalid — clearing.");
-    try { await kvSetJson("bot:position", null); } catch {}
-    return { exited:false, holding:false };
-  }
-
-  const takeProfitPct = Number(cfg.takeProfitPct ?? 0.20);
-  const stopLossPct   = Number(cfg.stopLossPct   ?? 0.12);
-
-    // Prefer orderbook for bids (snapshot bids can be 0/100 on these markets)
-  let bidCents = null;
-  let bidSource = "none";
-  try {
-    const ob = await getOrderbook(ticker, 5);
-    const p = obTopPrice(ob, side);
-    if (p && p >= 1 && p <= 99) { bidCents = p; bidSource = "orderbook"; }
-  } catch {}
-
-  // Fallback to snapshot bid only if orderbook is empty
-  if (!bidCents) {
-    const snap = side === "yes"
-      ? (marketSnapshot?.yes_bid ?? marketSnapshot?.market?.yes_bid)
-      : (marketSnapshot?.no_bid  ?? marketSnapshot?.market?.no_bid);
-    const v = Number(snap);
-    if (Number.isFinite(v) && v >= 1 && v <= 99) { bidCents = v; bidSource = "snapshot"; }
-  }
-
-  const bid = { bidCents, source: bidSource }
-  if (!bid.bidCents) {
-    console.log("HOLD — no bid to exit on yet.");
-    return { exited:false, holding:true };
-  }
-
-  const pnlCentsPer = bid.bidCents - entry;
-  const pnlPct = pnlCentsPer / entry;
-
-  console.log(
-    "POSITION:",
-    side.toUpperCase(),
-    count + "x",
-    ticker,
-    "entry=" + entry + "¢",
-    "bestBid=" + bid.bidCents + "¢ (" + bid.source + ")",
-    "PnL=" + (pnlCentsPer >= 0 ? "+" : "") + pnlCentsPer + "¢/ct",
-    "(" + (pnlPct >= 0 ? "+" : "") + pct(pnlPct) + "%)"
-  );
-
-  const hitTP = pnlPct >= takeProfitPct;
-  const hitSL = pnlPct <= -stopLossPct;
-
-  if (!hitTP && !hitSL) {
-    console.log("No exit — TP/SL not hit. TP=" + pct(takeProfitPct) + "% SL=-" + pct(stopLossPct) + "%");
-    return { exited:false, holding:true };
-  }
-
-  const reason = hitTP ? "TAKE_PROFIT" : "STOP_LOSS";
-  const line = "SELL " + side.toUpperCase() + " " + count + "x " + ticker + " @ " + bid.bidCents + "¢ (reason=" + reason + ", mode=" + cfg.mode + ")";
-  console.log("EXIT:", line);
-
-  if (String(cfg.mode || "paper").toLowerCase() !== "live") {
-    console.log("PAPER MODE — would exit:", line);
-    try { await kvSetJson("bot:position", null); } catch {}
-    return { exited:true, holding:false };
-  }
-
-  const res = await // --- End exit pricing hardening ---
-
-placeOrder({ ticker, side, count, priceCents: bid.bidCents, action: "sell", tif: "immediate_or_cancel", postOnly: false });
-  console.log("EXIT ORDER RESULT:", res);
-
-// Re-check exit order status (response may show resting even if it fills a moment later)
-try {
-  const oid = res && res.order ? (res.order.order_id || res.order.orderId) : null;
-  if (oid) {
-    const chk = await kalshiFetch("/trade-api/v2/portfolio/orders/" + oid, { method: "GET", auth: true });
-    const st = chk && chk.order ? chk.order.status : null;
-    console.log("Re-check exit order status:", st);
-
-    // If not executed yet, keep position so we manage it next run
-    if (st && st !== "executed") {
-      console.log("Exit not filled yet — keeping position for next run.");
-      try {
-        const cur = await kvGetJson("bot:position");
-        if (cur && typeof cur === "object") {
-          cur.exitOrderId = oid;
-          await kvSetJson("bot:position", cur);
-        }
-      } catch {}
-      return { exited: false };
-    }
-  }
-} catch (e) {
-  console.log("Exit re-check failed (non-fatal):", e && e.message ? e.message : e);
-}
-try { await kvSetJson("bot:position", null); } catch {}
-  return { exited:true, holding:false };
-}
+// Exit logic removed — contracts settle at $1 or $0 in 15 minutes.
+// Risk is controlled purely through position sizing (tradeSizeUsd / maxContracts).
 
 function probYesFromSignal(direction, confidence) {
   const c = clamp(Number(confidence || 0), 0, 1);
@@ -242,9 +231,6 @@ async function getExecutablePrices(ticker) {
 }
 
 async function main() {
-  // FIX: marketSnapshot was referenced but never defined (we use orderbook anyway)
-  const marketSnapshot = null;
-
   const cfg = (await kvGetJson("bot:config")) || {};
 
   const enabled = !!cfg.enabled;
@@ -253,35 +239,35 @@ async function main() {
 
   const tradeSizeUsd = Number(cfg.tradeSizeUsd ?? 5);
   const maxContracts = Number(cfg.maxContracts ?? 5);
-  const minConfidence = Number(cfg.minConfidence ?? 0.15);
+  const minConfidence = Number(cfg.minConfidence ?? 0.55);
   const minEdge = Number(cfg.minEdge ?? 5);
-  const maxEntryPriceCents = (cfg.maxEntryPriceCents == null) ? 85 : Number(cfg.maxEntryPriceCents);
+  const minEntryPriceCents = Number(cfg.minEntryPriceCents ?? 35);
+  const maxEntryPriceCents = Number(cfg.maxEntryPriceCents ?? 80);
+  const minMinutesToCloseToEnter = Number(cfg.minMinutesToCloseToEnter ?? 10);
 
   console.log("CONFIG:", {
     enabled, mode, seriesTicker,
     tradeSizeUsd, maxContracts,
-    minConfidence, minEdge, maxEntryPriceCents
+    minConfidence, minEdge,
+    priceband: minEntryPriceCents + "¢–" + maxEntryPriceCents + "¢",
+    minMinutesToCloseToEnter,
   });
 
   if (!enabled) return console.log("Bot disabled — exiting.");
 
-  const sig = await getSignal();
-  console.log("SIGNAL:", sig);
-// --- Exit management first (sell-to-close) ---
+  // Check if we already have an open position — skip entry if so (let it settle)
   try {
-    const ex = await maybeExitPosition({ ...cfg, mode });
-    if (ex.exited) {
-      console.log("Exited position — skipping entry this run.");
-      return;
-    }
-    if (ex.holding) {
-      console.log("Holding open position — skipping entry this run.");
+    const pos = await kvGetJson("bot:position");
+    if (pos && pos.ticker) {
+      console.log("HOLDING position — letting it settle:", pos.side?.toUpperCase(), pos.count + "x", pos.ticker, "entry=" + pos.entryPriceCents + "¢");
       return;
     }
   } catch (e) {
-    console.log("Exit manager error (non-fatal):", e?.message || e);
+    console.log("Position check error (non-fatal):", e?.message || e);
   }
 
+  const sig = await getSignal();
+  console.log("SIGNAL:", sig);
 
   const confidence = Number(sig.confidence || 0);
   if (confidence < minConfidence) {
@@ -298,13 +284,26 @@ async function main() {
   console.log("Markets source: series(" + seriesTicker + ") — found:", markets.length);
 
   const prefix = seriesTicker + "-";
+  const now = Date.now();
   const candidates = markets
-    .filter(m => typeof m?.ticker === "string" && m.ticker.startsWith(prefix))
+    .filter(m => {
+      if (typeof m?.ticker !== "string" || !m.ticker.startsWith(prefix)) return false;
+      // Time gate: only enter markets with enough time remaining
+      const closeTs = m.close_time ? new Date(m.close_time).getTime()
+        : m.expiration_time ? new Date(m.expiration_time).getTime() : 0;
+      if (closeTs > 0) {
+        const minsLeft = (closeTs - now) / 60000;
+        if (minsLeft < minMinutesToCloseToEnter) {
+          return false;
+        }
+      }
+      return true;
+    })
     .sort((a,b) => Number(b.volume || 0) - Number(a.volume || 0))
     .slice(0, 30);
 
   if (!candidates.length) {
-    console.log("No tradable markets found after prefix filter:", prefix);
+    console.log("No tradable markets found (after prefix + time gate filter):", prefix);
     return;
   }
 
@@ -317,8 +316,9 @@ async function main() {
     const yesAsk = validPx(px.yesAsk ?? m.yes_ask ?? m.yesAsk ?? null);
     const noAsk  = validPx(px.noAsk  ?? m.no_ask  ?? m.noAsk  ?? null);
 
-    const yesOk = yesAsk && yesAsk <= maxEntryPriceCents;
-    const noOk  = noAsk  && noAsk  <= maxEntryPriceCents;
+    // Price band filter: only trade contracts priced 35¢–80¢
+    const yesOk = yesAsk && yesAsk >= minEntryPriceCents && yesAsk <= maxEntryPriceCents;
+    const noOk  = noAsk  && noAsk  >= minEntryPriceCents && noAsk  <= maxEntryPriceCents;
 
     if (!yesOk && !noOk) continue;
 

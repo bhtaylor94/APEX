@@ -11,12 +11,14 @@ export function defaultConfig() {
 
     minConfidence: 0.55,
 
-    takeProfitPct: 0.20,
-    stopLossPct: 0.12,
+    // No TP/SL — contracts settle at $1 or $0. Risk controlled by position sizing.
 
-    // Force-exit rules for short-duration markets
-    minMinutesToCloseToEnter: 3,
-    minMinutesToCloseToHold: 2,
+    // Price band: only trade contracts priced 35¢–80¢
+    minEntryPriceCents: 35,
+    maxEntryPriceCents: 80,
+
+    // Time gate: only enter with 10+ minutes until settlement
+    minMinutesToCloseToEnter: 10,
 
     cooldownMinutes: 8,
     maxTradesPerDay: 10,
