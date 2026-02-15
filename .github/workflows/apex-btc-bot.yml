@@ -13,8 +13,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install
-      - run: node scripts/run-bot-clean.mjs
+      - name: Install dependencies
+        run: |
+          npm install
+          echo "--- Checking firebase-admin ---"
+          node -e "import('firebase-admin').then(m => console.log('firebase-admin loaded OK'))" || echo "FAILED to load firebase-admin"
+          ls -la node_modules/firebase-admin/package.json 2>&1 || echo "firebase-admin not in node_modules"
+      - name: Run bot
+        run: node scripts/run-bot-clean.mjs
         env:
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
