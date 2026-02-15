@@ -12,8 +12,11 @@ function validPx(v) {
   return n;
 }
 
-function calcContracts({ tradeSizeUsd, maxContracts, askCents }) {
-  const budgetCents = Math.max(1, Math.round((tradeSizeUsd || 10) * 100));
+function calcContracts({ tradeSizeUsd, maxContracts, askCents, confidence }) {
+  // Scale bet size by confidence: 100% confidence = full $5, 50% = $2.50, etc.
+  const maxBet = Math.min(tradeSizeUsd || 5, 5); // hard cap at $5
+  const scaledBet = maxBet * Math.max(0.2, Math.min(1, (confidence || 50) / 100));
+  const budgetCents = Math.max(1, Math.round(scaledBet * 100));
   const byBudget = Math.floor(budgetCents / askCents);
   return clamp(Math.max(1, byBudget), 1, maxContracts || 10);
 }
@@ -581,16 +584,17 @@ export async function runBotCycle() {
   // Cross-check with Kalshi (source of truth)
   const kalshiPositions = await getKalshiPositions();
   const seriesPrefix = seriesTicker + "-";
+  // position field = current net holding (positive=yes, negative=no). total_traded = cumulative volume (wrong for sell count!)
   const relevantPositions = kalshiPositions.filter(p =>
-    p.ticker?.startsWith(seriesPrefix) && (p.total_traded > 0 || p.quantity > 0)
+    p.ticker?.startsWith(seriesPrefix) && p.position !== 0 && p.position != null
   );
 
   // Position recovery: if bot:position is null but Kalshi has a position, recover it
   if ((!pos || !pos.ticker) && relevantPositions.length > 0) {
     const kp = relevantPositions[0];
-    const side = (kp.market_position || kp.position || "yes").toLowerCase();
-    const count = kp.total_traded || kp.quantity || 1;
-    _log("RECOVERING orphan position: " + side.toUpperCase() + " " + count + "x " + kp.ticker);
+    const posCount = Math.abs(kp.position || 0);
+    const side = (kp.position > 0) ? "yes" : "no";
+    _log("RECOVERING orphan position: " + side.toUpperCase() + " " + posCount + "x " + kp.ticker);
     let marketCloseTs = null;
     try {
       const mkt = await getMarket(kp.ticker);
@@ -598,8 +602,20 @@ export async function runBotCycle() {
       marketCloseTs = mm?.close_time ? new Date(mm.close_time).getTime()
         : mm?.expiration_time ? new Date(mm.expiration_time).getTime() : null;
     } catch (_) {}
+    // Try to get actual entry price from fills
+    let entryPrice = 50;
+    try {
+      const fills = await kalshiFetch("/trade-api/v2/portfolio/fills?ticker=" + encodeURIComponent(kp.ticker) + "&limit=20", { method: "GET" });
+      const buyFills = (fills?.fills || []).filter(f => f.action === "buy");
+      if (buyFills.length > 0) {
+        const totalCost = buyFills.reduce((s, f) => s + (f.yes_price || f.no_price || 50) * (f.count || 1), 0);
+        const totalQty = buyFills.reduce((s, f) => s + (f.count || 1), 0);
+        entryPrice = Math.round(totalCost / totalQty);
+        _log("RECOVERED entry price: " + entryPrice + "c from " + buyFills.length + " fills");
+      }
+    } catch (_) {}
     pos = {
-      ticker: kp.ticker, side, entryPriceCents: 50, count,
+      ticker: kp.ticker, side, entryPriceCents: entryPrice, count: posCount,
       openedTs: Date.now(), orderId: null, marketCloseTs,
     };
     await kvSetJson("bot:position", pos);
@@ -645,6 +661,14 @@ export async function runBotCycle() {
       pos = null;
     } else {
       // ── TAKE PROFIT CHECK ──
+      // Verify actual count from Kalshi before making sell decisions
+      const kalshiMatch = relevantPositions.find(p => p.ticker === pos.ticker);
+      const realCount = kalshiMatch ? Math.abs(kalshiMatch.position || 0) : 0;
+      if (realCount > 0 && realCount !== pos.count) {
+        _log("COUNT FIX: stored=" + pos.count + " kalshi=" + realCount);
+        pos.count = realCount;
+        await kvSetJson("bot:position", pos);
+      }
       // Fetch LIVE orderbook — getMarket() returns stale/zero bids
       const bestBid = await getBestBidFromOrderbook(pos.ticker, pos.side);
       const entryPx = pos.entryPriceCents || 50;
@@ -820,8 +844,12 @@ export async function runBotCycle() {
 
   // ── Step 7: Place maker order ──
 
-  const count = calcContracts({ tradeSizeUsd, maxContracts, askCents: best.limitPrice });
-  const line = "BUY " + best.side.toUpperCase() + " " + count + "x " + best.ticker + " @ " + best.limitPrice + "c (maker, mode=" + mode + ")";
+  // Size by confidence: predProb ~50-80 → confidence 0-100%
+  const confidence = Math.min(100, Math.max(20, ((predProb || 50) - 50) * 100 / 30));
+  const count = calcContracts({ tradeSizeUsd, maxContracts, askCents: best.limitPrice, confidence });
+  const betSize = (best.limitPrice * count / 100).toFixed(2);
+  const line = "BUY " + best.side.toUpperCase() + " " + count + "x " + best.ticker + " @ " + best.limitPrice +
+    "c (conf=" + Math.round(confidence) + "% bet=$" + betSize + " mode=" + mode + ")";
   _log("ORDER: " + line);
 
   if (mode !== "live") {

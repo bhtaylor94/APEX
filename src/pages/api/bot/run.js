@@ -67,8 +67,11 @@ function validPx(v) {
   return n;
 }
 
-function calcContracts({ tradeSizeUsd, maxContracts, askCents }) {
-  const budgetCents = Math.max(1, Math.round((tradeSizeUsd || 10) * 100));
+function calcContracts({ tradeSizeUsd, maxContracts, askCents, confidence }) {
+  // Scale bet size by confidence: 100% confidence = full $5, 50% = $2.50, etc.
+  const maxBet = Math.min(tradeSizeUsd || 5, 5); // hard cap at $5
+  const scaledBet = maxBet * Math.max(0.2, Math.min(1, (confidence || 50) / 100));
+  const budgetCents = Math.max(1, Math.round(scaledBet * 100));
   const byBudget = Math.floor(budgetCents / askCents);
   return clamp(Math.max(1, byBudget), 1, maxContracts || 10);
 }
@@ -260,10 +263,15 @@ function getSignalWithWeights(closes, obRatio, weights, minScoreThreshold) {
 
 // ── Kalshi helpers ──
 
-async function getKalshiPositions() {
+async function getKalshiPositions(log) {
   try {
     const data = await kalshiFetch("/trade-api/v2/portfolio/positions?limit=100&settlement_status=unsettled", { method: "GET" });
-    return data?.market_positions || data?.positions || [];
+    const positions = data?.market_positions || data?.positions || [];
+    if (log && positions.length > 0) log("KALSHI_POS_RAW: " + JSON.stringify(positions.map(p => ({
+      ticker: p.ticker, position: p.position, total_traded: p.total_traded,
+      market_position: p.market_position, resting_orders_count: p.resting_orders_count
+    }))));
+    return positions;
   } catch { return []; }
 }
 
@@ -401,18 +409,33 @@ async function runBotCycle() {
 
   // ── Position check + take profit ──
   let pos = await kvGetJson("bot:position");
-  const kalshiPos = await getKalshiPositions();
+  const kalshiPos = await getKalshiPositions(L);
   const prefix = seriesTicker + "-";
-  const relevant = kalshiPos.filter(p => p.ticker?.startsWith(prefix) && (p.total_traded > 0 || p.quantity > 0));
+  // position = current net holding count (positive=yes, negative=no). total_traded = cumulative volume (useless for sell count)
+  const relevant = kalshiPos.filter(p => p.ticker?.startsWith(prefix) && p.position !== 0 && p.position != null);
 
-  // Recovery
+  // Recovery — if we have no tracked position but Kalshi shows one
   if ((!pos || !pos.ticker) && relevant.length > 0) {
     const kp = relevant[0];
-    const side = (kp.market_position || kp.position || "yes").toLowerCase();
-    L("RECOVERING position: " + side + " " + kp.ticker);
+    // position > 0 = holding YES, position < 0 = holding NO
+    const posCount = Math.abs(kp.position || 0);
+    const side = (kp.position > 0) ? "yes" : "no";
+    L("RECOVERING position: " + side + " " + posCount + "x " + kp.ticker);
     let closeTime = null;
     try { const mp = await getMarketPrices(kp.ticker); closeTime = mp.closeTime; } catch {}
-    pos = { ticker: kp.ticker, side, entryPriceCents: 50, count: kp.total_traded || kp.quantity || 1,
+    // Try to get actual entry from fills
+    let entryPrice = 50;
+    try {
+      const fills = await kalshiFetch("/trade-api/v2/portfolio/fills?ticker=" + encodeURIComponent(kp.ticker) + "&limit=20", { method: "GET" });
+      const buyFills = (fills?.fills || []).filter(f => f.action === "buy");
+      if (buyFills.length > 0) {
+        const totalCost = buyFills.reduce((s, f) => s + (f.yes_price || f.no_price || 50) * (f.count || 1), 0);
+        const totalQty = buyFills.reduce((s, f) => s + (f.count || 1), 0);
+        entryPrice = Math.round(totalCost / totalQty);
+        L("RECOVERED entry price: " + entryPrice + "c from " + buyFills.length + " fills");
+      }
+    } catch {}
+    pos = { ticker: kp.ticker, side, entryPriceCents: entryPrice, count: posCount,
       openedTs: Date.now(), marketCloseTs: closeTime ? new Date(closeTime).getTime() : null };
     await kvSetJson("bot:position", pos);
   }
@@ -440,9 +463,16 @@ async function runBotCycle() {
       await kvSetJson("bot:position", null);
       pos = null;
     } else {
-      // Take profit check
+      // Take profit check — verify actual count from Kalshi
       const bestBid = await getBestBid(pos.ticker, pos.side, L);
       const entry = pos.entryPriceCents || 50;
+      const kalshiMatch = relevant.find(p => p.ticker === pos.ticker);
+      const realCount = kalshiMatch ? Math.abs(kalshiMatch.position || 0) : 0;
+      if (realCount > 0 && realCount !== pos.count) {
+        L("COUNT FIX: stored=" + pos.count + " kalshi=" + realCount);
+        pos.count = realCount;
+        await kvSetJson("bot:position", pos);
+      }
       const cnt = pos.count || 1;
       const totalCost = entry * cnt;
       const totalVal = bestBid ? bestBid * cnt : 0;
@@ -560,9 +590,13 @@ async function runBotCycle() {
     return { action: "no_edge", log };
   }
 
-  // ── Place order ──
-  const count = calcContracts({ tradeSizeUsd, maxContracts, askCents: best.limitPrice });
-  L("ORDER: " + best.side.toUpperCase() + " " + count + "x " + best.ticker + " @ " + best.limitPrice + "c (edge=" + best.edge.toFixed(1) + "c)");
+  // ── Place order — size by confidence ──
+  // predProb ranges ~50-80. Map to 0-100 confidence: (predProb - 50) * 100 / 30
+  const confidence = Math.min(100, Math.max(20, ((sig.predProb || 50) - 50) * 100 / 30));
+  const count = calcContracts({ tradeSizeUsd, maxContracts, askCents: best.limitPrice, confidence });
+  const betSize = (best.limitPrice * count / 100).toFixed(2);
+  L("ORDER: " + best.side.toUpperCase() + " " + count + "x " + best.ticker + " @ " + best.limitPrice +
+    "c (edge=" + best.edge.toFixed(1) + "c conf=" + Math.round(confidence) + "% bet=$" + betSize + ")");
 
   if (mode !== "live") {
     const posData = { ticker: best.ticker, side: best.side, entryPriceCents: best.limitPrice,
