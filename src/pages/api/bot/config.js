@@ -13,6 +13,8 @@ function pickConfig(input, current) {
     "minEntryPriceCents",
     "maxEntryPriceCents",
     "minMinutesToCloseToEnter",
+    "takeProfitCents",
+    "stopLossCents",
     "cooldownMinutes",
     "maxTradesPerDay",
     "dailyMaxLossUsd"
@@ -31,6 +33,7 @@ function pickConfig(input, current) {
   const numFields = [
     "tradeSizeUsd","maxContracts","minConfidence","minEdge",
     "minEntryPriceCents","maxEntryPriceCents",
+    "takeProfitCents","stopLossCents",
     "minMinutesToCloseToEnter","cooldownMinutes",
     "maxTradesPerDay","dailyMaxLossUsd"
   ];
