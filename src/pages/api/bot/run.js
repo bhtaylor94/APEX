@@ -145,8 +145,8 @@ const INDICATORS = ["rsi", "macd", "bb", "ema", "ob"];
 
 async function getLearnedWeights() {
   const learned = await kvGetJson("bot:learned_weights");
-  if (!learned || !learned.weights) return { weights: { ...DEFAULT_WEIGHTS }, minScoreThreshold: 3 };
-  return { weights: { ...DEFAULT_WEIGHTS, ...learned.weights }, minScoreThreshold: learned.minScoreThreshold || 3 };
+  if (!learned || !learned.weights) return { weights: { ...DEFAULT_WEIGHTS }, minScoreThreshold: 2 };
+  return { weights: { ...DEFAULT_WEIGHTS, ...learned.weights }, minScoreThreshold: learned.minScoreThreshold || 2 };
 }
 
 async function learnFromTrades(L) {
@@ -185,14 +185,29 @@ async function learnFromTrades(L) {
 
   const total = wins + losses;
   const winRate = total > 0 ? wins / total : 0.5;
-  let minScore = 3;
-  if (winRate < 0.35 && total >= 5) minScore = 4;
-  else if (winRate < 0.45 && total >= 8) minScore = 3.5;
-  else if (winRate > 0.65 && total >= 8) minScore = 2.5;
+
+  // Count recent consecutive losses (streak from end of array)
+  let lossStreak = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].result === "loss") lossStreak++;
+    else break;
+  }
+
+  // Dynamic threshold: base=2, tighten on losses, loosen on good performance
+  let minScore = 2;
+  if (lossStreak >= 4) minScore = 3.5;          // 4+ losses in a row: go strict
+  else if (lossStreak >= 3) minScore = 3;        // 3 losses: moderate tightening
+  else if (lossStreak >= 2) minScore = 2.5;      // 2 losses: slight tightening
+  else if (winRate >= 0.65 && total >= 5) minScore = 1.5;  // hot streak: loosen up
+  else if (winRate < 0.35 && total >= 5) minScore = 3;     // overall bad: tighten
+
+  const mode = lossStreak >= 3 ? "recovery" : winRate >= 0.6 ? "aggressive" : "normal";
 
   await kvSetJson("bot:learned_weights", { weights: newWeights, minScoreThreshold: minScore,
-    winRate: Math.round(winRate * 100), totalTrades: total, indicatorStats: stats, lastUpdated: Date.now() });
-  if (L) L("LEARNED: weights=" + JSON.stringify(newWeights) + " minScore=" + minScore + " winRate=" + Math.round(winRate * 100) + "%");
+    winRate: Math.round(winRate * 100), totalTrades: total, lossStreak, mode,
+    indicatorStats: stats, lastUpdated: Date.now() });
+  if (L) L("LEARNED: weights=" + JSON.stringify(newWeights) + " minScore=" + minScore + " mode=" + mode +
+    " winRate=" + Math.round(winRate * 100) + "% streak=" + lossStreak + "L");
 }
 
 function getSignalWithWeights(closes, obRatio, weights, minScoreThreshold) {
@@ -503,8 +518,11 @@ async function runBotCycle() {
 
   const closes = candles.map(c => c.close);
   const { weights, minScoreThreshold } = await getLearnedWeights();
+  const learned = await kvGetJson("bot:learned_weights");
+  const tradingMode = learned?.mode || "normal";
   const sig = getSignalWithWeights(closes, ob.ratio, weights, minScoreThreshold);
-  L("SIGNAL: score=" + sig.score + " dir=" + (sig.direction || "neutral") + " " + JSON.stringify(sig.breakdown));
+  L("SIGNAL: score=" + sig.score + " threshold=" + minScoreThreshold + " mode=" + tradingMode +
+    " dir=" + (sig.direction || "neutral") + " " + JSON.stringify(sig.breakdown));
 
   if (sig.direction === "neutral") {
     await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });

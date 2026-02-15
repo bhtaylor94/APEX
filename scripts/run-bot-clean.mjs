@@ -108,7 +108,143 @@ function computeBollingerBands(closes, period = 20, mult = 2) {
   return { upper: avg + mult * std, middle: avg, lower: avg - mult * std, price, std };
 }
 
-// ── Signal generator: weighted scoring, 5 indicators ──
+// ── Adaptive learning: analyze past trades to adjust indicator weights ──
+
+const DEFAULT_WEIGHTS = { rsi: 2, macd: 1, bb: 1, ema: 1, ob: 1 };
+const INDICATORS = ["rsi", "macd", "bb", "ema", "ob"];
+
+async function getLearnedWeights() {
+  const learned = await kvGetJson("bot:learned_weights");
+  if (!learned || !learned.weights) return { ...DEFAULT_WEIGHTS };
+  return { ...DEFAULT_WEIGHTS, ...learned.weights };
+}
+
+async function learnFromTrades() {
+  const history = (await kvGetJson("bot:trade_history")) || [];
+  // Need at least 5 trades with indicator data to learn from
+  const tradesWithSignals = history.filter(t => t.signal && t.signal.indicators);
+  if (tradesWithSignals.length < 5) return null;
+
+  // Analyze last 20 trades (or all if fewer)
+  const recent = tradesWithSignals.slice(-20);
+
+  // For each indicator, track: how often did it agree with the winning outcome?
+  const indicatorStats = {};
+  for (const ind of INDICATORS) {
+    indicatorStats[ind] = { correct: 0, wrong: 0, neutral: 0 };
+  }
+
+  let totalWins = 0;
+  let totalLosses = 0;
+  let totalPnl = 0;
+  const entryPriceStats = { low: 0, lowWin: 0, mid: 0, midWin: 0, high: 0, highWin: 0 };
+
+  for (const trade of recent) {
+    const won = trade.result === "win" || trade.result === "tp_exit";
+    const lost = trade.result === "loss";
+    if (won) totalWins++;
+    if (lost) totalLosses++;
+    totalPnl += (trade.pnlCents || 0);
+
+    // Track entry price ranges
+    const ep = trade.entryPriceCents || 50;
+    if (ep < 45) { entryPriceStats.low++; if (won) entryPriceStats.lowWin++; }
+    else if (ep <= 65) { entryPriceStats.mid++; if (won) entryPriceStats.midWin++; }
+    else { entryPriceStats.high++; if (won) entryPriceStats.highWin++; }
+
+    const indicators = trade.signal.indicators;
+    if (!indicators) continue;
+
+    // The trade direction: "up" means we bought YES, "down" means we bought NO
+    // A "correct" indicator is one that voted in the trade direction AND the trade won,
+    // OR voted against the trade direction and the trade lost
+    const tradeDir = trade.signal.direction; // "up" or "down"
+
+    for (const ind of INDICATORS) {
+      const vote = indicators[ind] || 0; // +N, -N, or 0
+      if (vote === 0) {
+        indicatorStats[ind].neutral++;
+        continue;
+      }
+      const votedUp = vote > 0;
+      const votedWithTrade = (tradeDir === "up" && votedUp) || (tradeDir === "down" && !votedUp);
+
+      if ((votedWithTrade && won) || (!votedWithTrade && lost)) {
+        indicatorStats[ind].correct++;
+      } else {
+        indicatorStats[ind].wrong++;
+      }
+    }
+  }
+
+  // Calculate new weights based on accuracy
+  const newWeights = {};
+  for (const ind of INDICATORS) {
+    const s = indicatorStats[ind];
+    const total = s.correct + s.wrong;
+    if (total < 3) {
+      // Not enough data, keep default
+      newWeights[ind] = DEFAULT_WEIGHTS[ind];
+      continue;
+    }
+    const accuracy = s.correct / total;
+    // Scale weight: 50% accuracy = default weight, 75% = 1.5x, 25% = 0.5x
+    // Clamp between 0.25 and 3x of default weight
+    const multiplier = Math.max(0.25, Math.min(3, accuracy * 2));
+    newWeights[ind] = Math.round(DEFAULT_WEIGHTS[ind] * multiplier * 100) / 100;
+  }
+
+  // Dynamic threshold based on recent performance + loss streaks
+  const totalTrades = totalWins + totalLosses;
+  const winRate = totalTrades > 0 ? totalWins / totalTrades : 0.5;
+
+  // Count recent consecutive losses (streak from end of array)
+  let lossStreak = 0;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    if (recent[i].result === "loss") lossStreak++;
+    else break;
+  }
+
+  // Base threshold = 2 (loose). Tighten on losses, loosen on hot streaks.
+  let minScoreThreshold = 2;
+  if (lossStreak >= 4) minScoreThreshold = 3.5;          // 4+ losses in a row: go strict
+  else if (lossStreak >= 3) minScoreThreshold = 3;        // 3 losses: moderate tightening
+  else if (lossStreak >= 2) minScoreThreshold = 2.5;      // 2 losses: slight tightening
+  else if (winRate >= 0.65 && totalTrades >= 5) minScoreThreshold = 1.5;  // hot streak: loosen up
+  else if (winRate < 0.35 && totalTrades >= 5) minScoreThreshold = 3;     // overall bad: tighten
+
+  const tradingMode = lossStreak >= 3 ? "recovery" : winRate >= 0.6 ? "aggressive" : "normal";
+
+  // Entry price insights
+  let priceAdvice = null;
+  if (entryPriceStats.low >= 3 && entryPriceStats.lowWin / entryPriceStats.low < 0.3) {
+    priceAdvice = "low_price_losing"; // Cheap contracts losing — raise minEntryPriceCents
+  }
+
+  const result = {
+    weights: newWeights,
+    minScoreThreshold,
+    winRate: Math.round(winRate * 100),
+    totalTrades,
+    totalPnl,
+    lossStreak,
+    mode: tradingMode,
+    indicatorStats,
+    priceAdvice,
+    lastUpdated: Date.now(),
+  };
+
+  await kvSetJson("bot:learned_weights", result);
+  console.log("LEARNING UPDATE:", JSON.stringify({
+    weights: newWeights, minScore: minScoreThreshold, mode: tradingMode,
+    winRate: result.winRate + "%", trades: totalTrades, pnl: "$" + (totalPnl / 100).toFixed(2),
+    lossStreak, priceAdvice,
+  }));
+
+  return result;
+}
+
+// ── Signal generator: adaptive weighted scoring, 5 indicators ──
 
 async function getSignal() {
   let candles, orderBook;
@@ -126,6 +262,11 @@ async function getSignal() {
     return { direction: "neutral", score: 0, confidence: 0, details: "insufficient_data" };
   }
 
+  // Load learned weights (or defaults if not enough trades yet)
+  const weights = await getLearnedWeights();
+  const learned = await kvGetJson("bot:learned_weights");
+  const minScoreThreshold = learned?.minScoreThreshold || 2;
+
   const closes = candles.map(c => c.close);
   const price = closes[closes.length - 1];
 
@@ -136,49 +277,70 @@ async function getSignal() {
   const ema21 = ema(closes, 21);
   const obRatio = orderBook.ratio;
 
+  // Raw indicator votes (+1/-1/0) — stored with trade for learning
+  const indicators = { rsi: 0, macd: 0, bb: 0, ema: 0, ob: 0 };
   let score = 0;
   const breakdown = {};
 
-  if (rsiVal < 30) { score += 2; breakdown.rsi = "+2 (oversold " + rsiVal.toFixed(1) + ")"; }
-  else if (rsiVal > 70) { score -= 2; breakdown.rsi = "-2 (overbought " + rsiVal.toFixed(1) + ")"; }
-  else { breakdown.rsi = "0 (neutral " + rsiVal.toFixed(1) + ")"; }
+  // RSI
+  if (rsiVal < 30) { indicators.rsi = 1; }
+  else if (rsiVal > 70) { indicators.rsi = -1; }
+  score += indicators.rsi * weights.rsi;
+  breakdown.rsi = (indicators.rsi > 0 ? "+" : indicators.rsi < 0 ? "-" : "") +
+    (indicators.rsi !== 0 ? weights.rsi.toFixed(1) : "0") + " (rsi=" + rsiVal.toFixed(1) + ")";
 
-  if (macdVal.macd > macdVal.signal) { score += 1; breakdown.macd = "+1 (bullish)"; }
-  else if (macdVal.macd < macdVal.signal) { score -= 1; breakdown.macd = "-1 (bearish)"; }
-  else { breakdown.macd = "0 (neutral)"; }
+  // MACD
+  if (macdVal.macd > macdVal.signal) { indicators.macd = 1; }
+  else if (macdVal.macd < macdVal.signal) { indicators.macd = -1; }
+  score += indicators.macd * weights.macd;
+  breakdown.macd = (indicators.macd > 0 ? "+" : indicators.macd < 0 ? "-" : "") +
+    (indicators.macd !== 0 ? weights.macd.toFixed(1) : "0");
 
+  // Bollinger Bands
   if (bb) {
-    if (price < bb.lower) { score += 1; breakdown.bb = "+1 (below lower)"; }
-    else if (price > bb.upper) { score -= 1; breakdown.bb = "-1 (above upper)"; }
-    else { breakdown.bb = "0 (within bands)"; }
-  } else { breakdown.bb = "0 (n/a)"; }
+    if (price < bb.lower) { indicators.bb = 1; }
+    else if (price > bb.upper) { indicators.bb = -1; }
+  }
+  score += indicators.bb * weights.bb;
+  breakdown.bb = (indicators.bb > 0 ? "+" : indicators.bb < 0 ? "-" : "") +
+    (indicators.bb !== 0 ? weights.bb.toFixed(1) : "0");
 
+  // EMA crossover
   if (ema9 != null && ema21 != null) {
-    if (ema9 > ema21) { score += 1; breakdown.ema = "+1 (9>21 bullish)"; }
-    else if (ema9 < ema21) { score -= 1; breakdown.ema = "-1 (9<21 bearish)"; }
-    else { breakdown.ema = "0 (equal)"; }
-  } else { breakdown.ema = "0 (n/a)"; }
+    if (ema9 > ema21) { indicators.ema = 1; }
+    else if (ema9 < ema21) { indicators.ema = -1; }
+  }
+  score += indicators.ema * weights.ema;
+  breakdown.ema = (indicators.ema > 0 ? "+" : indicators.ema < 0 ? "-" : "") +
+    (indicators.ema !== 0 ? weights.ema.toFixed(1) : "0");
 
-  if (obRatio > 0.60) { score += 1; breakdown.ob = "+1 (bid heavy " + obRatio.toFixed(3) + ")"; }
-  else if (obRatio < 0.40) { score -= 1; breakdown.ob = "-1 (ask heavy " + obRatio.toFixed(3) + ")"; }
-  else { breakdown.ob = "0 (balanced " + obRatio.toFixed(3) + ")"; }
+  // Order book imbalance
+  if (obRatio > 0.60) { indicators.ob = 1; }
+  else if (obRatio < 0.40) { indicators.ob = -1; }
+  score += indicators.ob * weights.ob;
+  breakdown.ob = (indicators.ob > 0 ? "+" : indicators.ob < 0 ? "-" : "") +
+    (indicators.ob !== 0 ? weights.ob.toFixed(1) : "0") + " (ob=" + obRatio.toFixed(3) + ")";
 
-  console.log("SIGNAL SCORE:", score, "/ 7");
+  // Max possible score with current weights
+  const maxScore = weights.rsi + weights.macd + weights.bb + weights.ema + weights.ob;
+
+  console.log("SIGNAL SCORE:", score.toFixed(2), "/ " + maxScore.toFixed(1) + " (threshold: " + minScoreThreshold + ")");
+  console.log("WEIGHTS:", JSON.stringify(weights));
   console.log("BREAKDOWN:", breakdown);
 
   const absScore = Math.abs(score);
 
-  if (absScore < 3) {
-    console.log("No trade -- score " + score + " (need |3|+ for edge)");
-    return { direction: "neutral", score, confidence: 0, price, breakdown };
+  if (absScore < minScoreThreshold) {
+    console.log("No trade -- score " + score.toFixed(2) + " (need |" + minScoreThreshold + "|+)");
+    return { direction: "neutral", score, confidence: 0, price, breakdown, indicators };
   }
 
-  const confidence = absScore / 7;
+  const confidence = absScore / maxScore;
   const direction = score > 0 ? "up" : "down";
   const predProb = 50 + confidence * 30;
 
   console.log("SIGNAL:", direction.toUpperCase(), "confidence=" + (confidence * 100).toFixed(0) + "%", "predProb=" + predProb.toFixed(1) + "%");
-  return { direction, score, confidence, predProb, price, breakdown };
+  return { direction, score, confidence, predProb, price, breakdown, indicators };
 }
 
 // ── Kalshi helpers ──
@@ -478,6 +640,7 @@ export async function runBotCycle() {
         signal: pos.signal || null, openedTs: pos.openedTs, settledTs: Date.now(),
       });
       await recordDailyTrade(won ? "win" : "loss", pnlCents);
+      await learnFromTrades();
       await kvSetJson("bot:position", null);
       pos = null;
     } else {
@@ -510,6 +673,7 @@ export async function runBotCycle() {
             signal: pos.signal || null, openedTs: pos.openedTs, closedTs: Date.now(),
           });
           await recordDailyTrade("tp_exit", pnlCents);
+          await learnFromTrades();
           await kvSetJson("bot:position", null);
           _log("TAKE PROFIT: Sold " + count + " " + pos.side + " contracts at " + bestBid +
             "c, entry was " + entryPx + "c, profit: $" + (pnlCents / 100).toFixed(2));
@@ -544,6 +708,7 @@ export async function runBotCycle() {
               signal: pos.signal || null, openedTs: pos.openedTs, closedTs: Date.now(),
             });
             await recordDailyTrade("tp_exit", pnlCents);
+            await learnFromTrades();
             await kvSetJson("bot:position", null);
             _log("TAKE PROFIT: Sold " + fillCount + " " + pos.side + " contracts at " + bestBid +
               "c, entry was " + entryPx + "c, profit: $" + (pnlCents / 100).toFixed(2));
@@ -664,7 +829,7 @@ export async function runBotCycle() {
     const posData = {
       ticker: best.ticker, side: best.side, entryPriceCents: best.limitPrice,
       count, openedTs: Date.now(), orderId: "paper-" + Date.now(),
-      signal: { direction: sig.direction, score: sig.score, predProb },
+      signal: { direction: sig.direction, score: sig.score, predProb, indicators: sig.indicators },
       marketCloseTs: best.marketCloseTs,
     };
     await kvSetJson("bot:position", posData);
@@ -691,7 +856,7 @@ export async function runBotCycle() {
     const posData = {
       ticker: best.ticker, side: best.side, entryPriceCents: best.limitPrice,
       count: fillCount, openedTs: Date.now(), orderId: order.order_id || null,
-      signal: { direction: sig.direction, score: sig.score, predProb },
+      signal: { direction: sig.direction, score: sig.score, predProb, indicators: sig.indicators },
       marketCloseTs: best.marketCloseTs,
     };
     await kvSetJson("bot:position", posData);
@@ -703,7 +868,7 @@ export async function runBotCycle() {
     await kvSetJson("bot:pendingOrder", {
       orderId: order.order_id, ticker: best.ticker, side: best.side,
       limitPrice: best.limitPrice, count, placedTs: Date.now(),
-      signal: { direction: sig.direction, score: sig.score, predProb },
+      signal: { direction: sig.direction, score: sig.score, predProb, indicators: sig.indicators },
     });
   } else {
     _log("ORDER STATUS unexpected: " + status);
