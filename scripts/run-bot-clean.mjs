@@ -1,4 +1,4 @@
-import { kvGetJson, kvSetJson } from "./kv.mjs";
+import { kvGetJson, kvSetJson } from "./kv.js";
 import { getMarkets, getMarket, getOrderbook, placeOrder } from "./kalshi_client.mjs";
 
 function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
@@ -18,7 +18,8 @@ function calcContracts({ tradeSizeUsd, maxContracts, askCents }) {
 
 // ── Binance data fetchers (public, no auth) ──
 
-const BINANCE_BASE = "https://api.binance.com";
+// Binance.US for US-based deployments (api.binance.com returns 451 from US IPs)
+const BINANCE_BASE = "https://api.binance.us";
 
 async function fetchBinanceKlines(limit = 100) {
   const url = `${BINANCE_BASE}/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=${limit}`;
