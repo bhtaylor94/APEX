@@ -84,19 +84,21 @@ function computeRSI(closes, period = 14) {
 }
 
 function computeMACD(closes) {
-  const ema12 = ema(closes, 12);
-  const ema26 = ema(closes, 26);
-  if (!ema12 || !ema26) return { macd: 0, signal: 0, histogram: 0 };
-  const macdLine = ema12 - ema26;
-  const mH = [];
+  if (closes.length < 26) return { macd: 0, signal: 0, histogram: 0 };
   const k12 = 2 / 13, k26 = 2 / 27;
   let e12 = closes.slice(0, 12).reduce((s, v) => s + v, 0) / 12;
   let e26 = closes.slice(0, 26).reduce((s, v) => s + v, 0) / 26;
+  // Update EMA-12 for values 12-25 (before EMA-26 is ready)
+  for (let i = 12; i < 26; i++) {
+    e12 = closes[i] * k12 + e12 * (1 - k12);
+  }
+  const mH = [];
   for (let i = 26; i < closes.length; i++) {
     e12 = closes[i] * k12 + e12 * (1 - k12);
     e26 = closes[i] * k26 + e26 * (1 - k26);
     mH.push(e12 - e26);
   }
+  const macdLine = e12 - e26;
   const sig = mH.length >= 9 ? ema(mH, 9) : macdLine;
   return { macd: macdLine, signal: sig || 0, histogram: macdLine - (sig || 0) };
 }
@@ -298,27 +300,27 @@ async function maybeExitPosition(pos, cfg) {
   const takeProfitThreshold = Number(cfg.takeProfitCents ?? 15);
   if (profitCents >= takeProfitThreshold) {
     console.log("TAKE PROFIT: +" + profitCents + "c >= +" + takeProfitThreshold + "c threshold");
-    return await executeSell(ticker, side, count, currentBid, cfg.mode);
+    return await executeSell(ticker, side, count, currentBid, cfg.mode, entryPrice);
   }
 
   // 2. STOP LOSS: sell if bid <= entry - 20c (cut losses before total wipeout)
   const stopLossThreshold = Number(cfg.stopLossCents ?? 20);
   if (profitCents <= -stopLossThreshold) {
     console.log("STOP LOSS: " + profitCents + "c <= -" + stopLossThreshold + "c threshold");
-    return await executeSell(ticker, side, count, currentBid, cfg.mode);
+    return await executeSell(ticker, side, count, currentBid, cfg.mode, entryPrice);
   }
 
   // 3. TIME EXIT: if < 3 minutes left and losing, sell to salvage capital
   if (minsLeft < 3 && profitCents < -5) {
     console.log("TIME EXIT: <3 min left and losing " + profitCents + "c. Selling to salvage.");
-    return await executeSell(ticker, side, count, currentBid, cfg.mode);
+    return await executeSell(ticker, side, count, currentBid, cfg.mode, entryPrice);
   }
 
   console.log("HOLDING position. No exit trigger met.");
   return false;
 }
 
-async function executeSell(ticker, side, count, priceCents, mode) {
+async function executeSell(ticker, side, count, priceCents, mode, entryPriceCents) {
   const line = "SELL " + side.toUpperCase() + " " + count + "x " + ticker + " @ " + priceCents + "c";
 
   if (mode !== "live") {
@@ -337,6 +339,17 @@ async function executeSell(ticker, side, count, priceCents, mode) {
     });
     console.log("SELL ORDER:", line);
     console.log("SELL RESULT:", res);
+
+    const orderStatus = res?.order?.status;
+    if (orderStatus === "resting" || orderStatus === "pending") {
+      console.log("SELL order resting (not filled yet). Keeping position.");
+      return false;
+    }
+
+    // Record sell revenue in daily P&L
+    const revenueCents = priceCents * count;
+    await recordSellRevenue(revenueCents);
+
     await kvSetJson("bot:position", null);
     return true;
   } catch (e) {
@@ -373,6 +386,16 @@ async function checkDailyLimits(cfg) {
   }
 
   return { ok: true, trades, pnlCents };
+}
+
+async function recordSellRevenue(revenueCents) {
+  const state = (await kvGetJson("bot:dailyState")) || {};
+  const today = new Date().toISOString().slice(0, 10);
+  if (state.date === today) {
+    state.pnlCents = (state.pnlCents || 0) + revenueCents;
+    await kvSetJson("bot:dailyState", state);
+    console.log("Daily P&L updated: +" + revenueCents + "c revenue. Total: " + state.pnlCents + "c");
+  }
 }
 
 async function recordTrade(costCents) {
@@ -598,6 +621,15 @@ async function main() {
 
   if (mode !== "live") {
     console.log("PAPER MODE -- would place:", line);
+    // Save paper position so exit logic can be tested
+    await kvSetJson("bot:position", {
+      ticker: best.ticker,
+      side: best.side,
+      entryPriceCents: best.askCents,
+      count,
+      openedTs: Date.now(),
+      orderId: "paper-" + Date.now(),
+    });
     await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now(), lastAction: "paper_buy" });
     return;
   }
@@ -605,7 +637,22 @@ async function main() {
   const res = await placeOrder({ ticker: best.ticker, side: best.side, count, priceCents: best.askCents, action: "buy" });
   console.log("ORDER RESULT:", res);
 
-  // Save position
+  // Check if order was actually filled
+  const orderStatus = res?.order?.status;
+  if (orderStatus === "resting" || orderStatus === "pending") {
+    console.log("Order resting (not filled). Will check again next run.");
+    await kvSetJson("bot:pendingOrder", {
+      orderId: res.order.order_id,
+      ticker: best.ticker,
+      side: best.side,
+      askCents: best.askCents,
+      count,
+      placedTs: Date.now(),
+    });
+    return;
+  }
+
+  // Save position (order was filled)
   await kvSetJson("bot:position", {
     ticker: best.ticker,
     side: best.side,

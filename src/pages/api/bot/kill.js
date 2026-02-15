@@ -1,4 +1,4 @@
-import { kvSetJson, requireUiToken } from "./_upstash";
+import { kvGetJson, kvSetJson, requireUiToken } from "./_upstash";
 
 export default async function handler(req, res) {
   try {
@@ -7,7 +7,8 @@ export default async function handler(req, res) {
       res.status(405).json({ ok: false, error: "Method not allowed" });
       return;
     }
-    await kvSetJson("bot:config", { enabled: false, mode: "paper", seriesTicker: "kxbtc15m" });
+    const current = await kvGetJson("bot:config") || {};
+    await kvSetJson("bot:config", { ...current, enabled: false });
     res.status(200).json({ ok: true, message: "Bot disabled (kill switch)" });
   } catch (e) {
     res.status(e.statusCode || 500).json({ ok: false, error: e.message || "Unknown error" });

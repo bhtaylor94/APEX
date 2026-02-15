@@ -138,7 +138,7 @@ export async function kalshiPublicFetch(path) {
 
 export function isConfigured() {
   return !!(
-    process.env.KALSHI_API_KEY_ID || process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID &&
+    (process.env.KALSHI_API_KEY_ID || process.env.NEXT_PUBLIC_KALSHI_API_KEY_ID) &&
     process.env.KALSHI_PRIVATE_KEY
   );
 }
