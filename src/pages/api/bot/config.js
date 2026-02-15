@@ -7,11 +7,12 @@ function pickConfig(input, current) {
     "mode",
     "seriesTicker",
     "tradeSizeUsd",
+    "maxContracts",
     "minConfidence",
-    "takeProfitPct",
-    "stopLossPct",
+    "minEdge",
+    "minEntryPriceCents",
+    "maxEntryPriceCents",
     "minMinutesToCloseToEnter",
-    "minMinutesToCloseToHold",
     "cooldownMinutes",
     "maxTradesPerDay",
     "dailyMaxLossUsd"
@@ -28,8 +29,9 @@ function pickConfig(input, current) {
   out.seriesTicker = out.seriesTicker || "kxbtc15m";
 
   const numFields = [
-    "tradeSizeUsd","minConfidence","takeProfitPct","stopLossPct",
-    "minMinutesToCloseToEnter","minMinutesToCloseToHold","cooldownMinutes",
+    "tradeSizeUsd","maxContracts","minConfidence","minEdge",
+    "minEntryPriceCents","maxEntryPriceCents",
+    "minMinutesToCloseToEnter","cooldownMinutes",
     "maxTradesPerDay","dailyMaxLossUsd"
   ];
   for (const k of numFields) {
@@ -39,8 +41,6 @@ function pickConfig(input, current) {
   // Clamp some values
   out.tradeSizeUsd = Math.max(1, out.tradeSizeUsd || 5);
   out.minConfidence = Math.min(0.95, Math.max(0.05, out.minConfidence || 0.55));
-  out.takeProfitPct = Math.min(1, Math.max(0.01, out.takeProfitPct || 0.20));
-  out.stopLossPct = Math.min(1, Math.max(0.01, out.stopLossPct || 0.12));
 
   return out;
 }
