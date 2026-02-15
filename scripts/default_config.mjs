@@ -3,29 +3,28 @@ export function defaultConfig() {
     enabled: false,
     mode: "paper", // "paper" | "live"
 
-    // 15-minute BTC Up/Down series
-    seriesTicker: "kxbtc15m",
+    seriesTicker: "KXBTC15M",
 
-    tradeSizeUsd: 5,
-    maxContracts: 5,
-    maxOpenPositions: 1,
+    tradeSizeUsd: 10,
+    maxContracts: 10,
 
-    minConfidence: 0.55,
+    // Signal: minimum edge in cents to enter
     minEdge: 5,
 
-    // Exit strategy: take profit at +15c, stop loss at -20c
-    takeProfitCents: 15,
-    stopLossCents: 20,
-
-    // Price band: only trade contracts priced 35c-80c
+    // Price band: only buy contracts priced 35c-80c
     minEntryPriceCents: 35,
     maxEntryPriceCents: 80,
 
-    // Time gate: only enter with 10+ minutes until settlement
+    // Maker orders: offset below ask (2c = place 2c below ask)
+    makerOffsetCents: 2,
+    makerTimeoutMinutes: 2.5,
+
+    // Time gate: only enter with 10+ min until settlement
     minMinutesToCloseToEnter: 10,
 
-    cooldownMinutes: 8,
+    // Risk management: daily limits (no per-trade TP/SL)
+    cooldownMinutes: 5,
     maxTradesPerDay: 10,
-    dailyMaxLossUsd: 25
+    dailyMaxLossUsd: 25,
   };
 }

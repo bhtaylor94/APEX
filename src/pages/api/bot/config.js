@@ -8,13 +8,12 @@ function pickConfig(input, current) {
     "seriesTicker",
     "tradeSizeUsd",
     "maxContracts",
-    "minConfidence",
     "minEdge",
     "minEntryPriceCents",
     "maxEntryPriceCents",
+    "makerOffsetCents",
+    "makerTimeoutMinutes",
     "minMinutesToCloseToEnter",
-    "takeProfitCents",
-    "stopLossCents",
     "cooldownMinutes",
     "maxTradesPerDay",
     "dailyMaxLossUsd"
@@ -31,9 +30,9 @@ function pickConfig(input, current) {
   out.seriesTicker = out.seriesTicker || "kxbtc15m";
 
   const numFields = [
-    "tradeSizeUsd","maxContracts","minConfidence","minEdge",
+    "tradeSizeUsd","maxContracts","minEdge",
     "minEntryPriceCents","maxEntryPriceCents",
-    "takeProfitCents","stopLossCents",
+    "makerOffsetCents","makerTimeoutMinutes",
     "minMinutesToCloseToEnter","cooldownMinutes",
     "maxTradesPerDay","dailyMaxLossUsd"
   ];
@@ -43,7 +42,6 @@ function pickConfig(input, current) {
 
   // Clamp some values
   out.tradeSizeUsd = Math.max(1, out.tradeSizeUsd || 5);
-  out.minConfidence = Math.min(0.95, Math.max(0.05, out.minConfidence || 0.55));
 
   return out;
 }
