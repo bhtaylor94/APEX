@@ -1,6 +1,6 @@
 // pages/api/kalshi/order.js
 import { kalshiFetch, isConfigured } from "../../../lib/kalshi";
-import { v4 as uuid } from "uuid";
+import crypto from "crypto";
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -24,7 +24,7 @@ export default async function handler(req, res) {
       action: action || "buy",
       count: parseInt(count),
       type: type || "limit",
-      client_order_id: uuid(),
+      client_order_id: crypto.randomUUID(),
       time_in_force: "fill_or_kill", // Immediate fill or cancel — critical for short-duration markets
     };
 
