@@ -1,5 +1,5 @@
 import { kvGetJson, kvSetJson } from "./kv.js";
-import { getMarkets, getMarket, getOrderbook, placeOrder, kalshiFetch } from "./kalshi_client.mjs";
+import { getMarkets, getMarket, getOrderbook, kalshiFetch } from "./kalshi_client.mjs";
 
 // ── Utilities ──
 
@@ -728,7 +728,7 @@ export async function runBotCycle() {
       await kvSetJson("bot:position", null);
       pos = null;
     } else {
-      // ── TAKE PROFIT / TRAILING STOP / PARTIAL EXIT ──
+      // ── TAKE PROFIT / TRAILING STOP ──
       const kalshiMatch = relevantPositions.find(p => p.ticker === pos.ticker);
       const realCount = kalshiMatch ? Math.abs(kalshiMatch.position || 0) : 0;
       if (realCount > 0 && realCount !== pos.count) {

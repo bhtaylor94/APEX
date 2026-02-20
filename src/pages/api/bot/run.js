@@ -512,7 +512,7 @@ async function runBotCycle() {
       await kvSetJson("bot:position", null);
       pos = null;
     } else {
-      // Take profit / trailing stop / partial exit — verify actual count from Kalshi
+      // Take profit / trailing stop — verify actual count from Kalshi
       const bestBid = await getBestBid(pos.ticker, pos.side, L);
       const entry = pos.entryPriceCents || 50;
       const kalshiMatch = relevant.find(p => p.ticker === pos.ticker);
@@ -688,6 +688,8 @@ async function runBotCycle() {
         } else {
           L("Underwater. Holding to settlement.");
         }
+      } else if (!bestBid) {
+        L("NO BIDS on orderbook for " + pos.ticker + " — holding to settlement");
       }
       await kvSetJson("bot:state", { lastCheck: Date.now(), holding: pos.ticker });
       return { action: "holding", profit: updatedProfit, log };
