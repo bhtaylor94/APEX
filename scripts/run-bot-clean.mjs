@@ -623,10 +623,8 @@ export async function runBotCycle() {
   const maxEntryPriceCents = Number(cfg.maxEntryPriceCents ?? 80);
   const minMinutesToCloseToEnter = Number(cfg.minMinutesToCloseToEnter ?? 3);
   const makerOffset = Number(cfg.makerOffsetCents ?? 2);
-  const takeProfitCents = Number(cfg.takeProfitCents ?? 100);
-
   _log("CONFIG: enabled=" + enabled + " mode=" + mode + " series=" + seriesTicker +
-    " tp=$" + (takeProfitCents / 100).toFixed(2) + " priceband=" + minEntryPriceCents + "-" + maxEntryPriceCents + "c");
+    " tp=any_profit priceband=" + minEntryPriceCents + "-" + maxEntryPriceCents + "c");
 
   if (!enabled) { _log("Bot disabled -- exiting."); return { action: "disabled", log }; }
 

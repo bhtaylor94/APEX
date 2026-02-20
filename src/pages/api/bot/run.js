@@ -405,11 +405,10 @@ async function runBotCycle() {
   const maxEntryPriceCents = Number(cfg.maxEntryPriceCents ?? 80);
   const minMinutesToClose = Number(cfg.minMinutesToCloseToEnter ?? 3);
   const makerOffset = Number(cfg.makerOffsetCents ?? 2);
-  const takeProfitCents = Number(cfg.takeProfitCents ?? 100);
   const cooldownMin = Number(cfg.cooldownMinutes ?? 5);
   const dailyMaxLossUsd = Number(cfg.dailyMaxLossUsd ?? 10);
 
-  L("CONFIG: mode=" + mode + " tp=$" + (takeProfitCents / 100).toFixed(2));
+  L("CONFIG: mode=" + mode + " tp=any_profit");
 
   if (!enabled) { L("Bot disabled."); return { action: "disabled", log }; }
 
