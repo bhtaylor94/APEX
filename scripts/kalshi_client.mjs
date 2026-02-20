@@ -98,7 +98,7 @@ export async function placeOrder({ ticker, side, count, priceCents, action = "bu
     type: "limit",
     side,
     count,
-    client_order_id: ""
+    client_order_id: crypto.randomUUID()
   };
   if (side === "yes") body.yes_price = priceCents;
   if (side === "no")  body.no_price  = priceCents;

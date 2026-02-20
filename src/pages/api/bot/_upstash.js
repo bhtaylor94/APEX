@@ -70,6 +70,7 @@ function parseFirestoreValue(fv) {
   if ("arrayValue" in fv) {
     return (fv.arrayValue.values || []).map(parseFirestoreValue);
   }
+  if ("timestampValue" in fv) return fv.timestampValue;
   return null;
 }
 

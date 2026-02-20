@@ -44,7 +44,7 @@ export default function MobileDashboard() {
       }
 
       const balData = await balRes.json();
-      if (!balData.error || balData.error !== "no_keys") {
+      if (!balData.error) {
         setBalance(balData);
       }
 
