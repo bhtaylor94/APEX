@@ -65,15 +65,6 @@ async function fetchCoinbaseCandles15m(limit = 30) {
   } catch { return null; }
 }
 
-async function fetchEthCandles(limit = 30) {
-  try {
-    const res = await fetch(`${COINBASE_BASE}/products/ETH-USD/candles?granularity=60`);
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data.slice(0, limit).reverse().map(c => ({ close: c[4] }));
-  } catch { return null; }
-}
-
 async function fetchCoinbaseOrderBook() {
   const url = `${COINBASE_BASE}/products/BTC-USD/book?level=2`;
   const res = await fetch(url);
@@ -90,14 +81,6 @@ async function fetchCoinbaseOrderBook() {
 }
 
 // ── Technical indicators ──
-
-function ema(data, period) {
-  if (data.length < period) return null;
-  const k = 2 / (period + 1);
-  let e = data.slice(0, period).reduce((s, v) => s + v, 0) / period;
-  for (let i = period; i < data.length; i++) e = data[i] * k + e * (1 - k);
-  return e;
-}
 
 function sma(data, period) {
   if (data.length < period) return null;
@@ -118,25 +101,6 @@ function computeRSI(closes, period = 14) {
   const avgLoss = losses / period;
   if (avgLoss === 0) return 100;
   return 100 - 100 / (1 + avgGain / avgLoss);
-}
-
-function computeMACD(closes) {
-  if (closes.length < 26) return { macd: 0, signal: 0, histogram: 0 };
-  const k12 = 2 / 13, k26 = 2 / 27;
-  let e12 = closes.slice(0, 12).reduce((s, v) => s + v, 0) / 12;
-  let e26 = closes.slice(0, 26).reduce((s, v) => s + v, 0) / 26;
-  for (let i = 12; i < 26; i++) {
-    e12 = closes[i] * k12 + e12 * (1 - k12);
-  }
-  const mH = [];
-  for (let i = 26; i < closes.length; i++) {
-    e12 = closes[i] * k12 + e12 * (1 - k12);
-    e26 = closes[i] * k26 + e26 * (1 - k26);
-    mH.push(e12 - e26);
-  }
-  const macdLine = e12 - e26;
-  const sig = mH.length >= 9 ? ema(mH, 9) : macdLine;
-  return { macd: macdLine, signal: sig || 0, histogram: macdLine - (sig || 0) };
 }
 
 function computeBollingerBands(closes, period = 20, mult = 2) {
@@ -609,7 +573,6 @@ async function recordDailyTrade(type, pnlCents) {
 
 async function checkDailyLimits(cfg) {
   const stats = await getDailyStats();
-  const maxTrades = Number(cfg.maxTradesPerDay ?? 10);
   const maxLossCents = Math.round((Number(cfg.dailyMaxLossUsd ?? 10)) * 100);
 
   if (stats.totalPnlCents <= -maxLossCents) {

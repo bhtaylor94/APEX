@@ -169,27 +169,31 @@ async function learnFromTrades(L) {
 
   const recent = trades.slice(-20);
   const stats = {};
-  for (const ind of INDICATORS) stats[ind] = { correct: 0, wrong: 0 };
-  let wins = 0, losses = 0;
+  for (const ind of INDICATORS) stats[ind] = { correct: 0, wrong: 0, neutral: 0 };
+  let wins = 0, losses = 0, totalPnl = 0;
 
   // Combo tracking: pairwise indicator agreement win rates
   const comboStats = {};
   // Hourly stats: win rate by hour UTC
   const hourlyStats = {};
   // Entry price tracking
-  const entryPriceStats = { low: 0, lowWin: 0, high: 0, highWin: 0 };
+  const entryPriceStats = { low: 0, lowWin: 0, mid: 0, midWin: 0, high: 0, highWin: 0 };
 
   for (const t of recent) {
     const won = t.result === "win" || t.result === "tp_exit";
     const lost = t.result === "loss";
     if (won) wins++; if (lost) losses++;
+    totalPnl += (t.pnlCents || 0);
     const inds = t.signal.indicators;
     if (!inds) continue;
 
     // Per-indicator stats
     for (const ind of INDICATORS) {
       const vote = inds[ind] || 0;
-      if (vote === 0) continue;
+      if (vote === 0) {
+        stats[ind].neutral++;
+        continue;
+      }
       const votedUp = vote > 0;
       const withTrade = (t.signal.direction === "up" && votedUp) || (t.signal.direction === "down" && !votedUp);
       if ((withTrade && won) || (!withTrade && lost)) stats[ind].correct++;
@@ -222,7 +226,8 @@ async function learnFromTrades(L) {
     // Entry price stats
     const ep = t.entryPriceCents || 50;
     if (ep < 45) { entryPriceStats.low++; if (won) entryPriceStats.lowWin++; }
-    if (ep > 65) { entryPriceStats.high++; if (won) entryPriceStats.highWin++; }
+    else if (ep <= 65) { entryPriceStats.mid++; if (won) entryPriceStats.midWin++; }
+    else { entryPriceStats.high++; if (won) entryPriceStats.highWin++; }
   }
 
   const newWeights = {};
@@ -261,7 +266,7 @@ async function learnFromTrades(L) {
   }
 
   await kvSetJson("bot:learned_weights", { weights: newWeights, minScoreThreshold: minScore,
-    winRate: Math.round(winRate * 100), totalTrades: total, lossStreak, mode,
+    winRate: Math.round(winRate * 100), totalTrades: total, totalPnl, lossStreak, mode,
     indicatorStats: stats, comboStats, hourlyStats, priceAdvice, lastUpdated: Date.now() });
   if (L) L("LEARNED: weights=" + JSON.stringify(newWeights) + " minScore=" + minScore + " mode=" + mode +
     " winRate=" + Math.round(winRate * 100) + "% streak=" + lossStreak + "L" +
@@ -402,7 +407,6 @@ async function runBotCycle() {
   const makerOffset = Number(cfg.makerOffsetCents ?? 2);
   const takeProfitCents = Number(cfg.takeProfitCents ?? 100);
   const cooldownMin = Number(cfg.cooldownMinutes ?? 5);
-  const maxTradesPerDay = Number(cfg.maxTradesPerDay ?? 10);
   const dailyMaxLossUsd = Number(cfg.dailyMaxLossUsd ?? 10);
 
   L("CONFIG: mode=" + mode + " tp=$" + (takeProfitCents / 100).toFixed(2));
@@ -538,7 +542,6 @@ async function runBotCycle() {
       const trailingDropCents = 8;
       const updatedCnt = pos.count || 1;
       if (bestBid && pos.peakBidCents && (pos.peakBidCents - bestBid) >= trailingDropCents && bestBid > entry) {
-        const trailProfit = (bestBid - entry) * updatedCnt;
         L("TRAILING STOP: bid " + bestBid + "c dropped " + (pos.peakBidCents - bestBid) + "c from peak " + pos.peakBidCents + "c. Selling.");
 
         if (mode !== "live") {
