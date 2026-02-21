@@ -546,32 +546,51 @@ async function runBotCycle() {
         " entry=" + entry + "c bid=" + (bestBid || "?") + "c peak=" + (pos.peakBidCents || "?") +
         "c P&L=" + (profit >= 0 ? "+$" : "-$") + (Math.abs(profit) / 100).toFixed(2));
 
-      // ── Balanced exit strategy: protect profits, limit losses, let winners run ──
+      // ── Smart exit strategy: take profit at the right time, cut losses early ──
       const minsToClose = pos.marketCloseTs ? (pos.marketCloseTs - Date.now()) / 60000 : 999;
       const updatedCnt = pos.count || 1;
+      const profitPerContract = bestBid ? bestBid - entry : 0;
 
-      // Trailing stop: activates after +10c profit, trails 5c from peak
-      // Near settlement (<3 min): don't trail — just hold for binary payout
-      const trailingDropCents = 5;
-      const trailingMinProfitCents = 10;
-      if (bestBid && pos.peakBidCents && minsToClose >= 3 &&
-          pos.peakBidCents >= (entry + trailingMinProfitCents) &&
-          (pos.peakBidCents - bestBid) >= trailingDropCents && bestBid > entry) {
-        L("TRAILING STOP: bid " + bestBid + "c dropped " + (pos.peakBidCents - bestBid) + "c from peak " + pos.peakBidCents + "c");
+      // ── TAKE PROFIT LOGIC ──
+      // 1. High-bid TP: bid >= 85c → risk/reward terrible (risk 85c to gain 15c)
+      // 2. Strong profit TP: profit >= 25c/contract → great trade, don't be greedy
+      // 3. Time-based TP: <5 min left + profit >= 15c → settlement risk, lock gains
+      // 4. Moderate profit + momentum fading: profit >= 10c and bid dropping from peak
+      let shouldTakeProfit = false;
+      let tpReason = "";
+
+      if (bestBid && profitPerContract > 0) {
+        if (bestBid >= 85) {
+          shouldTakeProfit = true;
+          tpReason = "HIGH_BID_" + bestBid;
+        } else if (profitPerContract >= 25) {
+          shouldTakeProfit = true;
+          tpReason = "STRONG_PROFIT_" + profitPerContract;
+        } else if (minsToClose < 5 && profitPerContract >= 15) {
+          shouldTakeProfit = true;
+          tpReason = "TIME_LOCK_" + profitPerContract + "c_" + minsToClose.toFixed(0) + "m";
+        } else if (profitPerContract >= 10 && pos.peakBidCents && (pos.peakBidCents - bestBid) >= 5) {
+          shouldTakeProfit = true;
+          tpReason = "MOMENTUM_FADE_peak" + pos.peakBidCents + "_now" + bestBid;
+        }
+      }
+
+      if (shouldTakeProfit) {
+        L("TAKE PROFIT: " + tpReason + " | bid=" + bestBid + "c entry=" + entry + "c profit=+" + profitPerContract + "c/contract");
 
         if (mode !== "live") {
           const rev = bestBid * updatedCnt;
           const cost = entry * updatedCnt;
           const pnl = rev - cost;
           await logTradeResult({ ticker: pos.ticker, side: pos.side, entryPriceCents: entry,
-            exitPriceCents: bestBid, count: updatedCnt, result: "tp_exit", exitReason: "TRAILING_STOP",
+            exitPriceCents: bestBid, count: updatedCnt, result: "tp_exit", exitReason: "TAKE_PROFIT_" + tpReason,
             revenueCents: rev, costCents: cost, pnlCents: pnl,
             signal: pos.signal, openedTs: pos.openedTs, closedTs: Date.now() });
           await recordDailyTrade("tp_exit", pnl);
           await learnFromTrades(L);
           await kvSetJson("bot:position", null);
-          L("PAPER TRAILING SOLD " + updatedCnt + "x @ " + bestBid + "c, profit: $" + (pnl / 100).toFixed(2));
-          return { action: "trailing_stop", pnlCents: pnl, log };
+          L("PAPER SOLD " + updatedCnt + "x @ " + bestBid + "c, profit: $" + (pnl / 100).toFixed(2));
+          return { action: "take_profit", reason: tpReason, pnlCents: pnl, log };
         }
 
         const sellBody = { ticker: pos.ticker, action: "sell", type: "limit", side: pos.side, count: updatedCnt,
@@ -585,23 +604,23 @@ async function runBotCycle() {
             const rev = bestBid * fc;
             const pnl = rev - entry * fc;
             await logTradeResult({ ticker: pos.ticker, side: pos.side, entryPriceCents: entry,
-              exitPriceCents: bestBid, count: fc, result: "tp_exit", exitReason: "TRAILING_STOP",
+              exitPriceCents: bestBid, count: fc, result: "tp_exit", exitReason: "TAKE_PROFIT_" + tpReason,
               revenueCents: rev, costCents: entry * fc, pnlCents: pnl,
               signal: pos.signal, openedTs: pos.openedTs, closedTs: Date.now() });
             await recordDailyTrade("tp_exit", pnl);
             await learnFromTrades(L);
             await kvSetJson("bot:position", null);
-            L("TRAILING SOLD " + fc + "x @ " + bestBid + "c, profit: $" + (pnl / 100).toFixed(2));
-            return { action: "trailing_stop", pnlCents: pnl, log };
+            L("SOLD " + fc + "x @ " + bestBid + "c, profit: $" + (pnl / 100).toFixed(2));
+            return { action: "take_profit", reason: tpReason, pnlCents: pnl, log };
           }
-          L("Trailing sell didn't fill. Retry next run.");
-        } catch (e) { L("Trailing sell failed: " + (e?.message || e)); }
+          L("TP sell didn't fill. Retry next run.");
+        } catch (e) { L("TP sell failed: " + (e?.message || e)); }
       }
 
-      // ── Tiered exit: hold for binary payout but cut losses before zero ──
+      // ── Tiered loss exit: cut losses before they reach zero ──
       const updatedProfit = bestBid ? (bestBid * (pos.count || 1)) - (entry * (pos.count || 1)) : profit;
       if (bestBid && updatedProfit > 0) {
-        L("IN PROFIT: +$" + (updatedProfit / 100).toFixed(2) + " — holding to settlement (" + minsToClose.toFixed(1) + " min left)");
+        L("IN PROFIT: +$" + (updatedProfit / 100).toFixed(2) + " (+" + profitPerContract + "c/contract) — holding, " + minsToClose.toFixed(1) + " min left");
       }
       if (bestBid) {
         // Tiered loss gates — tighter as settlement approaches:
