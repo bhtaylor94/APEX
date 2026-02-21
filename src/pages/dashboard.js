@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef } from "react";
 import Head from "next/head";
 
-const DEFAULT_W = { rsi: 2, vwap: 2, ob: 2 };
-const INDICATORS = ["rsi", "vwap", "ob"];
+const DEFAULT_W_15M = { rsi: 2, vwap: 2, ob: 2 };
+const DEFAULT_W_1H = { rsi: 2, macd: 2, ema: 2, vwap: 2 };
+const INDICATORS_15M = ["rsi", "vwap", "ob"];
+const INDICATORS_1H = ["rsi", "macd", "ema", "vwap"];
 
 function pnl$(c) { return (c >= 0 ? "+$" : "-$") + (Math.abs(c) / 100).toFixed(2); }
 function isWin(t) { return t.result === "win" || t.result === "tp_exit"; }
@@ -10,6 +12,7 @@ function isWin(t) { return t.result === "win" || t.result === "tp_exit"; }
 export default function Dashboard() {
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
+  const [tab, setTab] = useState("ALL"); // "ALL" | "15M" | "1H"
   const ref = useRef(null);
 
   const token = () => typeof window !== "undefined"
@@ -43,14 +46,47 @@ export default function Dashboard() {
     </div>
   );
 
-  const learned = data.learned || {};
-  const trades = data.tradeHistory || [];
-  const daily = data.dailyStats || {};
+  // Adapt to new or old API format
+  const series = data.series || {};
+  const s15 = series["15M"] || {};
+  const s1H = series["1H"] || {};
+
+  // For backward compat: if no series key, use old flat format
+  const learned15 = s15.learned || data.learned || {};
+  const learned1H = s1H.learned || {};
+  const allTrades = data.tradeHistory || [];
+
+  // Filter trades by series
+  const trades15 = allTrades.filter(t => (t.seriesSuffix || "15M") === "15M");
+  const trades1H = allTrades.filter(t => t.seriesSuffix === "1H");
+  const trades = tab === "1H" ? trades1H : tab === "15M" ? trades15 : allTrades;
+
+  const learned = tab === "1H" ? learned1H : tab === "15M" ? learned15 : learned15;
+  const DEFAULT_W = tab === "1H" ? DEFAULT_W_1H : DEFAULT_W_15M;
+  const INDICATORS = tab === "1H" ? INDICATORS_1H : INDICATORS_15M;
+
+  const daily15 = s15.dailyStats || data.dailyStats || {};
+  const daily1H = s1H.dailyStats || {};
+  const daily = tab === "1H" ? daily1H : tab === "15M" ? daily15 : null;
+
+  // Combined daily
+  const combinedDaily = {
+    date: daily15.date || daily1H.date || "",
+    totalTrades: (daily15.totalTrades || 0) + (daily1H.totalTrades || 0),
+    wins: (daily15.wins || 0) + (daily1H.wins || 0),
+    losses: (daily15.losses || 0) + (daily1H.losses || 0),
+    takeProfits: (daily15.takeProfits || 0) + (daily1H.takeProfits || 0),
+    totalPnlCents: (daily15.totalPnlCents || 0) + (daily1H.totalPnlCents || 0),
+  };
+  const displayDaily = tab === "ALL" ? combinedDaily : daily;
+
+  const pos15 = s15.position || data.position || null;
+  const pos1H = s1H.position || null;
+
   const stats = learned.indicatorStats || {};
   const weights = learned.weights || {};
   const hourly = learned.hourlyStats || {};
   const combos = learned.comboStats || {};
-  const pos = data.position;
 
   const wins = trades.filter(isWin).length;
   const losses = trades.length - wins;
@@ -78,9 +114,8 @@ export default function Dashboard() {
     return { id: id.toUpperCase(), acc, w, def, diff, total, correct: st.correct, wrong: st.wrong || 0 };
   });
 
-  // Insights — auto-generated from data
+  // Insights
   const insights = [];
-  // Indicator insights
   const qualified = indRows.filter(r => r.total >= 3);
   if (qualified.length >= 2) {
     const best = qualified.reduce((a, b) => a.acc > b.acc ? a : b);
@@ -90,19 +125,14 @@ export default function Dashboard() {
       insights.push({ text: worst.id + " is weakest at " + worst.acc + "% — needs work", good: false });
     }
   }
-  // Weight drift
   const boosted = indRows.filter(r => r.diff > 0.1);
   const dropped = indRows.filter(r => r.diff < -0.1);
   boosted.forEach(r => insights.push({ text: r.id + " weight boosted to " + r.w.toFixed(1) + " (default " + r.def + ")", good: true }));
   dropped.forEach(r => insights.push({ text: r.id + " weight dropped to " + r.w.toFixed(1) + " (default " + r.def + ")", good: false }));
-  // Untested indicators
   const untested = indRows.filter(r => r.total === 0);
   untested.forEach(r => insights.push({ text: r.id + " has no data yet — can't evaluate", good: null }));
-  // Mode
   if (learned.mode === "recovery") insights.push({ text: "Bot is in RECOVERY mode — trading conservatively", good: false });
-  // Loss streak
   if ((learned.lossStreak || 0) >= 3) insights.push({ text: "On a " + learned.lossStreak + "-loss streak", good: false });
-  // Hourly
   const hourEntries = Object.entries(hourly).filter(([, h]) => h?.total >= 3);
   if (hourEntries.length >= 2) {
     const bestH = hourEntries.reduce((a, b) => (a[1].wins / a[1].total) > (b[1].wins / b[1].total) ? a : b);
@@ -111,7 +141,6 @@ export default function Dashboard() {
     if (Math.round((worstH[1].wins / worstH[1].total) * 100) < 35)
       insights.push({ text: "Worst hour: " + worstH[0] + " UTC (" + Math.round((worstH[1].wins / worstH[1].total) * 100) + "% WR)", good: false });
   }
-  // Combos
   const comboEntries = Object.entries(combos).filter(([, c]) => c.total >= 3);
   if (comboEntries.length >= 1) {
     const bestC = comboEntries.reduce((a, b) => (a[1].wins / a[1].total) > (b[1].wins / b[1].total) ? a : b);
@@ -161,13 +190,31 @@ export default function Dashboard() {
 
   const recent = trades.slice(-12).reverse();
 
+  // Tab styles
+  const tabStyle = (active) => ({
+    flex: 1, textAlign: "center", padding: "8px 0", fontSize: 13, fontWeight: 600,
+    borderRadius: 8,
+    background: active ? "#30d158" : "#2c2c2e",
+    color: active ? "#000" : "#86868b",
+    cursor: "pointer",
+  });
+
   return (
     <div style={pg}>
       <Head><title>APEX</title><meta name="viewport" content="width=device-width, initial-scale=1" /></Head>
 
+      {/* Series Tabs */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
+        <div style={tabStyle(tab === "ALL")} onClick={() => setTab("ALL")}>All</div>
+        <div style={tabStyle(tab === "15M")} onClick={() => setTab("15M")}>15M</div>
+        <div style={tabStyle(tab === "1H")} onClick={() => setTab("1H")}>1H</div>
+      </div>
+
       {/* Hero */}
       <div style={{ textAlign: "center", padding: "16px 0 4px" }}>
-        <div style={{ fontSize: 13, color: "#86868b", marginBottom: 4 }}>Total P&L</div>
+        <div style={{ fontSize: 13, color: "#86868b", marginBottom: 4 }}>
+          {tab === "ALL" ? "Total P&L" : tab + " P&L"}
+        </div>
         <div style={{ fontSize: 44, fontWeight: 700, color: totalPnl >= 0 ? "#30d158" : "#ff453a", letterSpacing: -1 }}>
           {pnl$(totalPnl)}
         </div>
@@ -186,32 +233,45 @@ export default function Dashboard() {
       <div style={sep} />
 
       {/* Today */}
-      {daily.date && (
+      {displayDaily && displayDaily.date && (
         <>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 14 }}>
-            <span style={{ fontSize: 15, fontWeight: 600 }}>Today</span>
-            <span style={{ fontSize: 15, color: (daily.totalPnlCents || 0) >= 0 ? "#30d158" : "#ff453a", fontWeight: 600 }}>
-              {pnl$(daily.totalPnlCents || 0)}
+            <span style={{ fontSize: 15, fontWeight: 600 }}>Today {tab !== "ALL" ? "(" + tab + ")" : ""}</span>
+            <span style={{ fontSize: 15, color: (displayDaily.totalPnlCents || 0) >= 0 ? "#30d158" : "#ff453a", fontWeight: 600 }}>
+              {pnl$(displayDaily.totalPnlCents || 0)}
             </span>
           </div>
           <div style={{ display: "flex", justifyContent: "space-around", marginBottom: 4 }}>
-            <Stat n={daily.totalTrades || 0} l="Trades" />
-            <Stat n={(daily.wins || 0) + (daily.takeProfits || 0)} l="Wins" color="#30d158" />
-            <Stat n={daily.losses || 0} l="Losses" color="#ff453a" />
+            <Stat n={displayDaily.totalTrades || 0} l="Trades" />
+            <Stat n={(displayDaily.wins || 0) + (displayDaily.takeProfits || 0)} l="Wins" color="#30d158" />
+            <Stat n={displayDaily.losses || 0} l="Losses" color="#ff453a" />
           </div>
           <div style={sep} />
         </>
       )}
 
-      {/* Open Position */}
-      {pos?.ticker && (
+      {/* Open Positions */}
+      {(tab === "ALL" || tab === "15M") && pos15?.ticker && (
         <>
-          <div style={sectionLabel}>Open Position</div>
+          <div style={sectionLabel}>Open Position (15M)</div>
           <div style={{ ...grp, padding: 14 }}>
-            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 6 }}>{pos.ticker}</div>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 6 }}>{pos15.ticker}</div>
             <div style={{ display: "flex", gap: 16, fontSize: 14, color: "#86868b" }}>
-              <span style={{ color: pos.side === "yes" ? "#30d158" : "#ff453a" }}>{(pos.side || "").toUpperCase()}</span>
-              <span>{pos.entryPriceCents}c &times; {pos.count}</span>
+              <span style={{ color: pos15.side === "yes" ? "#30d158" : "#ff453a" }}>{(pos15.side || "").toUpperCase()}</span>
+              <span>{pos15.entryPriceCents}c &times; {pos15.count}</span>
+            </div>
+          </div>
+          <div style={sep} />
+        </>
+      )}
+      {(tab === "ALL" || tab === "1H") && pos1H?.ticker && (
+        <>
+          <div style={sectionLabel}>Open Position (1H)</div>
+          <div style={{ ...grp, padding: 14 }}>
+            <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 6 }}>{pos1H.ticker}</div>
+            <div style={{ display: "flex", gap: 16, fontSize: 14, color: "#86868b" }}>
+              <span style={{ color: pos1H.side === "yes" ? "#30d158" : "#ff453a" }}>{(pos1H.side || "").toUpperCase()}</span>
+              <span>{pos1H.entryPriceCents}c &times; {pos1H.count}</span>
             </div>
           </div>
           <div style={sep} />
@@ -219,9 +279,9 @@ export default function Dashboard() {
       )}
 
       {/* Insights */}
-      {insights.length > 0 && (
+      {insights.length > 0 && tab !== "ALL" && (
         <>
-          <div style={sectionLabel}>Insights</div>
+          <div style={sectionLabel}>Insights ({tab})</div>
           <div style={{ ...grp, padding: 14 }}>
             {insights.map((ins, i) => (
               <div key={i} style={{ fontSize: 14, marginBottom: i < insights.length - 1 ? 8 : 0, lineHeight: 1.4, color: ins.good === true ? "#30d158" : ins.good === false ? "#ff453a" : "#86868b" }}>
@@ -234,31 +294,34 @@ export default function Dashboard() {
       )}
 
       {/* Indicator Learning */}
-      <div style={sectionLabel}>Indicator Learning</div>
-      <div style={grp}>
-        {indRows.map((r, i) => {
-          const accColor = r.acc === null ? "#86868b" : r.acc >= 50 ? "#30d158" : "#ff453a";
-          const wColor = r.diff > 0.1 ? "#30d158" : r.diff < -0.1 ? "#ff453a" : "#86868b";
-          return (
-            <div key={r.id} style={{ padding: "12px 14px", borderTop: i > 0 ? "1px solid #2c2c2e" : "none" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <span style={{ fontSize: 15, fontWeight: 500 }}>{r.id}</span>
-                <span style={{ fontSize: 15, fontWeight: 600, color: accColor }}>
-                  {r.acc !== null ? r.acc + "%" : "—"}
-                </span>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 12, color: "#86868b" }}>
-                <span>{r.correct}W {r.wrong}L of {r.total} signals</span>
-                <span style={{ color: wColor }}>
-                  w={r.w.toFixed(1)} {r.diff > 0.1 ? "↑" : r.diff < -0.1 ? "↓" : ""} (def {r.def})
-                </span>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-
-      <div style={sep} />
+      {tab !== "ALL" && (
+        <>
+          <div style={sectionLabel}>Indicator Learning ({tab})</div>
+          <div style={grp}>
+            {indRows.map((r, i) => {
+              const accColor = r.acc === null ? "#86868b" : r.acc >= 50 ? "#30d158" : "#ff453a";
+              const wColor = r.diff > 0.1 ? "#30d158" : r.diff < -0.1 ? "#ff453a" : "#86868b";
+              return (
+                <div key={r.id} style={{ padding: "12px 14px", borderTop: i > 0 ? "1px solid #2c2c2e" : "none" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 15, fontWeight: 500 }}>{r.id}</span>
+                    <span style={{ fontSize: 15, fontWeight: 600, color: accColor }}>
+                      {r.acc !== null ? r.acc + "%" : "\u2014"}
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 12, color: "#86868b" }}>
+                    <span>{r.correct}W {r.wrong}L of {r.total} signals</span>
+                    <span style={{ color: wColor }}>
+                      w={r.w.toFixed(1)} {r.diff > 0.1 ? "\u2191" : r.diff < -0.1 ? "\u2193" : ""} (def {r.def})
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={sep} />
+        </>
+      )}
 
       {/* Confidence vs Outcome */}
       <div style={sectionLabel}>Confidence vs Outcome</div>
@@ -273,7 +336,7 @@ export default function Dashboard() {
                   <span style={{ fontSize: 15, fontWeight: 500 }}>{b.label}</span>
                   <span style={{ fontSize: 12, color: "#48484a", marginLeft: 8 }}>{b.desc}</span>
                 </div>
-                <span style={{ fontSize: 15, fontWeight: 600, color: col }}>{bwr !== null ? bwr + "%" : "—"}</span>
+                <span style={{ fontSize: 15, fontWeight: 600, color: col }}>{bwr !== null ? bwr + "%" : "\u2014"}</span>
               </div>
               {b.n > 0 && (
                 <div style={{ fontSize: 12, color: "#86868b", marginTop: 4 }}>
@@ -299,7 +362,7 @@ export default function Dashboard() {
                 <span style={{ fontSize: 15, fontWeight: 500 }}>{b.label}</span>
                 <span style={{ fontSize: 12, color: "#86868b", marginLeft: 8 }}>{b.n} trades</span>
               </div>
-              <span style={{ fontSize: 15, fontWeight: 600, color: col }}>{bwr !== null ? bwr + "%" : "—"}</span>
+              <span style={{ fontSize: 15, fontWeight: 600, color: col }}>{bwr !== null ? bwr + "%" : "\u2014"}</span>
             </div>
           );
         })}
@@ -328,46 +391,22 @@ export default function Dashboard() {
         </>
       )}
 
-      {/* Hourly Performance */}
-      {Object.keys(hourly).length > 0 && (
+      {/* Bot Status */}
+      {tab !== "ALL" && (
         <>
-          <div style={sectionLabel}>Hourly Performance (UTC)</div>
-          <div style={{ ...grp, padding: 12 }}>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(12, 1fr)", gap: 3 }}>
-              {Array.from({ length: 24 }, (_, h) => {
-                const hd = hourly[h];
-                let bg = "#2c2c2e", text = "—";
-                if (hd?.total > 0) {
-                  const w = hd.wins / hd.total;
-                  text = Math.round(w * 100) + "%";
-                  bg = w >= 0.6 ? "#30d158" : w >= 0.4 ? "#ff9f0a" : "#ff453a";
-                }
-                return (
-                  <div key={h} style={{ background: bg + "33", borderRadius: 4, padding: "4px 0", textAlign: "center", fontSize: 9, color: "#fff" }}>
-                    <div style={{ fontWeight: 600, opacity: 0.6 }}>{h}</div>
-                    <div>{text}</div>
-                  </div>
-                );
-              })}
-            </div>
+          <div style={sectionLabel}>Bot Status ({tab})</div>
+          <div style={grp}>
+            <Row l="Mode" v={(learned.mode || "normal").toUpperCase()} color={learned.mode === "recovery" ? "#ff453a" : learned.mode === "aggressive" ? "#30d158" : "#fff"} />
+            <Row l="Score Threshold" v={learned.minScoreThreshold ?? 2} border />
+            <Row l="Loss Streak" v={learned.lossStreak || 0} color={(learned.lossStreak || 0) >= 3 ? "#ff453a" : "#fff"} border />
+            <Row l="Learned Win Rate" v={(learned.winRate ?? 0) + "%"} color={(learned.winRate ?? 0) >= 50 ? "#30d158" : "#ff453a"} border />
+            <Row l="Total Learned Trades" v={learned.totalTrades || 0} border />
+            {learned.priceAdvice && <Row l="Price Advice" v={learned.priceAdvice} color="#ff9f0a" border />}
+            <Row l="Last Updated" v={learned.lastUpdated ? new Date(learned.lastUpdated).toLocaleString() : "never"} border />
           </div>
           <div style={sep} />
         </>
       )}
-
-      {/* Bot Status */}
-      <div style={sectionLabel}>Bot Status</div>
-      <div style={grp}>
-        <Row l="Mode" v={(learned.mode || "normal").toUpperCase()} color={learned.mode === "recovery" ? "#ff453a" : learned.mode === "aggressive" ? "#30d158" : "#fff"} />
-        <Row l="Score Threshold" v={learned.minScoreThreshold ?? 2} border />
-        <Row l="Loss Streak" v={learned.lossStreak || 0} color={(learned.lossStreak || 0) >= 3 ? "#ff453a" : "#fff"} border />
-        <Row l="Learned Win Rate" v={(learned.winRate ?? 0) + "%"} color={(learned.winRate ?? 0) >= 50 ? "#30d158" : "#ff453a"} border />
-        <Row l="Total Learned Trades" v={learned.totalTrades || 0} border />
-        {learned.priceAdvice && <Row l="Price Advice" v={learned.priceAdvice} color="#ff9f0a" border />}
-        <Row l="Last Updated" v={learned.lastUpdated ? new Date(learned.lastUpdated).toLocaleString() : "never"} border />
-      </div>
-
-      <div style={sep} />
 
       {/* Recent Trades */}
       {recent.length > 0 && (
@@ -379,10 +418,12 @@ export default function Dashboard() {
               const ts = t.closedTs || t.settledTs || t.openedTs;
               const time = ts ? new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
               const sc = t.signal?.score != null ? Math.abs(t.signal.score).toFixed(1) : null;
+              const badge = t.seriesSuffix || "15M";
               return (
                 <div key={i} style={{ padding: "11px 14px", borderTop: i > 0 ? "1px solid #2c2c2e" : "none" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                     <div style={{ fontSize: 14, fontWeight: 500 }}>
+                      <span style={{ fontSize: 10, background: badge === "1H" ? "#5856d6" : "#48484a", borderRadius: 4, padding: "1px 4px", marginRight: 6, color: "#fff" }}>{badge}</span>
                       <span style={{ color: t.side === "yes" ? "#30d158" : "#ff453a" }}>{(t.side || "").toUpperCase()}</span>
                       {" "}{t.entryPriceCents}c &rarr; {t.exitPriceCents ?? "settled"}c
                       {" "}&times;{t.count}
@@ -393,8 +434,8 @@ export default function Dashboard() {
                   </div>
                   <div style={{ fontSize: 12, color: "#86868b", marginTop: 3 }}>
                     {time}
-                    {t.exitReason ? " · " + t.exitReason : ""}
-                    {sc ? " · score " + sc : ""}
+                    {t.exitReason ? " \u00b7 " + t.exitReason : ""}
+                    {sc ? " \u00b7 score " + sc : ""}
                   </div>
                 </div>
               );

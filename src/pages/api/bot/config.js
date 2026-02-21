@@ -17,7 +17,16 @@ function pickConfig(input, current) {
     "takeProfitCents",
     "cooldownMinutes",
     "maxTradesPerDay",
-    "dailyMaxLossUsd"
+    "dailyMaxLossUsd",
+    // 1-Hour series
+    "hourlyEnabled",
+    "hourlySeriesTicker",
+    "hourly_minMinutesToCloseToEnter",
+    "hourly_cooldownMinutes",
+    "hourly_minEntryPriceCents",
+    "hourly_maxEntryPriceCents",
+    "hourly_makerOffsetCents",
+    "hourly_minEdge",
   ];
 
   const out = Object.assign({}, current || {});
@@ -27,6 +36,7 @@ function pickConfig(input, current) {
 
   // Basic normalization
   if (typeof out.enabled !== "boolean") out.enabled = !!out.enabled;
+  if (typeof out.hourlyEnabled !== "undefined" && typeof out.hourlyEnabled !== "boolean") out.hourlyEnabled = !!out.hourlyEnabled;
   out.mode = (out.mode === "live") ? "live" : "paper";
   out.seriesTicker = out.seriesTicker || "kxbtc15m";
 
@@ -35,7 +45,10 @@ function pickConfig(input, current) {
     "minEntryPriceCents","maxEntryPriceCents",
     "makerOffsetCents","makerTimeoutMinutes",
     "minMinutesToCloseToEnter","takeProfitCents",
-    "cooldownMinutes","maxTradesPerDay","dailyMaxLossUsd"
+    "cooldownMinutes","maxTradesPerDay","dailyMaxLossUsd",
+    "hourly_minMinutesToCloseToEnter","hourly_cooldownMinutes",
+    "hourly_minEntryPriceCents","hourly_maxEntryPriceCents",
+    "hourly_makerOffsetCents","hourly_minEdge",
   ];
   for (const k of numFields) {
     if (out[k] !== undefined && out[k] !== null) out[k] = Number(out[k]);

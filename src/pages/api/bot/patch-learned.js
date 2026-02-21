@@ -6,8 +6,11 @@ export default async function handler(req, res) {
   }
   if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
-  const learned = await kvGetJson("bot:learned_weights");
-  if (!learned) return res.json({ ok: false, error: "No learned weights found" });
+  const series = req.query.series || req.body?.series || "15M";
+  const suffix = series === "1H" ? "1H" : "15M";
+
+  const learned = await kvGetJson("bot:learned_weights:" + suffix);
+  if (!learned) return res.json({ ok: false, error: "No learned weights found for " + suffix });
 
   // Recalculate threshold with new rules
   const ls = learned.lossStreak || 0;
@@ -21,21 +24,34 @@ export default async function handler(req, res) {
   const before = learned.minScoreThreshold;
   learned.minScoreThreshold = threshold;
 
-  // Reset weights to clean 3-indicator defaults
-  learned.weights = { rsi: 2, vwap: 2, ob: 2 };
-  // Reset indicator stats so old BB/MACD data doesn't pollute learning
-  learned.indicatorStats = { rsi: { correct: 0, wrong: 0, neutral: 0 }, vwap: { correct: 0, wrong: 0, neutral: 0 }, ob: { correct: 0, wrong: 0, neutral: 0 } };
+  // Reset weights to clean defaults per series
+  if (suffix === "1H") {
+    learned.weights = { rsi: 2, macd: 2, ema: 2, vwap: 2 };
+    learned.indicatorStats = {
+      rsi: { correct: 0, wrong: 0, neutral: 0 },
+      macd: { correct: 0, wrong: 0, neutral: 0 },
+      ema: { correct: 0, wrong: 0, neutral: 0 },
+      vwap: { correct: 0, wrong: 0, neutral: 0 },
+    };
+  } else {
+    learned.weights = { rsi: 2, vwap: 2, ob: 2 };
+    learned.indicatorStats = {
+      rsi: { correct: 0, wrong: 0, neutral: 0 },
+      vwap: { correct: 0, wrong: 0, neutral: 0 },
+      ob: { correct: 0, wrong: 0, neutral: 0 },
+    };
+  }
   learned.comboStats = {};
 
-  await kvSetJson("bot:learned_weights", learned);
+  await kvSetJson("bot:learned_weights:" + suffix, learned);
 
   // Reset daily stats if requested
   let dailyReset = false;
   if (req.body?.resetDaily) {
     const today = new Date().toISOString().slice(0, 10);
-    await kvSetJson("bot:daily_stats", { date: today, totalTrades: 0, wins: 0, losses: 0, takeProfits: 0, totalPnlCents: 0 });
+    await kvSetJson("bot:daily_stats:" + suffix, { date: today, totalTrades: 0, wins: 0, losses: 0, takeProfits: 0, totalPnlCents: 0 });
     dailyReset = true;
   }
 
-  res.json({ ok: true, before, after: threshold, weights: learned.weights, lossStreak: ls, winRate: learned.winRate, dailyReset });
+  res.json({ ok: true, series: suffix, before, after: threshold, weights: learned.weights, lossStreak: ls, winRate: learned.winRate, dailyReset });
 }

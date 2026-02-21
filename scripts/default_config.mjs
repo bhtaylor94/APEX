@@ -23,12 +23,21 @@ export function defaultConfig() {
     minMinutesToCloseToEnter: 10,
 
     // Take profit: sell when total unrealized profit >= this (in cents)
-    // e.g., 75 = sell when up $0.75 across all contracts
     takeProfitCents: 75,
 
     // Risk management: daily limits
     cooldownMinutes: 5,
     maxTradesPerDay: 10,
     dailyMaxLossUsd: 50,
+
+    // ── 1-Hour series config ──
+    hourlyEnabled: false,
+    hourlySeriesTicker: "KXBTC",
+    hourly_minMinutesToCloseToEnter: 30,
+    hourly_cooldownMinutes: 15,
+    hourly_minEntryPriceCents: 35,
+    hourly_maxEntryPriceCents: 80,
+    hourly_makerOffsetCents: 2,
+    hourly_minEdge: 5,
   };
 }
