@@ -39,7 +39,12 @@ export default function MobileDashboard() {
       const statusData = await statusRes.json();
       if (statusData.ok) {
         setConfig(statusData.config);
-        setSignal(statusData.state?.lastSignal || statusData.state?.signal || null);
+        // Adapt to new per-series format or old flat format
+        const s15 = statusData.series?.["15M"] || {};
+        const s1H = statusData.series?.["1H"] || {};
+        const sig15 = s15.state?.lastSignal || s15.state?.signal || null;
+        const sig1H = s1H.state?.lastSignal || s1H.state?.signal || null;
+        setSignal({ "15M": sig15, "1H": sig1H });
         setConnected(true);
       }
 
@@ -185,36 +190,16 @@ export default function MobileDashboard() {
           {config ? (
             <div style={{ marginTop: 8 }}>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <Pill label="Confidence" value={(Number(config.minConfidence || 0.55) * 100).toFixed(0) + "%"} />
                 <Pill label="Edge" value={(config.minEdge || 5) + "\u00A2"} />
-                <Pill label="Band" value={(config.minEntryPriceCents || 35) + "-" + (config.maxEntryPriceCents || 80) + "\u00A2"} />
-                <Pill label="Time Gate" value={(config.minMinutesToCloseToEnter || 10) + "m"} />
+                <Pill label="15M Band" value={(config.minEntryPriceCents || 35) + "-" + (config.maxEntryPriceCents || 80) + "\u00A2"} />
+                <Pill label="15M Gate" value={(config.minMinutesToCloseToEnter || 10) + "m"} />
+                {config.hourlyEnabled && <Pill label="1H Gate" value={(config.hourly_minMinutesToCloseToEnter || 30) + "m"} />}
               </div>
-              {signal && signal.indicators && (
-                <div style={{ marginTop: 12 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-                    <span style={{ color: "#aaa", fontSize: 12 }}>Indicators</span>
-                    <span style={{ color: "#aaa", fontSize: 12 }}>
-                      {signal.direction?.toUpperCase() || "NEUTRAL"}
-                      {signal.confidence > 0 ? ` (${(signal.confidence * 100).toFixed(0)}%)` : ""}
-                    </span>
-                  </div>
-                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                    {Object.entries(signal.indicators).map(([key, val]) => {
-                      const v = typeof val === "object" ? val.score || val.signal || 0 : val;
-                      return (
-                        <span key={key} style={{
-                          ...S.indicator,
-                          background: v > 0 ? "rgba(76,175,80,0.15)" : v < 0 ? "rgba(244,67,54,0.15)" : "rgba(255,255,255,0.05)",
-                          color: v > 0 ? "#4caf50" : v < 0 ? "#f44336" : "#666",
-                          borderColor: v > 0 ? "#4caf5033" : v < 0 ? "#f4433633" : "#ffffff0a",
-                        }}>
-                          {key.toUpperCase()} {v > 0 ? "UP" : v < 0 ? "DN" : "--"}
-                        </span>
-                      );
-                    })}
-                  </div>
-                </div>
+              {signal && (
+                <>
+                  <SignalBlock label="15M" sig={signal["15M"]} />
+                  {config.hourlyEnabled && <SignalBlock label="1H" sig={signal["1H"]} />}
+                </>
               )}
             </div>
           ) : (
@@ -261,7 +246,7 @@ export default function MobileDashboard() {
                 <div key={i} style={S.row}>
                   <div>
                     <span style={{ color: "#ccc", fontSize: 13 }}>
-                      {s.ticker?.replace("KXBTC15M-", "") || "??"}
+                      {s.ticker?.replace("KXBTC15M-", "").replace("KXBTC-", "1H ") || "??"}
                     </span>
                   </div>
                   <div style={{ textAlign: "right" }}>
@@ -278,6 +263,37 @@ export default function MobileDashboard() {
         <div style={{ height: 40 }} />
       </div>
     </>
+  );
+}
+
+function SignalBlock({ label, sig }) {
+  if (!sig || !sig.indicators) return null;
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+        <span style={{ color: "#aaa", fontSize: 12 }}>{label} Indicators</span>
+        <span style={{ color: "#aaa", fontSize: 12 }}>
+          {sig.direction?.toUpperCase() || "NEUTRAL"}
+          {sig.confidence > 0 ? ` (${(sig.confidence * 100).toFixed(0)}%)` : ""}
+        </span>
+      </div>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {Object.entries(sig.indicators).map(([key, val]) => {
+          const v = typeof val === "object" ? val.score || val.signal || 0 : val;
+          return (
+            <span key={key} style={{
+              fontSize: 11, fontWeight: 700, padding: "4px 8px", borderRadius: 6,
+              border: "1px solid", letterSpacing: 0.5,
+              background: v > 0 ? "rgba(76,175,80,0.15)" : v < 0 ? "rgba(244,67,54,0.15)" : "rgba(255,255,255,0.05)",
+              color: v > 0 ? "#4caf50" : v < 0 ? "#f44336" : "#666",
+              borderColor: v > 0 ? "#4caf5033" : v < 0 ? "#f4433633" : "#ffffff0a",
+            }}>
+              {key.toUpperCase()} {v > 0 ? "UP" : v < 0 ? "DN" : "--"}
+            </span>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
