@@ -709,6 +709,14 @@ async function runSeriesCycle(seriesDef, cfg, sharedData, L) {
     }
   }
 
+  // ── Daily trade limit ──
+  const dailyStats = await getDailyStats(suffix);
+  const maxTradesPerDay = Number(cfg.maxTradesPerDay ?? 10);
+  if ((dailyStats.totalTrades || 0) >= maxTradesPerDay) {
+    L("[" + suffix + "] DAILY TRADE LIMIT: " + dailyStats.totalTrades + "/" + maxTradesPerDay);
+    return { action: "daily_trade_limit" };
+  }
+
   // ── Cooldown ──
   const learnedData = await kvGetJson(kvKey("bot:learned_weights", suffix));
   const streak = learnedData?.lossStreak || 0;
@@ -885,9 +893,9 @@ async function runBotCycle() {
   const mode = String(cfg.mode || "paper").toLowerCase();
   const hourlyEnabled = !!cfg.hourlyEnabled;
 
-  L("CONFIG: mode=" + mode + " hourly=" + hourlyEnabled);
+  L("CONFIG: mode=" + mode + " 15m=" + enabled + " hourly=" + hourlyEnabled);
 
-  if (!enabled) { L("Bot disabled."); return { action: "disabled", log }; }
+  if (!enabled && !hourlyEnabled) { L("Both bots disabled."); return { action: "disabled", log }; }
 
   const dailyCheck = await checkCombinedDailyLoss(cfg);
   if (!dailyCheck.ok) { L("DAILY LOSS LIMIT"); return { action: "daily_limit", log }; }
@@ -906,8 +914,10 @@ async function runBotCycle() {
 
   const results = {};
 
-  L("── 15M ──");
-  results["15M"] = await runSeriesCycle(SERIES_DEFS["15M"], cfg, sharedData, L);
+  if (enabled) {
+    L("── 15M ──");
+    results["15M"] = await runSeriesCycle(SERIES_DEFS["15M"], cfg, sharedData, L);
+  }
 
   if (hourlyEnabled) {
     L("── 1H ──");

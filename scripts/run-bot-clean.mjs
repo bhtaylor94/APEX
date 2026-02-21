@@ -903,6 +903,13 @@ async function runSeriesCycle(seriesDef, cfg, sharedData, _log) {
   }
 
   // ── Pre-entry checks ──
+  const dailyStats = await getDailyStats(suffix);
+  const maxTradesPerDay = Number(cfg.maxTradesPerDay ?? 10);
+  if ((dailyStats.totalTrades || 0) >= maxTradesPerDay) {
+    _log("[" + suffix + "] DAILY TRADE LIMIT: " + dailyStats.totalTrades + "/" + maxTradesPerDay);
+    return { action: "daily_trade_limit" };
+  }
+
   const cooldownOk = await checkCooldown(cfg, suffix, seriesDef);
   if (!cooldownOk) return { action: "cooldown" };
 
@@ -1168,9 +1175,9 @@ export async function runBotCycle() {
   const mode = String(cfg.mode || "paper").toLowerCase();
   const hourlyEnabled = !!cfg.hourlyEnabled;
 
-  _log("CONFIG: enabled=" + enabled + " mode=" + mode + " hourly=" + hourlyEnabled);
+  _log("CONFIG: enabled=" + enabled + " mode=" + mode + " 15m=" + enabled + " hourly=" + hourlyEnabled);
 
-  if (!enabled) { _log("Bot disabled -- exiting."); return { action: "disabled", log }; }
+  if (!enabled && !hourlyEnabled) { _log("Both bots disabled -- exiting."); return { action: "disabled", log }; }
 
   // ── Combined daily loss check ──
   const dailyCheck = await checkCombinedDailyLoss(cfg);
@@ -1202,9 +1209,11 @@ export async function runBotCycle() {
   // ── Run each enabled series ──
   const results = {};
 
-  // Always run 15M
-  _log("── 15M Series ──");
-  results["15M"] = await runSeriesCycle(SERIES_DEFS["15M"], cfg, sharedData, _log);
+  // Run 15M if enabled
+  if (enabled) {
+    _log("── 15M Series ──");
+    results["15M"] = await runSeriesCycle(SERIES_DEFS["15M"], cfg, sharedData, _log);
+  }
 
   // Run 1H if enabled
   if (hourlyEnabled) {
