@@ -754,13 +754,18 @@ export async function runBotCycle() {
         " | entry=" + entryPx + "c bid=" + (bestBid || "?") + "c peak=" + (pos.peakBidCents || "?") + "c" +
         " | P&L=" + (totalProfit >= 0 ? "+$" : "-$") + (Math.abs(totalProfit) / 100).toFixed(2));
 
-      // ── Trailing stop: only after +15c profit, trail 5c from peak ──
-      const trailingDropCents = 5;
-      const trailingMinProfitCents = 15;
+      // ── Balanced exit strategy: protect profits, limit losses, let winners run ──
+      const minsToClose = pos.marketCloseTs ? (pos.marketCloseTs - Date.now()) / 60000 : 999;
       const updatedCnt = pos.count || 1;
-      if (bestBid && pos.peakBidCents && pos.peakBidCents >= (entryPx + trailingMinProfitCents) &&
+
+      // Trailing stop: activates after +10c profit, trails 5c from peak
+      // Near settlement (<3 min): don't trail — just hold for binary payout
+      const trailingDropCents = 5;
+      const trailingMinProfitCents = 10;
+      if (bestBid && pos.peakBidCents && minsToClose >= 3 &&
+          pos.peakBidCents >= (entryPx + trailingMinProfitCents) &&
           (pos.peakBidCents - bestBid) >= trailingDropCents && bestBid > entryPx) {
-        _log("TRAILING STOP: bid " + bestBid + "c dropped " + (pos.peakBidCents - bestBid) + "c from peak " + pos.peakBidCents + "c (min profit threshold met)");
+        _log("TRAILING STOP: bid " + bestBid + "c dropped " + (pos.peakBidCents - bestBid) + "c from peak " + pos.peakBidCents + "c");
 
         if (mode !== "live") {
           const rev = bestBid * updatedCnt;
@@ -800,31 +805,34 @@ export async function runBotCycle() {
         } catch (e) { _log("Trailing sell failed: " + (e?.message || e)); }
       }
 
-      // ── Hold to settlement: no early exit on small profit — let binary payout work ──
+      // ── Tiered exit: hold for binary payout but cut losses before zero ──
       const updatedProfit = bestBid ? (bestBid * (pos.count || 1)) - (entryPx * (pos.count || 1)) : totalProfit;
       if (bestBid && updatedProfit > 0) {
-        _log("IN PROFIT: +$" + (updatedProfit / 100).toFixed(2) + " — holding to settlement (binary payout)");
+        _log("IN PROFIT: +$" + (updatedProfit / 100).toFixed(2) + " — holding to settlement (" + minsToClose.toFixed(1) + " min left)");
       }
-      if (bestBid && updatedProfit <= 0) {
-        // ── Recognize hopeless trades and exit early ──
-        // Instead of a fixed stop-loss, observe if the trade is clearly lost:
-        // 1. Bid has collapsed >50% from entry (market decided against us)
-        // 2. Running out of time AND losing significantly (no time to recover)
-        // 3. Bid is near floor (<5c) — effectively zero, salvage what's left
+      if (bestBid) {
+        // Tiered loss gates — tighter as settlement approaches:
+        //   >8 min left: exit if lost >50% from entry (clearly wrong)
+        //   5-8 min left: exit if lost >40% from entry (unlikely to recover)
+        //   <5 min left: exit if lost >30% from entry (cut and save capital)
+        //   Always: exit if bid <5c (near zero, salvage pennies)
         const lossPerContract = entryPx - bestBid;
         const lossRatio = lossPerContract / entryPx;
-        const minsToClose = pos.marketCloseTs ? (pos.marketCloseTs - Date.now()) / 60000 : 999;
 
-        const hopeless = (lossRatio >= 0.5) ||                    // lost half+ of entry
-          (bestBid <= 5) ||                                        // bid near zero, salvage pennies
-          (minsToClose < 3 && lossPerContract > 5);                // almost settled & losing
+        let maxLossRatio;
+        if (minsToClose < 5) maxLossRatio = 0.30;
+        else if (minsToClose < 8) maxLossRatio = 0.40;
+        else maxLossRatio = 0.50;
+
+        const hopeless = (lossRatio >= maxLossRatio && lossPerContract > 0) ||
+          (bestBid <= 5);
 
         if (hopeless && lossPerContract > 0) {
           const sellCnt = pos.count || 1;
           const totalLoss = lossPerContract * sellCnt;
-          const reason = lossRatio >= 0.5 ? "COLLAPSED" : bestBid <= 5 ? "NEAR_ZERO" : "TIME_EXIT";
+          const reason = bestBid <= 5 ? "NEAR_ZERO" : "LOSS_GATE_" + Math.round(maxLossRatio * 100);
           _log("EXIT_LOSING: " + reason + " loss=" + lossPerContract + "c/contract ($" + (totalLoss / 100).toFixed(2) + ")" +
-            " ratio=" + (lossRatio * 100).toFixed(0) + "% bid=" + bestBid + "c mins=" + minsToClose.toFixed(1));
+            " ratio=" + (lossRatio * 100).toFixed(0) + "% (gate=" + Math.round(maxLossRatio * 100) + "%) bid=" + bestBid + "c mins=" + minsToClose.toFixed(1));
 
           if (mode !== "live") {
             const rev = bestBid * sellCnt;
@@ -863,10 +871,10 @@ export async function runBotCycle() {
             }
             _log("Exit sell didn't fill. Retry next run.");
           } catch (e) { _log("Exit sell failed: " + (e?.message || e)); }
-        } else {
-          _log("UNDERWATER: -$" + (Math.abs(updatedProfit) / 100).toFixed(2) + ", holding to settlement");
+        } else if (updatedProfit <= 0) {
+          _log("UNDERWATER: -$" + (Math.abs(updatedProfit) / 100).toFixed(2) + " (loss=" + (lossRatio * 100).toFixed(0) + "% gate=" + Math.round(maxLossRatio * 100) + "%) — holding, " + minsToClose.toFixed(1) + " min left");
         }
-      } else {
+      } else if (!bestBid) {
         _log("NO BIDS on orderbook for " + pos.ticker + " — holding to settlement");
       }
 

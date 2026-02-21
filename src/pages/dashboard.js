@@ -196,7 +196,7 @@ export default function Dashboard() {
           </div>
           <div style={{ display: "flex", justifyContent: "space-around", marginBottom: 4 }}>
             <Stat n={daily.totalTrades || 0} l="Trades" />
-            <Stat n={daily.wins || 0} l="Wins" color="#30d158" />
+            <Stat n={(daily.wins || 0) + (daily.takeProfits || 0)} l="Wins" color="#30d158" />
             <Stat n={daily.losses || 0} l="Losses" color="#ff453a" />
           </div>
           <div style={sep} />
