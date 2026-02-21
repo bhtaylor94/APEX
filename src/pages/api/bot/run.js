@@ -116,18 +116,13 @@ async function fetchBtcOrderBook() {
   if (!res.ok) throw new Error("Coinbase book " + res.status);
   const data = await res.json();
   let bid = 0, ask = 0;
-  for (const [, s] of (data.bids || []).slice(0, 10)) bid += parseFloat(s);
-  for (const [, s] of (data.asks || []).slice(0, 10)) ask += parseFloat(s);
+  for (const [, s] of (data.bids || []).slice(0, 5)) bid += parseFloat(s);
+  for (const [, s] of (data.asks || []).slice(0, 5)) ask += parseFloat(s);
   const t = bid + ask;
   return { ratio: t > 0 ? bid / t : 0.5 };
 }
 
 // ── Indicators ──
-
-function sma(data, period) {
-  if (data.length < period) return null;
-  return data.slice(-period).reduce((s, v) => s + v, 0) / period;
-}
 
 function computeRSI(closes, period = 14) {
   if (closes.length < period + 1) return 50;
@@ -153,13 +148,13 @@ function computeATR(candles, period = 14) {
 
 // ── Adaptive learning ──
 
-const DEFAULT_WEIGHTS = { rsi: 1, bb: 1, ob: 3 };
-const INDICATORS = ["rsi", "bb", "ob"];
+const DEFAULT_WEIGHTS = { rsi: 2, vwap: 2, ob: 2 };
+const INDICATORS = ["rsi", "vwap", "ob"];
 
 async function getLearnedWeights() {
   const learned = await kvGetJson("bot:learned_weights");
-  if (!learned || !learned.weights) return { weights: { ...DEFAULT_WEIGHTS }, minScoreThreshold: 2 };
-  return { weights: { ...DEFAULT_WEIGHTS, ...learned.weights }, minScoreThreshold: learned.minScoreThreshold || 2 };
+  if (!learned || !learned.weights) return { weights: { ...DEFAULT_WEIGHTS }, minScoreThreshold: 3 };
+  return { weights: { ...DEFAULT_WEIGHTS, ...learned.weights }, minScoreThreshold: learned.minScoreThreshold || 3 };
 }
 
 async function learnFromTrades(L) {
@@ -273,34 +268,48 @@ async function learnFromTrades(L) {
     (priceAdvice ? " price=" + priceAdvice : ""));
 }
 
-function getSignalWithWeights(closes, obRatio, weights, minScoreThreshold) {
+function computeVWAP(candles) {
+  let cumVolPrice = 0, cumVol = 0;
+  for (const c of candles) {
+    const typical = ((c.high || c.close) + (c.low || c.close) + c.close) / 3;
+    const vol = c.volume || 0;
+    cumVolPrice += typical * vol;
+    cumVol += vol;
+  }
+  return cumVol > 0 ? cumVolPrice / cumVol : null;
+}
+
+function getSignalWithWeights(candles, closes, obRatio, weights, minScoreThreshold) {
   const price = closes[closes.length - 1];
-  // RSI-9 (faster period for 1-min candles)
-  const rsi = computeRSI(closes, 9);
 
-  const avg = sma(closes, 20);
-  const slice = closes.slice(-20);
-  const std = avg ? Math.sqrt(slice.reduce((s, v) => s + (v - avg) ** 2, 0) / 20) : 0;
-  const bbLower = avg ? avg - 2 * std : null;
-  const bbUpper = avg ? avg + 2 * std : null;
+  // RSI-3 (ultra-fast for 1-min candles, Connors-style)
+  const rsi = computeRSI(closes, 3);
+  // VWAP deviation
+  const vwap = computeVWAP(candles);
+  const vwapDev = vwap ? (price - vwap) / vwap : 0;
 
-  const indicators = { rsi: 0, bb: 0, ob: 0 };
+  const indicators = { rsi: 0, vwap: 0, ob: 0 };
   let score = 0;
   const bd = {};
 
-  if (rsi < 30) indicators.rsi = 1; else if (rsi > 70) indicators.rsi = -1;
-  score += indicators.rsi * (weights.rsi || 1);
-  bd.rsi = (indicators.rsi !== 0 ? (indicators.rsi > 0 ? "+" : "-") + (weights.rsi || 1) : "0");
+  // RSI-3: 15/85 thresholds (research-backed for short-period RSI)
+  if (rsi < 15) indicators.rsi = 1; else if (rsi > 85) indicators.rsi = -1;
+  score += indicators.rsi * (weights.rsi || 2);
+  bd.rsi = (indicators.rsi !== 0 ? (indicators.rsi > 0 ? "+" : "-") + (weights.rsi || 2) : "0");
 
-  if (bbLower && price < bbLower) indicators.bb = 1; else if (bbUpper && price > bbUpper) indicators.bb = -1;
-  score += indicators.bb * (weights.bb || 1);
-  bd.bb = (indicators.bb !== 0 ? (indicators.bb > 0 ? "+" : "-") + (weights.bb || 1) : "0");
+  // VWAP: buy 0.15%+ below, sell 0.15%+ above
+  if (vwap) {
+    if (vwapDev < -0.0015) indicators.vwap = 1; else if (vwapDev > 0.0015) indicators.vwap = -1;
+  }
+  score += indicators.vwap * (weights.vwap || 2);
+  bd.vwap = (indicators.vwap !== 0 ? (indicators.vwap > 0 ? "+" : "-") + (weights.vwap || 2) : "0");
 
-  if (obRatio > 0.60) indicators.ob = 1; else if (obRatio < 0.40) indicators.ob = -1;
-  score += indicators.ob * (weights.ob || 3);
-  bd.ob = (indicators.ob !== 0 ? (indicators.ob > 0 ? "+" : "-") + (weights.ob || 3) : "0");
+  // OB imbalance: tighter thresholds (0.65/0.35)
+  if (obRatio > 0.65) indicators.ob = 1; else if (obRatio < 0.35) indicators.ob = -1;
+  score += indicators.ob * (weights.ob || 2);
+  bd.ob = (indicators.ob !== 0 ? (indicators.ob > 0 ? "+" : "-") + (weights.ob || 2) : "0");
 
-  const maxScore = (weights.rsi || 1) + (weights.bb || 1) + (weights.ob || 3);
+  const maxScore = (weights.rsi || 2) + (weights.vwap || 2) + (weights.ob || 2);
   const abs = Math.abs(score);
   if (abs < minScoreThreshold) return { direction: "neutral", score, breakdown: bd, indicators };
   return {
@@ -403,12 +412,12 @@ async function runBotCycle() {
   const minEdge = Number(cfg.minEdge ?? 5);
   const minEntryPriceCents = Number(cfg.minEntryPriceCents ?? 35);
   const maxEntryPriceCents = Number(cfg.maxEntryPriceCents ?? 80);
-  const minMinutesToClose = Number(cfg.minMinutesToCloseToEnter ?? 3);
+  const minMinutesToClose = Number(cfg.minMinutesToCloseToEnter ?? 5);
   const makerOffset = Number(cfg.makerOffsetCents ?? 2);
   const cooldownMin = Number(cfg.cooldownMinutes ?? 5);
   const dailyMaxLossUsd = Number(cfg.dailyMaxLossUsd ?? 10);
 
-  L("CONFIG: mode=" + mode + " tp=any_profit");
+  L("CONFIG: mode=" + mode + " exit=hold_to_settlement");
 
   if (!enabled) { L("Bot disabled."); return { action: "disabled", log }; }
 
@@ -537,11 +546,13 @@ async function runBotCycle() {
         " entry=" + entry + "c bid=" + (bestBid || "?") + "c peak=" + (pos.peakBidCents || "?") +
         "c P&L=" + (profit >= 0 ? "+$" : "-$") + (Math.abs(profit) / 100).toFixed(2));
 
-      // ── Trailing stop: sell if price drops 8c from peak (and we're in profit) ──
-      const trailingDropCents = 8;
+      // ── Trailing stop: only after +15c profit, trail 5c from peak ──
+      const trailingDropCents = 5;
+      const trailingMinProfitCents = 15;
       const updatedCnt = pos.count || 1;
-      if (bestBid && pos.peakBidCents && (pos.peakBidCents - bestBid) >= trailingDropCents && bestBid > entry) {
-        L("TRAILING STOP: bid " + bestBid + "c dropped " + (pos.peakBidCents - bestBid) + "c from peak " + pos.peakBidCents + "c. Selling.");
+      if (bestBid && pos.peakBidCents && pos.peakBidCents >= (entry + trailingMinProfitCents) &&
+          (pos.peakBidCents - bestBid) >= trailingDropCents && bestBid > entry) {
+        L("TRAILING STOP: bid " + bestBid + "c dropped " + (pos.peakBidCents - bestBid) + "c from peak " + pos.peakBidCents + "c (min profit threshold met)");
 
         if (mode !== "live") {
           const rev = bestBid * updatedCnt;
@@ -582,52 +593,12 @@ async function runBotCycle() {
         } catch (e) { L("Trailing sell failed: " + (e?.message || e)); }
       }
 
-      // ── Take profit: exit on ANY profit ──
+      // ── Hold to settlement: no early exit on small profit — let binary payout work ──
       const updatedProfit = bestBid ? (bestBid * (pos.count || 1)) - (entry * (pos.count || 1)) : profit;
       if (bestBid && updatedProfit > 0) {
-        const sellCnt = pos.count || 1;
-        L("TAKE PROFIT: +$" + (updatedProfit / 100).toFixed(2) + " — exiting on profit");
-
-        if (mode !== "live") {
-          const rev = bestBid * sellCnt;
-          const cost = entry * sellCnt;
-          const pnl = rev - cost;
-          await logTradeResult({ ticker: pos.ticker, side: pos.side, entryPriceCents: entry,
-            exitPriceCents: bestBid, count: sellCnt, result: "tp_exit", exitReason: "TAKE_PROFIT",
-            revenueCents: rev, costCents: cost, pnlCents: pnl,
-            signal: pos.signal, openedTs: pos.openedTs, closedTs: Date.now() });
-          await recordDailyTrade("tp_exit", pnl);
-          await learnFromTrades(L);
-          await kvSetJson("bot:position", null);
-          L("PAPER SOLD " + sellCnt + "x @ " + bestBid + "c, profit: $" + (pnl / 100).toFixed(2));
-          return { action: "take_profit", pnlCents: pnl, log };
-        }
-
-        const sellBody = {
-          ticker: pos.ticker, action: "sell", type: "limit", side: pos.side, count: sellCnt,
-          time_in_force: "fill_or_kill",
-          ...(pos.side === "yes" ? { yes_price: bestBid } : { no_price: bestBid }),
-        };
-        try {
-          const sr = await kalshiFetch("/trade-api/v2/portfolio/orders", { method: "POST", body: sellBody });
-          const so = sr?.order || {};
-          if (so.status === "executed" || ((so.fill_count ?? 0) > 0)) {
-            const fc = (so.fill_count ?? 0) > 0 ? so.fill_count : sellCnt;
-            const rev = bestBid * fc;
-            const pnl = rev - entry * fc;
-            await logTradeResult({ ticker: pos.ticker, side: pos.side, entryPriceCents: entry,
-              exitPriceCents: bestBid, count: fc, result: "tp_exit", exitReason: "TAKE_PROFIT",
-              revenueCents: rev, costCents: entry * fc, pnlCents: pnl,
-              signal: pos.signal, openedTs: pos.openedTs, closedTs: Date.now() });
-            await recordDailyTrade("tp_exit", pnl);
-            await learnFromTrades(L);
-            await kvSetJson("bot:position", null);
-            L("SOLD " + fc + "x @ " + bestBid + "c, profit: $" + (pnl / 100).toFixed(2));
-            return { action: "take_profit", pnlCents: pnl, log };
-          }
-          L("Sell didn't fill (status=" + so.status + "). Retry next run.");
-        } catch (e) { L("Sell failed: " + (e?.message || e)); }
-      } else if (bestBid) {
+        L("IN PROFIT: +$" + (updatedProfit / 100).toFixed(2) + " — holding to settlement (binary payout)");
+      }
+      if (bestBid && updatedProfit <= 0) {
         // ── Recognize hopeless trades and exit early ──
         // Instead of a fixed stop-loss, observe if the trade is clearly lost:
         // 1. Bid has collapsed >50% from entry (market decided against us)
@@ -722,33 +693,23 @@ async function runBotCycle() {
   const closes = candles.map(c => c.close);
   const { weights, minScoreThreshold } = await getLearnedWeights();
   const tradingMode = learned?.mode || "normal";
-  const sig = getSignalWithWeights(closes, ob.ratio, weights, minScoreThreshold);
+  const sig = getSignalWithWeights(candles, closes, ob.ratio, weights, minScoreThreshold);
 
-  // Multi-timeframe confirmation: boost score if 5m and 15m RSI+BB agree
+  // Multi-timeframe confirmation: RSI on 5m and 15m (faster periods for short windows)
   let mtfBoost = 0;
   if (sig.direction !== "neutral") {
     const sigDir = sig.score > 0 ? 1 : -1;
-    if (candles5m && candles5m.length >= 20) {
+    if (candles5m && candles5m.length >= 10) {
       const c5 = candles5m.map(c => c.close);
-      const rsi5 = computeRSI(c5, 9);
-      const bb5avg = sma(c5, 20);
-      const bb5slice = c5.slice(-20);
-      const bb5std = bb5avg ? Math.sqrt(bb5slice.reduce((s, v) => s + (v - bb5avg) ** 2, 0) / 20) : 0;
-      const rsiDir = rsi5 < 40 ? 1 : rsi5 > 60 ? -1 : 0;
-      const bbDir = bb5avg ? (c5[c5.length - 1] < bb5avg - 2 * bb5std ? 1 : c5[c5.length - 1] > bb5avg + 2 * bb5std ? -1 : 0) : 0;
-      const dir5 = rsiDir + bbDir;
-      if (dir5 !== 0 && Math.sign(dir5) === sigDir) mtfBoost += 0.5;
+      const rsi5 = computeRSI(c5, 5);
+      const rsiDir = rsi5 < 35 ? 1 : rsi5 > 65 ? -1 : 0;
+      if (rsiDir !== 0 && rsiDir === sigDir) mtfBoost += 0.5;
     }
-    if (candles15m && candles15m.length >= 20) {
+    if (candles15m && candles15m.length >= 10) {
       const c15 = candles15m.map(c => c.close);
-      const rsi15 = computeRSI(c15, 9);
-      const bb15avg = sma(c15, 20);
-      const bb15slice = c15.slice(-20);
-      const bb15std = bb15avg ? Math.sqrt(bb15slice.reduce((s, v) => s + (v - bb15avg) ** 2, 0) / 20) : 0;
-      const rsiDir = rsi15 < 40 ? 1 : rsi15 > 60 ? -1 : 0;
-      const bbDir = bb15avg ? (c15[c15.length - 1] < bb15avg - 2 * bb15std ? 1 : c15[c15.length - 1] > bb15avg + 2 * bb15std ? -1 : 0) : 0;
-      const dir15 = rsiDir + bbDir;
-      if (dir15 !== 0 && Math.sign(dir15) === sigDir) mtfBoost += 0.5;
+      const rsi15 = computeRSI(c15, 7);
+      const rsiDir = rsi15 < 35 ? 1 : rsi15 > 65 ? -1 : 0;
+      if (rsiDir !== 0 && rsiDir === sigDir) mtfBoost += 0.5;
     }
     if (mtfBoost > 0) sig.score += mtfBoost * Math.sign(sig.score);
   }
@@ -768,6 +729,7 @@ async function runBotCycle() {
   const atrPct = atr && closes[closes.length - 1] > 0 ? (atr / closes[closes.length - 1]) * 100 : 0;
   let atrOk = true;
   if (atrPct > 0 && atrPct < 0.02) atrOk = false;
+  if (atrPct > 0.15) atrOk = false;
 
   L("SIGNAL: score=" + sig.score + " threshold=" + minScoreThreshold + " mode=" + tradingMode +
     " dir=" + (sig.direction || "neutral") + " " + JSON.stringify(sig.breakdown) +
@@ -786,7 +748,7 @@ async function runBotCycle() {
   }
 
   if (!atrOk) {
-    L("ATR GATE: volatility too low (" + atrPct.toFixed(3) + "%). Skipping.");
+    L("ATR GATE: volatility " + (atrPct < 0.02 ? "too low" : "too high") + " (" + atrPct.toFixed(3) + "%). Skipping.");
     await kvSetJson("bot:state", { lastSignal: sig, lastCheck: Date.now() });
     return { action: "atr_gate", log };
   }
@@ -799,7 +761,7 @@ async function runBotCycle() {
   }
 
   // Recalculate predProb after all score modifications (MTF, volume boost)
-  const maxScoreRecalc = (weights.rsi || 1) + (weights.bb || 1) + (weights.ob || 3);
+  const maxScoreRecalc = (weights.rsi || 2) + (weights.vwap || 2) + (weights.ob || 2);
   sig.predProb = 50 + (Math.abs(sig.score) / maxScoreRecalc) * 30;
 
   // ── Hourly gate: skip hours with <30% win rate (3+ samples) ──
@@ -890,9 +852,9 @@ async function runBotCycle() {
     const depthBook = depthOb?.orderbook || depthOb;
     const depthBids = depthBook?.[best.side] || [];
     const totalDepth = depthBids.reduce((s, b) => s + (Array.isArray(b) ? (b[1] || 0) : (b?.quantity || b?.size || 0)), 0);
-    if (totalDepth < 3) {
+    if (totalDepth < 10) {
       depthOk = false;
-      L("DEPTH GATE: only " + totalDepth + " contracts on " + best.side + " book for " + best.ticker + ". Skipping.");
+      L("DEPTH GATE: only " + totalDepth + " contracts on " + best.side + " book for " + best.ticker + " (need 10+). Skipping.");
     } else {
       L("DEPTH: " + totalDepth + " contracts on " + best.side + " book");
     }

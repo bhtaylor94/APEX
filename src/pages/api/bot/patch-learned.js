@@ -22,9 +22,9 @@ export default async function handler(req, res) {
   learned.minScoreThreshold = threshold;
 
   // Reset weights to clean 3-indicator defaults
-  learned.weights = { rsi: 1, bb: 1, ob: 3 };
-  // Reset indicator stats so old MACD/EMA data doesn't pollute learning
-  learned.indicatorStats = { rsi: { correct: 0, wrong: 0, neutral: 0 }, bb: { correct: 0, wrong: 0, neutral: 0 }, ob: { correct: 0, wrong: 0, neutral: 0 } };
+  learned.weights = { rsi: 2, vwap: 2, ob: 2 };
+  // Reset indicator stats so old BB/MACD data doesn't pollute learning
+  learned.indicatorStats = { rsi: { correct: 0, wrong: 0, neutral: 0 }, vwap: { correct: 0, wrong: 0, neutral: 0 }, ob: { correct: 0, wrong: 0, neutral: 0 } };
   learned.comboStats = {};
 
   await kvSetJson("bot:learned_weights", learned);

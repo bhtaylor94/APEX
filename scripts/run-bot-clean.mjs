@@ -71,8 +71,8 @@ async function fetchCoinbaseOrderBook() {
   if (!res.ok) throw new Error(`Coinbase book ${res.status}`);
   const data = await res.json();
   let bidDepth = 0, askDepth = 0;
-  const bids = (data.bids || []).slice(0, 10);
-  const asks = (data.asks || []).slice(0, 10);
+  const bids = (data.bids || []).slice(0, 5);
+  const asks = (data.asks || []).slice(0, 5);
   for (const [, size] of bids) bidDepth += parseFloat(size);
   for (const [, size] of asks) askDepth += parseFloat(size);
   const total = bidDepth + askDepth;
@@ -81,11 +81,6 @@ async function fetchCoinbaseOrderBook() {
 }
 
 // ── Technical indicators ──
-
-function sma(data, period) {
-  if (data.length < period) return null;
-  return data.slice(-period).reduce((s, v) => s + v, 0) / period;
-}
 
 function computeRSI(closes, period = 14) {
   if (closes.length < period + 1) return 50;
@@ -103,15 +98,6 @@ function computeRSI(closes, period = 14) {
   return 100 - 100 / (1 + avgGain / avgLoss);
 }
 
-function computeBollingerBands(closes, period = 20, mult = 2) {
-  if (closes.length < period) return null;
-  const avg = sma(closes, period);
-  const slice = closes.slice(-period);
-  const std = Math.sqrt(slice.reduce((s, v) => s + (v - avg) ** 2, 0) / period);
-  const price = closes[closes.length - 1];
-  return { upper: avg + mult * std, middle: avg, lower: avg - mult * std, price, std };
-}
-
 function computeATR(candles, period = 14) {
   if (!candles || candles.length < period + 1) return null;
   const trs = [];
@@ -125,8 +111,8 @@ function computeATR(candles, period = 14) {
 
 // ── Adaptive learning: analyze past trades to adjust indicator weights ──
 
-const DEFAULT_WEIGHTS = { rsi: 1, bb: 1, ob: 3 };
-const INDICATORS = ["rsi", "bb", "ob"];
+const DEFAULT_WEIGHTS = { rsi: 2, vwap: 2, ob: 2 };
+const INDICATORS = ["rsi", "vwap", "ob"];
 
 async function getLearnedWeights() {
   const learned = await kvGetJson("bot:learned_weights");
@@ -275,7 +261,18 @@ async function learnFromTrades() {
   return result;
 }
 
-// ── Signal generator: adaptive weighted scoring, 3 indicators (RSI-9, BB, OB) ──
+// ── Signal generator: adaptive weighted scoring, 3 indicators (RSI-3, VWAP, OB) ──
+
+function computeVWAP(candles) {
+  let cumVolPrice = 0, cumVol = 0;
+  for (const c of candles) {
+    const typical = ((c.high || c.close) + (c.low || c.close) + c.close) / 3;
+    const vol = c.volume || 0;
+    cumVolPrice += typical * vol;
+    cumVol += vol;
+  }
+  return cumVol > 0 ? cumVolPrice / cumVol : null;
+}
 
 async function getSignal() {
   let candles, orderBook, candles5m, candles15m;
@@ -297,60 +294,60 @@ async function getSignal() {
 
   const weights = await getLearnedWeights();
   const learned = await kvGetJson("bot:learned_weights");
-  const minScoreThreshold = learned?.minScoreThreshold || 2;
+  const minScoreThreshold = learned?.minScoreThreshold || 3;
 
   const closes = candles.map(c => c.close);
   const price = closes[closes.length - 1];
 
-  // RSI-9 (faster period for 1-min candles)
-  const rsiVal = computeRSI(closes, 9);
-  const bb = computeBollingerBands(closes, 20, 2);
+  // RSI-3 (ultra-fast for 1-min candles, Connors-style)
+  const rsiVal = computeRSI(closes, 3);
+  // VWAP deviation
+  const vwap = computeVWAP(candles);
+  const vwapDev = vwap ? (price - vwap) / vwap : 0;
+  // Order book imbalance (tighter thresholds: 0.65/0.35)
   const obRatio = orderBook.ratio;
 
-  const indicators = { rsi: 0, bb: 0, ob: 0 };
+  const indicators = { rsi: 0, vwap: 0, ob: 0 };
   let score = 0;
   const breakdown = {};
 
-  if (rsiVal < 30) { indicators.rsi = 1; } else if (rsiVal > 70) { indicators.rsi = -1; }
-  score += indicators.rsi * (weights.rsi || 1);
+  // RSI-3: use 15/85 thresholds (research-backed for short-period RSI)
+  if (rsiVal < 15) { indicators.rsi = 1; } else if (rsiVal > 85) { indicators.rsi = -1; }
+  score += indicators.rsi * (weights.rsi || 2);
   breakdown.rsi = (indicators.rsi > 0 ? "+" : indicators.rsi < 0 ? "-" : "") +
-    (indicators.rsi !== 0 ? (weights.rsi || 1).toFixed(1) : "0") + " (rsi=" + rsiVal.toFixed(1) + ")";
+    (indicators.rsi !== 0 ? (weights.rsi || 2).toFixed(1) : "0") + " (rsi3=" + rsiVal.toFixed(1) + ")";
 
-  if (bb) {
-    if (price < bb.lower) { indicators.bb = 1; } else if (price > bb.upper) { indicators.bb = -1; }
+  // VWAP: buy 0.15%+ below, sell 0.15%+ above
+  if (vwap) {
+    if (vwapDev < -0.0015) { indicators.vwap = 1; } else if (vwapDev > 0.0015) { indicators.vwap = -1; }
   }
-  score += indicators.bb * (weights.bb || 1);
-  breakdown.bb = (indicators.bb > 0 ? "+" : indicators.bb < 0 ? "-" : "") +
-    (indicators.bb !== 0 ? (weights.bb || 1).toFixed(1) : "0");
+  score += indicators.vwap * (weights.vwap || 2);
+  breakdown.vwap = (indicators.vwap > 0 ? "+" : indicators.vwap < 0 ? "-" : "") +
+    (indicators.vwap !== 0 ? (weights.vwap || 2).toFixed(1) : "0") + " (dev=" + (vwapDev * 100).toFixed(3) + "%)";
 
-  if (obRatio > 0.60) { indicators.ob = 1; } else if (obRatio < 0.40) { indicators.ob = -1; }
-  score += indicators.ob * (weights.ob || 3);
+  // OB imbalance: tighter thresholds (0.65/0.35)
+  if (obRatio > 0.65) { indicators.ob = 1; } else if (obRatio < 0.35) { indicators.ob = -1; }
+  score += indicators.ob * (weights.ob || 2);
   breakdown.ob = (indicators.ob > 0 ? "+" : indicators.ob < 0 ? "-" : "") +
-    (indicators.ob !== 0 ? (weights.ob || 3).toFixed(1) : "0") + " (ob=" + obRatio.toFixed(3) + ")";
+    (indicators.ob !== 0 ? (weights.ob || 2).toFixed(1) : "0") + " (ob=" + obRatio.toFixed(3) + ")";
 
-  const maxScore = (weights.rsi || 1) + (weights.bb || 1) + (weights.ob || 3);
+  const maxScore = (weights.rsi || 2) + (weights.vwap || 2) + (weights.ob || 2);
 
-  // Multi-timeframe confirmation (RSI + BB on 5m and 15m)
+  // Multi-timeframe confirmation (RSI on 5m and 15m — faster periods for short windows)
   let mtfBoost = 0;
   const sigDir = score > 0 ? 1 : score < 0 ? -1 : 0;
   if (sigDir !== 0) {
-    if (candles5m && candles5m.length >= 20) {
+    if (candles5m && candles5m.length >= 10) {
       const c5 = candles5m.map(c => c.close);
-      const rsi5 = computeRSI(c5, 9);
-      const bb5 = computeBollingerBands(c5, 20, 2);
-      const rsiDir = rsi5 < 40 ? 1 : rsi5 > 60 ? -1 : 0;
-      const bbDir = bb5 ? (c5[c5.length - 1] < bb5.lower ? 1 : c5[c5.length - 1] > bb5.upper ? -1 : 0) : 0;
-      const dir5 = rsiDir + bbDir;
-      if (dir5 !== 0 && Math.sign(dir5) === sigDir) mtfBoost += 0.5;
+      const rsi5 = computeRSI(c5, 5);
+      const rsiDir = rsi5 < 35 ? 1 : rsi5 > 65 ? -1 : 0;
+      if (rsiDir !== 0 && rsiDir === sigDir) mtfBoost += 0.5;
     }
-    if (candles15m && candles15m.length >= 20) {
+    if (candles15m && candles15m.length >= 10) {
       const c15 = candles15m.map(c => c.close);
-      const rsi15 = computeRSI(c15, 9);
-      const bb15 = computeBollingerBands(c15, 20, 2);
-      const rsiDir = rsi15 < 40 ? 1 : rsi15 > 60 ? -1 : 0;
-      const bbDir = bb15 ? (c15[c15.length - 1] < bb15.lower ? 1 : c15[c15.length - 1] > bb15.upper ? -1 : 0) : 0;
-      const dir15 = rsiDir + bbDir;
-      if (dir15 !== 0 && Math.sign(dir15) === sigDir) mtfBoost += 0.5;
+      const rsi15 = computeRSI(c15, 7);
+      const rsiDir = rsi15 < 35 ? 1 : rsi15 > 65 ? -1 : 0;
+      if (rsiDir !== 0 && rsiDir === sigDir) mtfBoost += 0.5;
     }
     if (mtfBoost > 0) score += mtfBoost * sigDir;
   }
@@ -385,10 +382,14 @@ async function getSignal() {
     return { direction: "neutral", score, confidence: 0, price, breakdown, indicators, details: "volume_gate" };
   }
 
-  // ATR gate
+  // ATR gate: too low = no movement, too high = trending (mean reversion fails)
   if (atrPct > 0 && atrPct < 0.02) {
     console.log("ATR GATE: volatility too low (" + atrPct.toFixed(3) + "%). Skipping.");
     return { direction: "neutral", score, confidence: 0, price, breakdown, indicators, details: "atr_gate" };
+  }
+  if (atrPct > 0.15) {
+    console.log("ATR GATE: volatility too high (" + atrPct.toFixed(3) + "%). Mean reversion unreliable. Skipping.");
+    return { direction: "neutral", score, confidence: 0, price, breakdown, indicators, details: "atr_high_gate" };
   }
 
   // Volume boost
@@ -621,10 +622,10 @@ export async function runBotCycle() {
   const minEdge = Number(cfg.minEdge ?? 5);
   const minEntryPriceCents = Number(cfg.minEntryPriceCents ?? 35);
   const maxEntryPriceCents = Number(cfg.maxEntryPriceCents ?? 80);
-  const minMinutesToCloseToEnter = Number(cfg.minMinutesToCloseToEnter ?? 3);
+  const minMinutesToCloseToEnter = Number(cfg.minMinutesToCloseToEnter ?? 5);
   const makerOffset = Number(cfg.makerOffsetCents ?? 2);
   _log("CONFIG: enabled=" + enabled + " mode=" + mode + " series=" + seriesTicker +
-    " tp=any_profit priceband=" + minEntryPriceCents + "-" + maxEntryPriceCents + "c");
+    " exit=hold_to_settlement priceband=" + minEntryPriceCents + "-" + maxEntryPriceCents + "c");
 
   if (!enabled) { _log("Bot disabled -- exiting."); return { action: "disabled", log }; }
 
@@ -753,11 +754,13 @@ export async function runBotCycle() {
         " | entry=" + entryPx + "c bid=" + (bestBid || "?") + "c peak=" + (pos.peakBidCents || "?") + "c" +
         " | P&L=" + (totalProfit >= 0 ? "+$" : "-$") + (Math.abs(totalProfit) / 100).toFixed(2));
 
-      // ── Trailing stop: sell if price drops 8c from peak (and in profit) ──
-      const trailingDropCents = 8;
+      // ── Trailing stop: only after +15c profit, trail 5c from peak ──
+      const trailingDropCents = 5;
+      const trailingMinProfitCents = 15;
       const updatedCnt = pos.count || 1;
-      if (bestBid && pos.peakBidCents && (pos.peakBidCents - bestBid) >= trailingDropCents && bestBid > entryPx) {
-        _log("TRAILING STOP: bid " + bestBid + "c dropped " + (pos.peakBidCents - bestBid) + "c from peak " + pos.peakBidCents + "c");
+      if (bestBid && pos.peakBidCents && pos.peakBidCents >= (entryPx + trailingMinProfitCents) &&
+          (pos.peakBidCents - bestBid) >= trailingDropCents && bestBid > entryPx) {
+        _log("TRAILING STOP: bid " + bestBid + "c dropped " + (pos.peakBidCents - bestBid) + "c from peak " + pos.peakBidCents + "c (min profit threshold met)");
 
         if (mode !== "live") {
           const rev = bestBid * updatedCnt;
@@ -797,52 +800,12 @@ export async function runBotCycle() {
         } catch (e) { _log("Trailing sell failed: " + (e?.message || e)); }
       }
 
-      // ── Take profit: exit on ANY profit ──
+      // ── Hold to settlement: no early exit on small profit — let binary payout work ──
       const updatedProfit = bestBid ? (bestBid * (pos.count || 1)) - (entryPx * (pos.count || 1)) : totalProfit;
       if (bestBid && updatedProfit > 0) {
-        const sellCnt = pos.count || 1;
-        _log("TAKE PROFIT: +$" + (updatedProfit / 100).toFixed(2) + " — exiting on profit");
-
-        if (mode !== "live") {
-          const rev = bestBid * sellCnt;
-          const cost = entryPx * sellCnt;
-          const pnl = rev - cost;
-          await logTradeResult({ ticker: pos.ticker, side: pos.side, entryPriceCents: entryPx,
-            exitPriceCents: bestBid, count: sellCnt, result: "tp_exit", exitReason: "TAKE_PROFIT",
-            revenueCents: rev, costCents: cost, pnlCents: pnl,
-            signal: pos.signal, openedTs: pos.openedTs, closedTs: Date.now() });
-          await recordDailyTrade("tp_exit", pnl);
-          await learnFromTrades();
-          await kvSetJson("bot:position", null);
-          _log("PAPER SOLD " + sellCnt + "x @ " + bestBid + "c, profit: $" + (pnl / 100).toFixed(2));
-          await kvSetJson("bot:state", { lastCheck: Date.now(), lastAction: "take_profit" });
-          return { action: "take_profit", pnlCents: pnl, log };
-        }
-
-        const sellBody = { ticker: pos.ticker, action: "sell", type: "limit", side: pos.side, count: sellCnt,
-          time_in_force: "fill_or_kill",
-          ...(pos.side === "yes" ? { yes_price: bestBid } : { no_price: bestBid }) };
-        try {
-          const sr = await kalshiFetch("/trade-api/v2/portfolio/orders", { method: "POST", body: sellBody });
-          const so = sr?.order || {};
-          if (so.status === "executed" || ((so.fill_count ?? 0) > 0)) {
-            const fc = (so.fill_count ?? 0) > 0 ? so.fill_count : sellCnt;
-            const rev = bestBid * fc;
-            const pnl = rev - entryPx * fc;
-            await logTradeResult({ ticker: pos.ticker, side: pos.side, entryPriceCents: entryPx,
-              exitPriceCents: bestBid, count: fc, result: "tp_exit", exitReason: "TAKE_PROFIT",
-              revenueCents: rev, costCents: entryPx * fc, pnlCents: pnl,
-              signal: pos.signal, openedTs: pos.openedTs, closedTs: Date.now() });
-            await recordDailyTrade("tp_exit", pnl);
-            await learnFromTrades();
-            await kvSetJson("bot:position", null);
-            _log("SOLD " + fc + "x @ " + bestBid + "c, profit: $" + (pnl / 100).toFixed(2));
-            await kvSetJson("bot:state", { lastCheck: Date.now(), lastAction: "take_profit" });
-            return { action: "take_profit", pnlCents: pnl, log };
-          }
-          _log("Sell didn't fill. Retry next run.");
-        } catch (e) { _log("Sell failed: " + (e?.message || e)); }
-      } else if (bestBid) {
+        _log("IN PROFIT: +$" + (updatedProfit / 100).toFixed(2) + " — holding to settlement (binary payout)");
+      }
+      if (bestBid && updatedProfit <= 0) {
         // ── Recognize hopeless trades and exit early ──
         // Instead of a fixed stop-loss, observe if the trade is clearly lost:
         // 1. Bid has collapsed >50% from entry (market decided against us)
@@ -1054,9 +1017,9 @@ export async function runBotCycle() {
     const depthBook = depthOb?.orderbook || depthOb?.order_book || depthOb;
     const depthBids = depthBook?.[best.side] || [];
     const totalDepth = depthBids.reduce((s, b) => s + (Array.isArray(b) ? (b[1] || 0) : (b?.quantity || b?.size || 0)), 0);
-    if (totalDepth < 3) {
+    if (totalDepth < 10) {
       depthOk = false;
-      _log("DEPTH GATE: only " + totalDepth + " contracts on " + best.side + " book. Skipping.");
+      _log("DEPTH GATE: only " + totalDepth + " contracts on " + best.side + " book (need 10+). Skipping.");
     } else {
       _log("DEPTH: " + totalDepth + " contracts on " + best.side + " book");
     }

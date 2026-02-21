@@ -1,6 +1,6 @@
 import { kvGetJson, requireUiToken } from "./_upstash";
 
-const DEFAULT_WEIGHTS = { rsi: 1, bb: 1, ob: 3 };
+const DEFAULT_WEIGHTS = { rsi: 2, vwap: 2, ob: 2 };
 
 export default async function handler(req, res) {
   try {

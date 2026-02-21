@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import Head from "next/head";
 
-const DEFAULT_W = { rsi: 1, bb: 1, ob: 3 };
-const INDICATORS = ["rsi", "bb", "ob"];
+const DEFAULT_W = { rsi: 2, vwap: 2, ob: 2 };
+const INDICATORS = ["rsi", "vwap", "ob"];
 
 function pnl$(c) { return (c >= 0 ? "+$" : "-$") + (Math.abs(c) / 100).toFixed(2); }
 function isWin(t) { return t.result === "win" || t.result === "tp_exit"; }
