@@ -73,7 +73,7 @@ export default function MobileDashboard() {
     return () => clearInterval(intervalRef.current);
   }, [token, fetchAll]);
 
-  const toggleBot = async () => {
+  const toggleConfig = async (field) => {
     if (!config || toggling) return;
     setToggling(true);
     setError(null);
@@ -81,7 +81,7 @@ export default function MobileDashboard() {
       const res = await fetch("/api/bot/config", {
         method: "POST",
         headers: headers(),
-        body: JSON.stringify({ enabled: !config.enabled }),
+        body: JSON.stringify({ [field]: !config[field] }),
       });
       const data = await res.json();
       if (data.ok) {
@@ -144,23 +144,43 @@ export default function MobileDashboard() {
           </div>
         </div>
 
-        {/* Toggle */}
-        <div style={S.card} onClick={toggleBot}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <span style={{ color: "#aaa", fontSize: 14 }}>Bot Status</span>
-            <div style={{
-              ...S.toggle,
-              background: enabled ? "#4caf50" : "#333",
-              opacity: toggling ? 0.5 : 1,
-            }}>
+        {/* Toggles */}
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ ...S.card, flex: 1 }} onClick={() => toggleConfig("enabled")}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ color: "#aaa", fontSize: 13 }}>15M Bot</span>
               <div style={{
-                ...S.toggleKnob,
-                transform: enabled ? "translateX(26px)" : "translateX(2px)",
-              }} />
+                ...S.toggle,
+                background: enabled ? "#4caf50" : "#333",
+                opacity: toggling ? 0.5 : 1,
+              }}>
+                <div style={{
+                  ...S.toggleKnob,
+                  transform: enabled ? "translateX(26px)" : "translateX(2px)",
+                }} />
+              </div>
+            </div>
+            <div style={{ marginTop: 6, fontSize: 20, fontWeight: 700, color: enabled ? "#4caf50" : "#666" }}>
+              {toggling ? "..." : enabled ? "ON" : "OFF"}
             </div>
           </div>
-          <div style={{ marginTop: 8, fontSize: 24, fontWeight: 700, color: enabled ? "#4caf50" : "#666" }}>
-            {toggling ? "..." : enabled ? "RUNNING" : "OFF"}
+          <div style={{ ...S.card, flex: 1 }} onClick={() => toggleConfig("hourlyEnabled")}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ color: "#aaa", fontSize: 13 }}>1H Bot</span>
+              <div style={{
+                ...S.toggle,
+                background: config?.hourlyEnabled ? "#4caf50" : "#333",
+                opacity: toggling ? 0.5 : 1,
+              }}>
+                <div style={{
+                  ...S.toggleKnob,
+                  transform: config?.hourlyEnabled ? "translateX(26px)" : "translateX(2px)",
+                }} />
+              </div>
+            </div>
+            <div style={{ marginTop: 6, fontSize: 20, fontWeight: 700, color: config?.hourlyEnabled ? "#4caf50" : "#666" }}>
+              {toggling ? "..." : config?.hourlyEnabled ? "ON" : "OFF"}
+            </div>
           </div>
         </div>
 
