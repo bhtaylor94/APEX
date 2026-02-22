@@ -33,11 +33,11 @@ export function defaultConfig() {
     // ── 1-Hour series config ──
     hourlyEnabled: false,
     hourlySeriesTicker: "KXBTC",
-    hourly_minMinutesToCloseToEnter: 30,
+    hourly_minMinutesToCloseToEnter: 60,
     hourly_cooldownMinutes: 15,
-    hourly_minEntryPriceCents: 35,
-    hourly_maxEntryPriceCents: 80,
+    hourly_minEntryPriceCents: 8,
+    hourly_maxEntryPriceCents: 85,
     hourly_makerOffsetCents: 2,
-    hourly_minEdge: 5,
+    hourly_minEdge: 3,
   };
 }

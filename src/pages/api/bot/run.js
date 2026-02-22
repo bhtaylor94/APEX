@@ -21,11 +21,11 @@ const SERIES_DEFS = {
   "1H": {
     suffix: "1H",
     defaultSeriesTicker: "KXBTC",
-    indicators: ["rsi", "macd", "ema", "vwap"],
-    defaultWeights: { rsi: 2, macd: 2, ema: 2, vwap: 2 },
+    indicators: [],
+    defaultWeights: {},
     defaults: {
-      minMinutesToCloseToEnter: 30, cooldownMinutes: 15,
-      minEntryPriceCents: 35, maxEntryPriceCents: 80, makerOffsetCents: 2, minEdge: 5, atrMaxPct: 0.25,
+      minMinutesToCloseToEnter: 60, cooldownMinutes: 15,
+      minEntryPriceCents: 8, maxEntryPriceCents: 85, makerOffsetCents: 2, minEdge: 3, atrMaxPct: 0.25,
     },
   },
 };
@@ -202,6 +202,83 @@ function computeVWAP(candles) {
   return cumVol > 0 ? cumVolPrice / cumVol : null;
 }
 
+// ── Probability engine (1H bracket markets) ──
+
+function normalCDF(x) {
+  const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+  const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+  const sign = x < 0 ? -1 : 1;
+  x = Math.abs(x) / Math.SQRT2;
+  const t = 1 / (1 + p * x);
+  const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+  return 0.5 * (1 + sign * y);
+}
+
+function computeRealizedVol(candles1m, lookback = 60) {
+  const subset = candles1m.slice(-Math.min(candles1m.length, lookback + 1));
+  if (subset.length < 10) return 0.50;
+  const returns = [];
+  for (let i = 1; i < subset.length; i++) {
+    if (subset[i].close > 0 && subset[i - 1].close > 0)
+      returns.push(Math.log(subset[i].close / subset[i - 1].close));
+  }
+  if (returns.length < 5) return 0.50;
+  const variance = returns.reduce((s, r) => s + r * r, 0) / returns.length;
+  return Math.sqrt(variance * 525600);
+}
+
+function fairValueAbove(spot, strike, sigmaAnnual, tauYears) {
+  if (tauYears <= 0) return spot >= strike ? 1 : 0;
+  const sqrtTau = Math.sqrt(tauYears);
+  const d2 = (Math.log(spot / strike) - (sigmaAnnual * sigmaAnnual / 2) * tauYears)
+              / (sigmaAnnual * sqrtTau);
+  return normalCDF(d2);
+}
+
+function parseStrike(ticker) {
+  const m = ticker.match(/-([TB])(\d+\.?\d*)$/);
+  if (!m) return null;
+  return { strike: parseFloat(m[2]), type: m[1] === "T" ? "above" : "below" };
+}
+
+function findBestBracketTrade(markets, spot, sigma, tauYears, priceBand, minEdgeCents, vwapSignal) {
+  let best = null;
+  for (const m of markets) {
+    const parsed = parseStrike(m.ticker);
+    if (!parsed) continue;
+
+    const closeTs = m.close_time ? new Date(m.close_time).getTime()
+      : m.expiration_time ? new Date(m.expiration_time).getTime() : 0;
+    const thisTau = closeTs > 0 ? (closeTs - Date.now()) / (365.25 * 24 * 3600 * 1000) : tauYears;
+
+    let fairProb = fairValueAbove(spot, parsed.strike, sigma, thisTau);
+    fairProb = Math.max(0.01, Math.min(0.99, fairProb + vwapSignal * 0.03));
+    const fairCents = Math.round(fairProb * 100);
+
+    // BUY YES: market ask < fair value
+    const yesAsk = validPx(m.yes_ask);
+    if (yesAsk && yesAsk >= priceBand[0] && yesAsk <= priceBand[1]) {
+      const edge = fairCents - yesAsk;
+      if (edge >= minEdgeCents && (!best || edge > best.edge)) {
+        best = { ticker: m.ticker, side: "yes", askPrice: yesAsk, fairCents,
+                 edge, strike: parsed.strike, type: parsed.type, closeTs };
+      }
+    }
+
+    // BUY NO: fair value of NO = 1 - fairProb
+    const noFairCents = 100 - fairCents;
+    const noAsk = validPx(m.no_ask);
+    if (noAsk && noAsk >= priceBand[0] && noAsk <= priceBand[1]) {
+      const edge = noFairCents - noAsk;
+      if (edge >= minEdgeCents && (!best || edge > best.edge)) {
+        best = { ticker: m.ticker, side: "no", askPrice: noAsk, fairCents: noFairCents,
+                 edge, strike: parsed.strike, type: parsed.type, closeTs };
+      }
+    }
+  }
+  return best;
+}
+
 // ── Adaptive learning (series-aware) ──
 
 async function getLearnedWeights(suffix, seriesDef) {
@@ -212,7 +289,7 @@ async function getLearnedWeights(suffix, seriesDef) {
 
 async function learnFromTrades(suffix, seriesDef, L) {
   const history = (await kvGetJson("bot:trade_history")) || [];
-  const trades = history.filter(t => t.signal && t.signal.indicators && (t.seriesSuffix || "15M") === suffix);
+  const trades = history.filter(t => t.signal && (t.seriesSuffix || "15M") === suffix);
   if (trades.length < 5) return;
 
   const recent = trades.slice(-20);
@@ -224,14 +301,38 @@ async function learnFromTrades(suffix, seriesDef, L) {
   const comboStats = {};
   const hourlyStats = {};
   const entryPriceStats = { low: 0, lowWin: 0, mid: 0, midWin: 0, high: 0, highWin: 0 };
+  const edgeStats = { small: 0, smallWin: 0, medium: 0, mediumWin: 0, large: 0, largeWin: 0 };
 
   for (const t of recent) {
     const won = t.result === "win" || t.result === "tp_exit";
     const lost = t.result === "loss";
     if (won) wins++; if (lost) losses++;
     totalPnl += (t.pnlCents || 0);
-    const inds = t.signal.indicators;
-    if (!inds) continue;
+
+    // Track edge stats for bracket trades
+    if (t.signal?.type === "bracket" && t.signal.edge != null) {
+      const e = t.signal.edge;
+      if (e >= 8) { edgeStats.large++; if (won) edgeStats.largeWin++; }
+      else if (e >= 5) { edgeStats.medium++; if (won) edgeStats.mediumWin++; }
+      else { edgeStats.small++; if (won) edgeStats.smallWin++; }
+    }
+
+    const inds = t.signal?.indicators;
+    if (!inds) {
+      // Still track hourly + entry price for bracket trades
+      const ts = t.openedTs || t.settledTs || t.closedTs;
+      if (ts) {
+        const hour = new Date(ts).getUTCHours();
+        if (!hourlyStats[hour]) hourlyStats[hour] = { wins: 0, total: 0 };
+        hourlyStats[hour].total++;
+        if (won) hourlyStats[hour].wins++;
+      }
+      const ep = t.entryPriceCents || 50;
+      if (ep < 45) { entryPriceStats.low++; if (won) entryPriceStats.lowWin++; }
+      else if (ep <= 65) { entryPriceStats.mid++; if (won) entryPriceStats.midWin++; }
+      else { entryPriceStats.high++; if (won) entryPriceStats.highWin++; }
+      continue;
+    }
 
     for (const ind of INDICATORS) {
       const vote = inds[ind] || 0;
@@ -298,7 +399,7 @@ async function learnFromTrades(suffix, seriesDef, L) {
   await kvSetJson(kvKey("bot:learned_weights", suffix), {
     weights: newWeights, minScoreThreshold: minScore,
     winRate: Math.round(winRate * 100), totalTrades: total, totalPnl, lossStreak, mode,
-    indicatorStats: stats, comboStats, hourlyStats, priceAdvice, lastUpdated: Date.now(),
+    indicatorStats: stats, comboStats, hourlyStats, edgeStats, priceAdvice, lastUpdated: Date.now(),
   });
   if (L) L("[" + suffix + "] LEARNED: weights=" + JSON.stringify(newWeights) + " minScore=" + minScore + " mode=" + mode);
 }
@@ -350,52 +451,6 @@ function getSignal15M(candles, closes, obRatio, weights, minScoreThreshold, cand
   return {
     direction: score > 0 ? "up" : "down", score, indicators,
     predProb: 50 + (abs / maxScore) * 30, breakdown: bd, maxScore, mtfBoost,
-    confidence: abs / maxScore,
-  };
-}
-
-function getSignal1H(candles5m, closes5m, obRatio, weights, minScoreThreshold) {
-  if (!candles5m || closes5m.length < 30) {
-    return { direction: "neutral", score: 0, confidence: 0, maxScore: 8, mtfBoost: 0 };
-  }
-  const price = closes5m[closes5m.length - 1];
-  const rsiVal = computeRSI(closes5m, 14);
-  const macdData = computeMACD(closes5m, 12, 26, 9);
-  const emaCross = computeEMACrossover(closes5m, 9, 21);
-  const vwap = computeVWAP(candles5m);
-  const vwapDev = vwap ? (price - vwap) / vwap : 0;
-
-  const indicators = { rsi: 0, macd: 0, ema: 0, vwap: 0 };
-  let score = 0;
-  const bd = {};
-
-  if (rsiVal < 30) indicators.rsi = 1; else if (rsiVal > 70) indicators.rsi = -1;
-  score += indicators.rsi * (weights.rsi || 2);
-  bd.rsi = (indicators.rsi !== 0 ? (indicators.rsi > 0 ? "+" : "-") + (weights.rsi || 2) : "0");
-
-  if (macdData) {
-    if (macdData.crossUp || (macdData.histogram > 0 && macdData.macd > 0)) indicators.macd = 1;
-    else if (macdData.crossDown || (macdData.histogram < 0 && macdData.macd < 0)) indicators.macd = -1;
-  }
-  score += indicators.macd * (weights.macd || 2);
-  bd.macd = (indicators.macd !== 0 ? (indicators.macd > 0 ? "+" : "-") + (weights.macd || 2) : "0");
-
-  if (emaCross) {
-    if (emaCross.bullish) indicators.ema = 1; else indicators.ema = -1;
-  }
-  score += indicators.ema * (weights.ema || 2);
-  bd.ema = (indicators.ema !== 0 ? (indicators.ema > 0 ? "+" : "-") + (weights.ema || 2) : "0");
-
-  if (vwap) { if (vwapDev < -0.0025) indicators.vwap = 1; else if (vwapDev > 0.0025) indicators.vwap = -1; }
-  score += indicators.vwap * (weights.vwap || 2);
-  bd.vwap = (indicators.vwap !== 0 ? (indicators.vwap > 0 ? "+" : "-") + (weights.vwap || 2) : "0");
-
-  const maxScore = (weights.rsi || 2) + (weights.macd || 2) + (weights.ema || 2) + (weights.vwap || 2);
-  const abs = Math.abs(score);
-  if (abs < minScoreThreshold) return { direction: "neutral", score, breakdown: bd, indicators, maxScore, mtfBoost: 0 };
-  return {
-    direction: score > 0 ? "up" : "down", score, indicators,
-    predProb: 50 + (abs / maxScore) * 30, breakdown: bd, maxScore, mtfBoost: 0,
     confidence: abs / maxScore,
   };
 }
@@ -709,14 +764,6 @@ async function runSeriesCycle(seriesDef, cfg, sharedData, L) {
     }
   }
 
-  // ── Daily trade limit ──
-  const dailyStats = await getDailyStats(suffix);
-  const maxTradesPerDay = Number(cfg.maxTradesPerDay ?? 10);
-  if ((dailyStats.totalTrades || 0) >= maxTradesPerDay) {
-    L("[" + suffix + "] DAILY TRADE LIMIT: " + dailyStats.totalTrades + "/" + maxTradesPerDay);
-    return { action: "daily_trade_limit" };
-  }
-
   // ── Cooldown ──
   const learnedData = await kvGetJson(kvKey("bot:learned_weights", suffix));
   const streak = learnedData?.lossStreak || 0;
@@ -727,17 +774,118 @@ async function runSeriesCycle(seriesDef, cfg, sharedData, L) {
     return { action: "cooldown" };
   }
 
-  // ── Signal ──
+  // ── 1H: Probability-based bracket market trading ──
+  if (suffix === "1H") {
+    const closes = candles.map(c => c.close);
+    const spot = closes[closes.length - 1];
+    const sigma = computeRealizedVol(candles, 60);
+
+    // Time to settlement (KXBTC settles at 22:00 UTC)
+    const now = new Date();
+    const settlement = new Date(now);
+    settlement.setUTCHours(22, 0, 0, 0);
+    if (settlement <= now) settlement.setUTCDate(settlement.getUTCDate() + 1);
+    const tauYears = (settlement - now) / (365.25 * 24 * 3600 * 1000);
+    const minsToSettlement = (settlement - now) / 60000;
+
+    if (minsToSettlement < minMins) {
+      L("[1H] TIME GATE: " + minsToSettlement.toFixed(0) + "min to settlement (need " + minMins + ")");
+      return { action: "time_gate" };
+    }
+
+    // VWAP signal for probability adjustment
+    const vwap = computeVWAP(candles);
+    const vwapDev = vwap ? (spot - vwap) / vwap : 0;
+    let vwapSignal = 0;
+    if (vwapDev < -0.005) vwapSignal = 1;
+    else if (vwapDev > 0.005) vwapSignal = -1;
+
+    L("[1H] spot=$" + spot.toFixed(0) + " sigma=" + (sigma * 100).toFixed(1) +
+      "% tau=" + (tauYears * 365.25 * 24).toFixed(1) + "h vwap=" + vwapSignal);
+
+    // Fetch all KXBTC markets
+    const resp = await kalshiFetch("/trade-api/v2/markets?series_ticker=" + seriesTicker +
+      "&status=open&limit=200", { method: "GET" });
+    const allMarkets = (resp?.markets || []).filter(m =>
+      m.ticker?.startsWith(prefix) && m.close_time
+    );
+    L("[1H] Markets: " + allMarkets.length);
+
+    // Find best mispriced contract
+    const best = findBestBracketTrade(allMarkets, spot, sigma, tauYears,
+      [minEntry, maxEntry], minEdge, vwapSignal);
+
+    if (!best) {
+      L("[1H] No mispriced contracts found");
+      await kvSetJson(kvKey("bot:state", suffix), { lastCheck: Date.now(), sigma, spot });
+      return { action: "no_edge" };
+    }
+
+    L("[1H] BEST: " + best.ticker + " " + best.side + " ask=" + best.askPrice +
+      "c fair=" + best.fairCents + "c edge=" + best.edge + "c strike=$" + best.strike);
+
+    // Depth check
+    let depthOk = true;
+    try {
+      const dob = await kalshiFetch("/trade-api/v2/markets/" + encodeURIComponent(best.ticker) + "/orderbook?depth=10", { method: "GET" });
+      const db = dob?.orderbook || dob;
+      const bids = db?.[best.side] || [];
+      const td = bids.reduce((s, b) => s + (Array.isArray(b) ? (b[1] || 0) : (b?.quantity || b?.size || 0)), 0);
+      if (td < 10) depthOk = false;
+    } catch {}
+    if (!depthOk) {
+      L("[1H] DEPTH GATE");
+      await kvSetJson(kvKey("bot:state", suffix), { lastCheck: Date.now(), sigma, spot });
+      return { action: "depth_gate" };
+    }
+
+    // Place order
+    const limitPrice = best.askPrice - makerOffset;
+    const confidence = Math.min(1, best.edge / 20);
+    const wr = learnedData?.winRate || 50;
+    const count = calcContracts({ tradeSizeUsd, maxContracts, askCents: limitPrice > 0 ? limitPrice : best.askPrice, winRate: wr, confidence });
+    const finalPrice = limitPrice >= minEntry ? limitPrice : best.askPrice;
+
+    L("[1H] ORDER: " + best.side.toUpperCase() + " " + count + "x " + best.ticker + " @ " + finalPrice + "c");
+
+    const sigData = { type: "bracket", spot, sigma, strike: best.strike, fairCents: best.fairCents,
+      edge: best.edge, vwapSignal, tauHours: tauYears * 365.25 * 24 };
+
+    if (mode !== "live") {
+      const posData = { ticker: best.ticker, side: best.side, entryPriceCents: finalPrice,
+        count, openedTs: Date.now(), orderId: "paper-" + Date.now(),
+        signal: sigData, marketCloseTs: best.closeTs || null };
+      await kvSetJson(kvKey("bot:position", suffix), posData);
+      await kvSetJson(kvKey("bot:lastTradeTs", suffix), Date.now());
+      await kvSetJson(kvKey("bot:state", suffix), { lastCheck: Date.now(), lastAction: "paper_buy", sigma, spot });
+      return { action: "paper_buy", position: posData };
+    }
+
+    const orderBody = { ticker: best.ticker, action: "buy", type: "limit", side: best.side, count,
+      ...(best.side === "yes" ? { yes_price: finalPrice } : { no_price: finalPrice }) };
+    const orderRes = await kalshiFetch("/trade-api/v2/portfolio/orders", { method: "POST", body: orderBody });
+    const order = orderRes?.order || {};
+
+    if (order.status === "executed" || ((order.fill_count ?? 0) > 0)) {
+      const fc = (order.fill_count ?? 0) > 0 ? order.fill_count : count;
+      await kvSetJson(kvKey("bot:position", suffix), { ticker: best.ticker, side: best.side, entryPriceCents: finalPrice,
+        count: fc, openedTs: Date.now(), orderId: order.order_id, signal: sigData, marketCloseTs: best.closeTs || null });
+      await kvSetJson(kvKey("bot:lastTradeTs", suffix), Date.now());
+    } else if (order.status === "resting") {
+      await kvSetJson(kvKey("bot:pendingOrder", suffix), { orderId: order.order_id, ticker: best.ticker, side: best.side,
+        limitPrice: finalPrice, count, placedTs: Date.now(), signal: sigData });
+    }
+
+    await kvSetJson(kvKey("bot:state", suffix), { lastCheck: Date.now(), lastAction: "buy", sigma, spot });
+    return { action: "order_placed", status: order.status };
+  }
+
+  // ── 15M: Indicator-based signal trading ──
   const closes = candles.map(c => c.close);
   const closes5m = candles5m ? candles5m.map(c => c.close) : [];
   const { weights, minScoreThreshold } = await getLearnedWeights(suffix, seriesDef);
 
-  let sig;
-  if (suffix === "1H") {
-    sig = getSignal1H(candles5m, closes5m, ob.ratio, weights, minScoreThreshold);
-  } else {
-    sig = getSignal15M(candles, closes, ob.ratio, weights, minScoreThreshold, candles5m, candles15m);
-  }
+  const sig = getSignal15M(candles, closes, ob.ratio, weights, minScoreThreshold, candles5m, candles15m);
 
   // Volume + ATR
   const volumes = candles.map(c => c.volume || 0);

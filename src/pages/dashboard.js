@@ -2,9 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import Head from "next/head";
 
 const DEFAULT_W_15M = { rsi: 2, vwap: 2, ob: 2 };
-const DEFAULT_W_1H = { rsi: 2, macd: 2, ema: 2, vwap: 2 };
 const INDICATORS_15M = ["rsi", "vwap", "ob"];
-const INDICATORS_1H = ["rsi", "macd", "ema", "vwap"];
 
 function pnl$(c) { return (c >= 0 ? "+$" : "-$") + (Math.abs(c) / 100).toFixed(2); }
 function isWin(t) { return t.result === "win" || t.result === "tp_exit"; }
@@ -62,8 +60,9 @@ export default function Dashboard() {
   const trades = tab === "1H" ? trades1H : tab === "15M" ? trades15 : allTrades;
 
   const learned = tab === "1H" ? learned1H : tab === "15M" ? learned15 : learned15;
-  const DEFAULT_W = tab === "1H" ? DEFAULT_W_1H : DEFAULT_W_15M;
-  const INDICATORS = tab === "1H" ? INDICATORS_1H : INDICATORS_15M;
+  const is1H = tab === "1H";
+  const DEFAULT_W = DEFAULT_W_15M;
+  const INDICATORS = is1H ? [] : INDICATORS_15M;
 
   const daily15 = s15.dailyStats || data.dailyStats || {};
   const daily1H = s1H.dailyStats || {};
@@ -293,10 +292,10 @@ export default function Dashboard() {
         </>
       )}
 
-      {/* Indicator Learning */}
-      {tab !== "ALL" && (
+      {/* Indicator Learning (15M only) */}
+      {tab === "15M" && indRows.length > 0 && (
         <>
-          <div style={sectionLabel}>Indicator Learning ({tab})</div>
+          <div style={sectionLabel}>Indicator Learning (15M)</div>
           <div style={grp}>
             {indRows.map((r, i) => {
               const accColor = r.acc === null ? "#86868b" : r.acc >= 50 ? "#30d158" : "#ff453a";
@@ -318,6 +317,36 @@ export default function Dashboard() {
                 </div>
               );
             })}
+          </div>
+          <div style={sep} />
+        </>
+      )}
+
+      {/* Bracket Model (1H only) */}
+      {tab === "1H" && (
+        <>
+          <div style={sectionLabel}>Bracket Model (1H)</div>
+          <div style={grp}>
+            {(() => {
+              const state1H = s1H.state || {};
+              const sigData = trades1H.length > 0 ? trades1H[trades1H.length - 1]?.signal : null;
+              const sigma = state1H.sigma || sigData?.sigma;
+              const spot = state1H.spot || sigData?.spot;
+              const lastEdge = sigData?.edge;
+              const lastStrike = sigData?.strike;
+              const lastFair = sigData?.fairCents;
+              const tauH = sigData?.tauHours;
+              return (
+                <>
+                  <Row l="Spot Price" v={spot ? "$" + Number(spot).toLocaleString() : "\u2014"} />
+                  <Row l="Realized Vol" v={sigma ? (sigma * 100).toFixed(1) + "%" : "\u2014"} color={sigma && sigma > 0.8 ? "#ff9f0a" : "#fff"} border />
+                  <Row l="Last Strike" v={lastStrike ? "$" + Number(lastStrike).toLocaleString() : "\u2014"} border />
+                  <Row l="Last Fair Value" v={lastFair ? lastFair + "c" : "\u2014"} border />
+                  <Row l="Last Edge" v={lastEdge ? lastEdge + "c" : "\u2014"} color={lastEdge && lastEdge >= 5 ? "#30d158" : "#fff"} border />
+                  <Row l="Time to Settle" v={tauH ? tauH.toFixed(1) + "h" : "\u2014"} border />
+                </>
+              );
+            })()}
           </div>
           <div style={sep} />
         </>
@@ -396,8 +425,8 @@ export default function Dashboard() {
         <>
           <div style={sectionLabel}>Bot Status ({tab})</div>
           <div style={grp}>
-            <Row l="Mode" v={(learned.mode || "normal").toUpperCase()} color={learned.mode === "recovery" ? "#ff453a" : learned.mode === "aggressive" ? "#30d158" : "#fff"} />
-            <Row l="Score Threshold" v={learned.minScoreThreshold ?? 2} border />
+            <Row l="Mode" v={is1H ? "BRACKET" : (learned.mode || "normal").toUpperCase()} color={is1H ? "#5856d6" : learned.mode === "recovery" ? "#ff453a" : learned.mode === "aggressive" ? "#30d158" : "#fff"} />
+            {!is1H && <Row l="Score Threshold" v={learned.minScoreThreshold ?? 2} border />}
             <Row l="Loss Streak" v={learned.lossStreak || 0} color={(learned.lossStreak || 0) >= 3 ? "#ff453a" : "#fff"} border />
             <Row l="Learned Win Rate" v={(learned.winRate ?? 0) + "%"} color={(learned.winRate ?? 0) >= 50 ? "#30d158" : "#ff453a"} border />
             <Row l="Total Learned Trades" v={learned.totalTrades || 0} border />
